@@ -187,23 +187,27 @@ class ProxyManager:
         """创建示例代理文件"""
         example_content = """# 代理文件示例 - proxy.txt
 # 支持的格式：
-# HTTP代理：ip:port
-# HTTP认证：ip:port:username:password
-# SOCKS5：socks5:ip:port:username:password
-# SOCKS4：socks4:ip:port
-# ABCProxy住宅代理：host:port:username:password
+# HTTP代理：ip:port 或 http://ip:port
+# HTTP认证：ip:port:username:password 或 http://ip:port:username:password
+# SOCKS5：socks5:ip:port:username:password 或 socks5://ip:port:username:password
+# SOCKS4：socks4:ip:port 或 socks4://ip:port
+# ABCProxy住宅代理：host:port:username:password 或 http://host:port:username:password
 
 # 示例（请替换为真实代理）
 # 127.0.0.1:8080
+# http://127.0.0.1:8080
 # 127.0.0.1:1080:user:pass
 # socks5:127.0.0.1:1080:user:pass
+# socks5://127.0.0.1:1080:user:pass
 # socks4:127.0.0.1:1080
 
-# ABCProxy住宅代理示例：
+# ABCProxy住宅代理示例（两种格式都支持）：
 # f01a4db3d3952561.abcproxy.vip:4950:FlBaKtPm7l-zone-abc:00937128
+# http://f01a4db3d3952561.abcproxy.vip:4950:FlBaKtPm7l-zone-abc:00937128
 
 # 注意：
 # - 以#开头的行为注释行，会被忽略
+# - 支持标准格式和URL格式（带 :// 的格式）
 # - 住宅代理（如ABCProxy）会自动使用更长的超时时间（30秒）
 # - 系统会自动检测住宅代理并优化连接参数
 """
@@ -225,12 +229,24 @@ class ProxyManager:
     def parse_proxy_line(self, line: str) -> Optional[Dict]:
         """解析代理行（支持ABCProxy等住宅代理格式）"""
         try:
+            # 先处理URL格式的代理（如 http://host:port:user:pass 或 socks5://host:port）
+            # 移除协议前缀（如果存在）
+            original_line = line
+            proxy_type = 'http'  # 默认类型
+            
+            # 检查并移除协议前缀
+            if '://' in line:
+                protocol, rest = line.split('://', 1)
+                proxy_type = protocol.lower()
+                line = rest  # 现在 line 是 host:port:user:pass 格式
+            
             parts = line.split(':')
+            
             if len(parts) == 2:
                 # ip:port
                 host = parts[0].strip()
                 return {
-                    'type': 'http',
+                    'type': proxy_type,
                     'host': host,
                     'port': int(parts[1].strip()),
                     'username': None,
@@ -242,15 +258,16 @@ class ProxyManager:
                 # 例如: f01a4db3d3952561.abcproxy.vip:4950:FlBaKtPm7l-zone-abc:00937128
                 host = parts[0].strip()
                 return {
-                    'type': 'http',
+                    'type': proxy_type,
                     'host': host,
                     'port': int(parts[1].strip()),
                     'username': parts[2].strip(),
                     'password': parts[3].strip(),
                     'is_residential': self.is_residential_proxy(host)
                 }
-            elif len(parts) >= 3 and parts[0].lower() in ['socks5', 'socks4', 'http']:
-                # socks5:ip:port or socks5:ip:port:username:password
+            elif len(parts) >= 3 and parts[0].lower() in ['socks5', 'socks4', 'http', 'https']:
+                # 旧格式: socks5:ip:port or socks5:ip:port:username:password (无 ://)
+                # 这种情况下 parts[0] 是协议类型
                 proxy_type = parts[0].lower()
                 host = parts[1].strip()
                 port = int(parts[2].strip())
