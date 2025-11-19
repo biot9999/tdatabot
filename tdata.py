@@ -1159,17 +1159,28 @@ class SpamBotChecker:
         return "无限制"
     
     def get_proxy_usage_stats(self) -> Dict[str, int]:
-        """获取代理使用统计"""
+        """
+        获取代理使用统计
+        
+        注意：统计的是账户数量，而不是代理尝试次数
+        每个账户只统计最终结果（成功、失败或回退）
+        """
+        # 使用字典去重，确保每个账户只统计一次（取最后一条记录）
+        account_records = {}
+        for record in self.proxy_usage_records:
+            account_records[record.account_name] = record
+        
         stats = {
-            "total": len(self.proxy_usage_records),
-            "proxy_success": 0,
-            "proxy_failed": 0,
-            "local_fallback": 0,
-            "local_only": 0
+            "total": len(account_records),  # 账户总数
+            "proxy_success": 0,      # 成功使用代理的账户数
+            "proxy_failed": 0,       # 代理失败但未回退的账户数
+            "local_fallback": 0,     # 代理失败后回退本地的账户数
+            "local_only": 0          # 未尝试代理的账户数
         }
         
-        for record in self.proxy_usage_records:
+        for record in account_records.values():
             if record.proxy_attempted:
+                # 尝试了代理
                 if record.attempt_result == "success":
                     stats["proxy_success"] += 1
                 elif record.fallback_used:
@@ -1177,7 +1188,11 @@ class SpamBotChecker:
                 else:
                     stats["proxy_failed"] += 1
             else:
-                stats["local_only"] += 1
+                # 未尝试代理（本地连接或回退）
+                if record.fallback_used:
+                    stats["local_fallback"] += 1
+                else:
+                    stats["local_only"] += 1
         
         return stats
 
