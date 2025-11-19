@@ -9433,7 +9433,7 @@ class EnhancedBot:
                 pass
             
             # 准备文件列表
-            file_list = [(file_path, file_type) for file_path, file_name, info in files]
+            file_list = [(file_path, file_type) for file_path, file_name in files]
             
             # 运行批量处理
             processed = 0
