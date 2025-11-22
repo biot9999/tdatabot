@@ -4,9 +4,6 @@ __pycache__/
 *$py.class
 *.so
 .Python
-env/
-venv/
-ENV/
 build/
 develop-eggs/
 dist/
@@ -23,10 +20,10 @@ wheels/
 .installed.cfg
 *.egg
 
-# Environment variables
-.env
-.env.local
-.env.*.local
+# Virtual Environment
+venv/
+env/
+ENV/
 
 # IDE
 .vscode/
@@ -35,22 +32,18 @@ wheels/
 *.swo
 *~
 
-# Bot data
+# Project specific
+.env
 bot_data.db
-bot_data.db-journal
-
-# Uploads and results
-uploads/
+proxy.txt
+proxy_*.txt
 results/
-sessions/
+uploads/
+*.session
+*.session-journal
+tdata/
+*.zip
 
-# Logs
-*.log
-
-# Proxy files (backup)
-proxy_backup.txt
-proxy_working.txt
-
-# Temporary files
-*.tmp
+# OS
 .DS_Store
+Thumbs.db
