@@ -36,6 +36,8 @@ import threading
 import struct
 import base64
 from pathlib import Path
+from dataclasses import dataclass
+from collections import deque
 print("🔍 Telegram账号检测机器人 V8.0")
 print(f"📅 当前时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
@@ -172,6 +174,22 @@ class ProxyManager:
         except:
             return config.USE_PROXY and len(self.proxies) > 0
     
+    def get_proxy_activation_detail(self, db: 'Database') -> str:
+        """获取代理模式激活状态的详细信息"""
+        details = []
+        details.append(f"ENV USE_PROXY: {config.USE_PROXY}")
+        
+        try:
+            proxy_enabled = db.get_proxy_enabled()
+            details.append(f"DB proxy_enabled: {proxy_enabled}")
+        except Exception as e:
+            details.append(f"DB proxy_enabled: error ({str(e)[:30]})")
+        
+        details.append(f"Valid proxies loaded: {len(self.proxies)}")
+        details.append(f"Proxy mode active: {self.is_proxy_mode_active(db)}")
+        
+        return " | ".join(details)
+    
     def load_proxies(self):
         """加载代理列表"""
         if not os.path.exists(self.proxy_file):
@@ -201,23 +219,27 @@ class ProxyManager:
         """创建示例代理文件"""
         example_content = """# 代理文件示例 - proxy.txt
 # 支持的格式：
-# HTTP代理：ip:port
-# HTTP认证：ip:port:username:password
-# SOCKS5：socks5:ip:port:username:password
-# SOCKS4：socks4:ip:port
-# ABCProxy住宅代理：host:port:username:password
+# HTTP代理：ip:port 或 http://ip:port
+# HTTP认证：ip:port:username:password 或 http://ip:port:username:password
+# SOCKS5：socks5:ip:port:username:password 或 socks5://ip:port:username:password
+# SOCKS4：socks4:ip:port 或 socks4://ip:port
+# ABCProxy住宅代理：host:port:username:password 或 http://host:port:username:password
 
 # 示例（请替换为真实代理）
 # 127.0.0.1:8080
+# http://127.0.0.1:8080
 # 127.0.0.1:1080:user:pass
 # socks5:127.0.0.1:1080:user:pass
+# socks5://127.0.0.1:1080:user:pass
 # socks4:127.0.0.1:1080
 
-# ABCProxy住宅代理示例：
+# ABCProxy住宅代理示例（两种格式都支持）：
 # f01a4db3d3952561.abcproxy.vip:4950:FlBaKtPm7l-zone-abc:00937128
+# http://f01a4db3d3952561.abcproxy.vip:4950:FlBaKtPm7l-zone-abc:00937128
 
 # 注意：
 # - 以#开头的行为注释行，会被忽略
+# - 支持标准格式和URL格式（带 :// 的格式）
 # - 住宅代理（如ABCProxy）会自动使用更长的超时时间（30秒）
 # - 系统会自动检测住宅代理并优化连接参数
 """
@@ -239,12 +261,24 @@ class ProxyManager:
     def parse_proxy_line(self, line: str) -> Optional[Dict]:
         """解析代理行（支持ABCProxy等住宅代理格式）"""
         try:
+            # 先处理URL格式的代理（如 http://host:port:user:pass 或 socks5://host:port）
+            # 移除协议前缀（如果存在）
+            original_line = line
+            proxy_type = 'http'  # 默认类型
+            
+            # 检查并移除协议前缀
+            if '://' in line:
+                protocol, rest = line.split('://', 1)
+                proxy_type = protocol.lower()
+                line = rest  # 现在 line 是 host:port:user:pass 格式
+            
             parts = line.split(':')
+            
             if len(parts) == 2:
                 # ip:port
                 host = parts[0].strip()
                 return {
-                    'type': 'http',
+                    'type': proxy_type,
                     'host': host,
                     'port': int(parts[1].strip()),
                     'username': None,
@@ -256,15 +290,16 @@ class ProxyManager:
                 # 例如: f01a4db3d3952561.abcproxy.vip:4950:FlBaKtPm7l-zone-abc:00937128
                 host = parts[0].strip()
                 return {
-                    'type': 'http',
+                    'type': proxy_type,
                     'host': host,
                     'port': int(parts[1].strip()),
                     'username': parts[2].strip(),
                     'password': parts[3].strip(),
                     'is_residential': self.is_residential_proxy(host)
                 }
-            elif len(parts) >= 3 and parts[0].lower() in ['socks5', 'socks4', 'http']:
-                # socks5:ip:port or socks5:ip:port:username:password
+            elif len(parts) >= 3 and parts[0].lower() in ['socks5', 'socks4', 'http', 'https']:
+                # 旧格式: socks5:ip:port or socks5:ip:port:username:password (无 ://)
+                # 这种情况下 parts[0] 是协议类型
                 proxy_type = parts[0].lower()
                 host = parts[1].strip()
                 port = int(parts[2].strip())
@@ -738,6 +773,10 @@ PROXY_AUTO_CLEANUP=true
 PROXY_FAST_MODE=true
 PROXY_RETRY_COUNT=2
 PROXY_BATCH_SIZE=20
+PROXY_ROTATE_RETRIES=2
+PROXY_SHOW_FAILURE_REASON=true
+PROXY_USAGE_LOG_LIMIT=500
+PROXY_DEBUG_VERBOSE=false
 BASE_URL=http://127.0.0.1:5000
 RECOVERY_CONCURRENT=10
 RECOVERY_CODE_TIMEOUT=300
@@ -751,6 +790,21 @@ RECOVERY_PROXY_RETRIES=2
             with open(".env", "w", encoding="utf-8") as f:
                 f.write(env_content)
             print("✅ 已创建.env配置文件，请填入正确的配置信息")
+
+# ================================
+# Proxy Usage Tracking
+# ================================
+
+@dataclass
+class ProxyUsageRecord:
+    """代理使用记录"""
+    account_name: str
+    proxy_attempted: Optional[str]  # Format: "type host:port" or None for local
+    attempt_result: str  # "success", "timeout", "connection_refused", "auth_failed", "dns_error", etc.
+    fallback_used: bool  # True if fell back to local connection
+    error: Optional[str]  # Error message if any
+    is_residential: bool  # Whether it's a residential proxy
+    elapsed: float  # Time elapsed in seconds
 
 # ================================
 # SpamBot检测器（增强代理支持）
@@ -772,6 +826,9 @@ class SpamBotChecker:
         self.connection_timeout = 6  # 连接超时6秒
         self.spambot_timeout = 3     # SpamBot超时3秒
         self.fast_wait = 0.1         # SpamBot等待0.1秒
+        
+        # 代理使用记录跟踪（使用deque限制大小）
+        self.proxy_usage_records: deque = deque(maxlen=config.PROXY_USAGE_LOG_LIMIT)
         
         print(f"⚡ SpamBot检测器初始化: 并发={concurrent_limit}, 快速模式={'开启' if config.PROXY_FAST_MODE else '关闭'}")
         
@@ -873,63 +930,130 @@ class SpamBotChecker:
             return None
     
     async def check_account_status(self, session_path: str, account_name: str, db: 'Database') -> Tuple[str, str, str]:
-        """检查账号状态（优化版 - 支持快速模式和智能重试）"""
+        """检查账号状态（增强版 - 支持代理轮换和使用追踪）"""
         if not TELETHON_AVAILABLE:
             return "连接错误", "Telethon未安装", account_name
         
         async with self.semaphore:
-            # 智能重试逻辑
-            retry_count = config.PROXY_RETRY_COUNT if config.PROXY_FAST_MODE else 1
+            start_time = time.time()
+            proxy_attempts = []  # Track all proxy attempts
             
-            for attempt in range(retry_count + 1):
-                result = await self._single_check_attempt(session_path, account_name, db, attempt)
+            # 检查是否应使用代理
+            proxy_enabled = db.get_proxy_enabled() if db else True
+            use_proxy = config.USE_PROXY and proxy_enabled and self.proxy_manager.proxies
+            
+            # 确定重试次数：如果启用代理则尝试多个代理
+            max_proxy_attempts = config.PROXY_ROTATE_RETRIES if use_proxy else 0
+            
+            # 尝试不同的代理
+            for proxy_attempt in range(max_proxy_attempts + 1):
+                proxy_info = None
                 
-                # 如果成功或者是最后一次尝试，返回结果
-                if result[0] != "连接错误" or attempt == retry_count:
+                # 获取代理（如果启用）
+                if use_proxy and proxy_attempt < max_proxy_attempts:
+                    proxy_info = self.proxy_manager.get_next_proxy()
+                    if config.PROXY_DEBUG_VERBOSE and proxy_info:
+                        proxy_str = f"{proxy_info['type']} {proxy_info['host']}:{proxy_info['port']}"
+                        print(f"[#{proxy_attempt + 1}] 使用代理 {proxy_str} 检测账号 {account_name}")
+                
+                # 尝试检测
+                result = await self._single_check_with_proxy(
+                    session_path, account_name, proxy_info, proxy_attempt
+                )
+                
+                # 记录尝试结果
+                elapsed = time.time() - start_time
+                attempt_result = "success" if result[0] not in ["连接错误", "封禁"] else "failed"
+                
+                if proxy_info:
+                    proxy_str = f"{proxy_info['type']} {proxy_info['host']}:{proxy_info['port']}"
+                    proxy_attempts.append({
+                        'proxy': proxy_str,
+                        'result': attempt_result,
+                        'error': result[1] if attempt_result == "failed" else None,
+                        'is_residential': proxy_info.get('is_residential', False)
+                    })
+                
+                # 如果成功或到达最后一次尝试，记录并返回
+                if result[0] != "连接错误" or proxy_attempt >= max_proxy_attempts:
+                    # 创建使用记录
+                    usage_record = ProxyUsageRecord(
+                        account_name=account_name,
+                        proxy_attempted=proxy_str if proxy_info else None,
+                        attempt_result=attempt_result,
+                        fallback_used=(proxy_attempt >= max_proxy_attempts and use_proxy),
+                        error=result[1] if attempt_result == "failed" else None,
+                        is_residential=proxy_info.get('is_residential', False) if proxy_info else False,
+                        elapsed=elapsed
+                    )
+                    self.proxy_usage_records.append(usage_record)
+                    
                     return result
                 
-                # 短暂延迟后重试
-                if attempt < retry_count:
-                    await asyncio.sleep(0.5)
+                # 短暂延迟后重试下一个代理
+                if config.PROXY_DEBUG_VERBOSE:
+                    print(f"连接失败 ({result[1][:50]}), 重试下一个代理...")
+                await asyncio.sleep(0.3)
+            
+            # 所有代理都失败，尝试本地连接
+            if use_proxy:
+                if config.PROXY_DEBUG_VERBOSE:
+                    print(f"所有代理失败，回退到本地连接: {account_name}")
+                result = await self._single_check_with_proxy(session_path, account_name, None, max_proxy_attempts)
+                
+                # 记录本地回退
+                elapsed = time.time() - start_time
+                usage_record = ProxyUsageRecord(
+                    account_name=account_name,
+                    proxy_attempted=None,
+                    attempt_result="success" if result[0] != "连接错误" else "failed",
+                    fallback_used=True,
+                    error=result[1] if result[0] == "连接错误" else None,
+                    is_residential=False,
+                    elapsed=elapsed
+                )
+                self.proxy_usage_records.append(usage_record)
+                
+                return result
             
             return "连接错误", "多次尝试后仍然失败", account_name
     
-    async def _single_check_attempt(self, session_path: str, account_name: str, db: 'Database', attempt: int) -> Tuple[str, str, str]:
-        """单次检测尝试"""
+    async def _single_check_with_proxy(self, session_path: str, account_name: str, 
+                                        proxy_info: Optional[Dict], attempt: int) -> Tuple[str, str, str]:
+        """使用指定代理进行单次检测"""
         client = None
-        proxy_used = "本地连接"
-        proxy_info = None
+        connect_start = time.time()
+        
+        # 构建代理描述字符串
+        if proxy_info:
+            proxy_type_display = "住宅代理" if proxy_info.get('is_residential', False) else proxy_info['type'].upper()
+            proxy_used = f"{proxy_type_display} {proxy_info['host']}:{proxy_info['port']}"
+        else:
+            proxy_used = "本地连接"
         
         try:
-            # 快速预检测模式
+            # 快速预检测模式（仅首次尝试）
             if config.PROXY_FAST_MODE and attempt == 0:
-                # 先进行快速连接测试
                 quick_result = await self._quick_connection_test(session_path)
                 if not quick_result:
                     return "连接错误", "快速连接测试失败", account_name
             
-            # 尝试使用代理（检查数据库开关和配置）
+            # 创建代理字典（如果提供了proxy_info）
             proxy_dict = None
-            proxy_enabled = db.get_proxy_enabled() if db else True
-            if config.USE_PROXY and proxy_enabled and self.proxy_manager.proxies:
-                proxy_info = self.proxy_manager.get_next_proxy()
-                if proxy_info:
-                    proxy_dict = self.create_proxy_dict(proxy_info)
-                    if proxy_dict:
-                        proxy_type = "住宅代理" if proxy_info.get('is_residential', False) else "代理"
-                        proxy_used = f"{proxy_type} {proxy_info['host']}:{proxy_info['port']}"
+            if proxy_info:
+                proxy_dict = self.create_proxy_dict(proxy_info)
+                if not proxy_dict:
+                    return "连接错误", f"{proxy_used} | 代理配置错误", account_name
             
             # 根据代理类型调整超时时间
             if proxy_info and proxy_info.get('is_residential', False):
-                # 住宅代理使用更长的超时时间
                 client_timeout = config.RESIDENTIAL_PROXY_TIMEOUT
                 connect_timeout = config.RESIDENTIAL_PROXY_TIMEOUT
             else:
-                # 普通代理或本地连接使用标准超时
                 client_timeout = self.fast_timeout
                 connect_timeout = self.connection_timeout if proxy_dict else 5
             
-            # 创建客户端（使用优化的超时设置）
+            # 创建客户端
             client = TelegramClient(
                 session_path,
                 config.API_ID,
@@ -940,29 +1064,31 @@ class SpamBotChecker:
                 proxy=proxy_dict
             )
             
-            # 连接（使用根据代理类型调整的超时）
+            # 连接
             try:
                 await asyncio.wait_for(client.connect(), timeout=connect_timeout)
+                connect_elapsed = time.time() - connect_start
+            except asyncio.TimeoutError:
+                error_reason = "timeout" if config.PROXY_SHOW_FAILURE_REASON else "连接超时"
+                return "连接错误", f"{proxy_used} | {error_reason}", account_name
             except Exception as e:
-                # 如果代理失败且启用代理模式，尝试本地连接
-                if proxy_dict and config.PROXY_FAST_MODE:
-                    print(f"⚠️ 代理连接失败，快速切换本地: {account_name}")
-                    if client:
-                        await client.disconnect()
-                    
-                    client = TelegramClient(
-                        session_path,
-                        config.API_ID,
-                        config.API_HASH,
-                        timeout=self.fast_timeout,
-                        connection_retries=1,
-                        retry_delay=1
-                    )
-                    
-                    await asyncio.wait_for(client.connect(), timeout=5)
-                    proxy_used = "本地连接(代理失败)"
+                error_msg = str(e).lower()
+                # 分类错误原因
+                if "timeout" in error_msg:
+                    error_reason = "timeout"
+                elif "connection refused" in error_msg or "refused" in error_msg:
+                    error_reason = "connection_refused"
+                elif "auth" in error_msg or "authentication" in error_msg:
+                    error_reason = "auth_failed"
+                elif "resolve" in error_msg or "dns" in error_msg:
+                    error_reason = "dns_error"
                 else:
-                    return "连接错误", f"网络连接失败", account_name
+                    error_reason = "network_error"
+                
+                if config.PROXY_SHOW_FAILURE_REASON:
+                    return "连接错误", f"{proxy_used} | {error_reason}", account_name
+                else:
+                    return "连接错误", f"{proxy_used} | 连接失败", account_name
             
             # 快速授权检查
             try:
@@ -1014,7 +1140,14 @@ class SpamBotChecker:
                     else:
                         reply_preview = spambot_reply[:30] + "..." if len(spambot_reply) > 30 else spambot_reply
                     
-                    return status, f"{user_info} | {proxy_used} | {reply_preview}", account_name
+                    # 构建详细信息字符串，包含连接时间
+                    total_elapsed = time.time() - connect_start
+                    info_str = f"{user_info} | {proxy_used}"
+                    if config.PROXY_DEBUG_VERBOSE:
+                        info_str += f" (ok {total_elapsed:.2f}s)"
+                    info_str += f" | {reply_preview}"
+                    
+                    return status, info_str, account_name
                 else:
                     return "封禁", f"{user_info} | {proxy_used} | SpamBot无回复", account_name
                     
@@ -1027,10 +1160,20 @@ class SpamBotChecker:
             
         except Exception as e:
             error_msg = str(e).lower()
-            if any(word in error_msg for word in ["timeout", "network", "connection", "resolve"]):
-                return "连接错误", f"{proxy_used} | 网络问题", account_name
+            # 分类错误原因
+            if "timeout" in error_msg:
+                error_reason = "timeout"
+            elif "connection" in error_msg or "network" in error_msg:
+                error_reason = "connection_error"
+            elif "resolve" in error_msg:
+                error_reason = "dns_error"
             else:
-                return "封禁", f"{proxy_used} | 检测失败", account_name
+                error_reason = "unknown"
+            
+            if config.PROXY_SHOW_FAILURE_REASON:
+                return "连接错误", f"{proxy_used} | {error_reason}", account_name
+            else:
+                return "连接错误", f"{proxy_used} | 检测失败", account_name
         finally:
             if client:
                 try:
@@ -1074,6 +1217,44 @@ class SpamBotChecker:
         
         # 4. 默认返回无限制
         return "无限制"
+    
+    def get_proxy_usage_stats(self) -> Dict[str, int]:
+        """
+        获取代理使用统计
+        
+        注意：统计的是账户数量，而不是代理尝试次数
+        每个账户只统计最终结果（成功、失败或回退）
+        """
+        # 使用字典去重，确保每个账户只统计一次（取最后一条记录）
+        account_records = {}
+        for record in self.proxy_usage_records:
+            account_records[record.account_name] = record
+        
+        stats = {
+            "total": len(account_records),  # 账户总数
+            "proxy_success": 0,      # 成功使用代理的账户数
+            "proxy_failed": 0,       # 代理失败但未回退的账户数
+            "local_fallback": 0,     # 代理失败后回退本地的账户数
+            "local_only": 0          # 未尝试代理的账户数
+        }
+        
+        for record in account_records.values():
+            if record.proxy_attempted:
+                # 尝试了代理
+                if record.attempt_result == "success":
+                    stats["proxy_success"] += 1
+                elif record.fallback_used:
+                    stats["local_fallback"] += 1
+                else:
+                    stats["proxy_failed"] += 1
+            else:
+                # 未尝试代理（本地连接或回退）
+                if record.fallback_used:
+                    stats["local_fallback"] += 1
+                else:
+                    stats["local_only"] += 1
+        
+        return stats
 
 # ================================
 # 数据库管理（增强管理员功能）
@@ -8221,6 +8402,17 @@ class EnhancedBot:
                     progress = int(processed / total * 100)
                     remaining_time = (total - processed) / speed if speed > 0 else 0
                     
+                    # 获取代理使用统计
+                    proxy_stats_text = ""
+                    if config.USE_PROXY and self.checker.proxy_manager.is_proxy_mode_active(self.db):
+                        stats = self.checker.get_proxy_usage_stats()
+                        proxy_stats_text = f"""
+📡 <b>代理使用统计</b>
+• 已使用代理: {stats['proxy_success']}
+• 回退本地: {stats['local_fallback']}
+• 失败代理: {stats['proxy_failed']}
+"""
+                    
                     text = f"""
 ⚡ <b>检测进行中...</b>
 
@@ -8230,7 +8422,7 @@ class EnhancedBot:
 • 模式: {'📡代理模式' if config.USE_PROXY else '🏠本地模式'}
 • 速度: {speed:.1f} 账号/秒
 • 预计剩余: {remaining_time/60:.1f} 分钟
-
+{proxy_stats_text}
 ⚡ <b>优化状态</b>
 • 快速模式: {'🟢开启' if config.PROXY_FAST_MODE else '🔴关闭'}
 • 并发数: {config.PROXY_CHECK_CONCURRENT if config.PROXY_FAST_MODE else config.MAX_CONCURRENT_CHECKS}
@@ -8275,12 +8467,17 @@ class EnhancedBot:
             total_time = time.time() - start_time
             final_speed = total_accounts / total_time if total_time > 0 else 0
             
-            # 统计代理使用情况
+            # 统计代理使用情况（增强版）
             proxy_stats = ""
             if config.USE_PROXY:
-                proxy_used_count = sum(1 for _, _, info in sum(results.values(), []) if "代理" in info)
-                local_used_count = total_accounts - proxy_used_count
-                proxy_stats = f"\n📡 代理连接: {proxy_used_count}个\n🏠 本地连接: {local_used_count}个"
+                stats = self.checker.get_proxy_usage_stats()
+                if stats['total'] > 0:
+                    proxy_stats = f"\n\n📡 <b>代理使用统计</b>\n• 已使用代理: {stats['proxy_success']}个\n• 回退本地: {stats['local_fallback']}个\n• 失败代理: {stats['proxy_failed']}个\n• 仅本地: {stats['local_only']}个"
+                else:
+                    # 回退到简单统计
+                    proxy_used_count = sum(1 for _, _, info in sum(results.values(), []) if "代理" in info)
+                    local_used_count = total_accounts - proxy_used_count
+                    proxy_stats = f"\n\n📡 代理连接: {proxy_used_count}个\n🏠 本地连接: {local_used_count}个"
             
             final_text = f"""
 ✅ <b>检测完成！正在自动发送文件...</b>
