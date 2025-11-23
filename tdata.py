@@ -3739,7 +3739,7 @@ class TwoFactorManager:
             file_type: 文件类型（'session' 或 'tdata'）
             
         Returns:
-            是否更新成功
+            是否更新成功。对于纯Session文件（无JSON），返回True表示成功（非阻塞）
         """
         try:
             if file_type == 'session':
@@ -12418,9 +12418,10 @@ class EnhancedBot:
                             json_files[basename] = os.path.join(root, fname)
                     
                     # 添加所有session文件，优先使用配对的JSON（如果有）
+                    # 元组格式: (session_path, json_path, basename) 其中 json_path 可以为 None
                     for basename in session_files.keys():
                         session_path = session_files[basename]
-                        json_path = json_files.get(basename, None)  # JSON可选
+                        json_path = json_files.get(basename, None)  # JSON可选，可能为None
                         session_json_pairs.append((session_path, json_path, basename))
             except Exception as e:
                 print(f"❌ 扫描目录失败 {dir_path}: {e}")
