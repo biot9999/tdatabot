@@ -702,6 +702,7 @@ class Config:
         self.PROXY_FAST_MODE = os.getenv("PROXY_FAST_MODE", "true").lower() == "true"
         self.PROXY_RETRY_COUNT = int(os.getenv("PROXY_RETRY_COUNT", "2"))
         self.PROXY_BATCH_SIZE = int(os.getenv("PROXY_BATCH_SIZE", "20"))
+        self.PROXY_USAGE_LOG_LIMIT = int(os.getenv("PROXY_USAGE_LOG_LIMIT", "500"))
         
         # 防止找回配置
         self.RECOVERY_CONCURRENT = int(os.getenv("RECOVERY_CONCURRENT", "10"))
