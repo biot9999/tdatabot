@@ -5484,9 +5484,14 @@ class RecoveryProtectionManager:
         # 阶段3: 请求验证码
         stage_start = time.time()
         try:
+            # 确保phone是字符串类型
+            phone_str = str(phone) if phone else ""
+            if not phone_str or phone_str == "unknown":
+                raise Exception(f"无效的手机号: {phone}")
+            
             # 发送验证码请求
-            print(f"📤 [{account_name}] 向 {phone} 发送验证码请求...")
-            await old_client.send_code_request(phone)
+            print(f"📤 [{account_name}] 向 {phone_str} 发送验证码请求...")
+            await old_client.send_code_request(phone_str)
             print(f"✅ [{account_name}] 验证码请求已发送")
             
             stage_result = RecoveryStageResult(
@@ -5918,7 +5923,10 @@ class RecoveryProtectionManager:
                         try:
                             with open(json_path, 'r', encoding='utf-8') as f:
                                 json_data = json.load(f)
-                                phone = json_data.get('phone', phone)
+                                phone_value = json_data.get('phone', phone)
+                                # 确保phone是字符串类型
+                                if phone_value and phone_value != "unknown":
+                                    phone = str(phone_value)
                         except:
                             pass
                     
@@ -5931,7 +5939,8 @@ class RecoveryProtectionManager:
                             phone = phone_match.group(1)
                             print(f"📱 从文件名提取手机号: {phone}")
                     
-                    context.phone = phone
+                    # 确保phone最终是字符串类型
+                    context.phone = str(phone) if phone else "unknown"
                     stage_result = RecoveryStageResult(
                         account_name=account_name,
                         phone=phone,
@@ -5982,7 +5991,7 @@ class RecoveryProtectionManager:
                     
                     # 如果之前没有获取到手机号，现在从账号信息中获取
                     if phone == "unknown" and me.phone:
-                        phone = me.phone
+                        phone = str(me.phone)  # 确保是字符串
                         context.phone = phone
                         print(f"📱 从账号信息获取手机号: {phone}")
                     
