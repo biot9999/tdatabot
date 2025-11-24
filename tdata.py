@@ -75,6 +75,7 @@ except ImportError as e:
 try:
     from telethon import TelegramClient, functions
     from telethon.errors import *
+    from telethon.errors import FloodWaitError, SessionPasswordNeededError
     from telethon.tl.functions.messages import SendMessageRequest, GetHistoryRequest
     TELETHON_AVAILABLE = True
     print("✅ telethon库导入成功")
@@ -133,7 +134,7 @@ class RecoveryStageResult:
     """防止找回单阶段结果"""
     account_name: str
     phone: str
-    stage: str  # load/connect_old/connect_new/request_code/wait_code/sign_in/rotate_pwd/remove_devices/archive
+    stage: str  # load/connect_old/request_code/wait_code/sign_in/rotate_pwd/remove_devices
     success: bool
     error: str = ""
     detail: str = ""
@@ -5362,13 +5363,24 @@ def normalize_phone(phone: Any, default_country_prefix: str = None) -> str:
     
     # 如果是纯数字且长度合理（通常手机号10-15位）
     if phone_str.isdigit() and len(phone_str) >= 10:
-        # 添加国家前缀
-        return f"+{phone_str}"
+        # 如果数字很长（可能已包含国家代码），直接添加+
+        # 否则使用配置的国家前缀
+        if len(phone_str) >= 11:  # 国际号码通常11-15位
+            return f"+{phone_str}"
+        else:
+            # 短号码可能缺少国家代码，使用配置的前缀
+            # 去除前缀中的+，然后添加
+            prefix = default_country_prefix.lstrip('+')
+            return f"+{prefix}{phone_str}"
     
     # 其他情况尝试提取数字
     digits_only = ''.join(c for c in phone_str if c.isdigit())
     if digits_only and len(digits_only) >= 10:
-        return f"+{digits_only}"
+        if len(digits_only) >= 11:
+            return f"+{digits_only}"
+        else:
+            prefix = default_country_prefix.lstrip('+')
+            return f"+{prefix}{digits_only}"
     
     # 无法规范化，返回原始字符串
     return phone_str
@@ -5391,12 +5403,16 @@ def _find_available_port(preferred: int = 8080, max_tries: int = 20) -> Optional
             # 尝试绑定端口
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(1)
-            result = sock.connect_ex(('127.0.0.1', port))
-            sock.close()
-            
-            # 如果连接失败（端口未被占用），则该端口可用
-            if result != 0:
+            # 尝试绑定到端口（而不是连接）
+            try:
+                sock.bind(('127.0.0.1', port))
+                sock.close()
+                # 绑定成功，说明端口可用
                 return port
+            except OSError:
+                # 绑定失败（端口被占用），尝试下一个
+                sock.close()
+                continue
         except Exception:
             continue
     
