@@ -5403,6 +5403,312 @@ class RecoveryProtectionManager:
         except Exception as e:
             return False, f"获取设备列表失败: {str(e)[:80]}"
     
+    async def _stage_request_and_wait_code(self, old_client: TelegramClient, phone: str, context: RecoveryAccountContext) -> Optional[str]:
+        """阶段3+4: 请求并等待验证码"""
+        account_name = os.path.basename(context.original_path)
+        
+        # 阶段3: 请求验证码
+        stage_start = time.time()
+        try:
+            # 发送验证码请求
+            await old_client.send_code_request(phone)
+            
+            stage_result = RecoveryStageResult(
+                account_name=account_name,
+                phone=phone,
+                stage="request_code",
+                success=True,
+                detail="验证码请求已发送",
+                elapsed=time.time() - stage_start
+            )
+            context.stage_results.append(stage_result)
+            self.db.insert_recovery_log(stage_result)
+            
+        except Exception as e:
+            stage_result = RecoveryStageResult(
+                account_name=account_name,
+                phone=phone,
+                stage="request_code",
+                success=False,
+                error=str(e)[:200],
+                elapsed=time.time() - stage_start
+            )
+            context.stage_results.append(stage_result)
+            self.db.insert_recovery_log(stage_result)
+            return None
+        
+        # 阶段4: 等待验证码
+        stage_start = time.time()
+        try:
+            code = await self.wait_for_code(old_client, phone, timeout=config.RECOVERY_CODE_TIMEOUT)
+            
+            if code:
+                stage_result = RecoveryStageResult(
+                    account_name=account_name,
+                    phone=phone,
+                    stage="wait_code",
+                    success=True,
+                    detail=f"成功获取验证码: {code[:2]}***",
+                    elapsed=time.time() - stage_start
+                )
+                context.stage_results.append(stage_result)
+                self.db.insert_recovery_log(stage_result)
+                return code
+            else:
+                stage_result = RecoveryStageResult(
+                    account_name=account_name,
+                    phone=phone,
+                    stage="wait_code",
+                    success=False,
+                    error=f"等待超时({config.RECOVERY_CODE_TIMEOUT}秒)",
+                    elapsed=time.time() - stage_start
+                )
+                context.stage_results.append(stage_result)
+                self.db.insert_recovery_log(stage_result)
+                return None
+                
+        except Exception as e:
+            stage_result = RecoveryStageResult(
+                account_name=account_name,
+                phone=phone,
+                stage="wait_code",
+                success=False,
+                error=str(e)[:200],
+                elapsed=time.time() - stage_start
+            )
+            context.stage_results.append(stage_result)
+            self.db.insert_recovery_log(stage_result)
+            return None
+    
+    async def _stage_sign_in_new(self, phone: str, code: str, context: RecoveryAccountContext) -> Tuple[Optional[TelegramClient], bool]:
+        """阶段5: 新设备登录"""
+        account_name = os.path.basename(context.original_path)
+        stage_start = time.time()
+        new_client = None
+        
+        try:
+            # 生成新session文件名
+            timestamp = int(time.time())
+            new_session_name = f"safe_{phone}_{timestamp}"
+            new_session_path = os.path.join(config.RECOVERY_SAFE_DIR, f"{new_session_name}.session")
+            
+            # 创建新客户端
+            new_client = TelegramClient(
+                new_session_path.replace('.session', ''),
+                config.API_ID,
+                config.API_HASH
+            )
+            
+            # 连接
+            await new_client.connect()
+            
+            # 使用验证码登录
+            try:
+                await new_client.sign_in(phone, code)
+                
+                # 验证登录成功
+                me = await new_client.get_me()
+                if not me:
+                    raise Exception("登录成功但无法获取用户信息")
+                
+                # 更新上下文
+                context.new_session_path = new_session_path
+                
+                stage_result = RecoveryStageResult(
+                    account_name=account_name,
+                    phone=phone,
+                    stage="sign_in",
+                    success=True,
+                    detail=f"新设备登录成功: {new_session_name}",
+                    elapsed=time.time() - stage_start
+                )
+                context.stage_results.append(stage_result)
+                self.db.insert_recovery_log(stage_result)
+                
+                return new_client, True
+                
+            except SessionPasswordNeededError:
+                # 账号已有2FA密码
+                stage_result = RecoveryStageResult(
+                    account_name=account_name,
+                    phone=phone,
+                    stage="sign_in",
+                    success=False,
+                    error="账号已设置2FA，缺少旧密码",
+                    elapsed=time.time() - stage_start
+                )
+                context.stage_results.append(stage_result)
+                self.db.insert_recovery_log(stage_result)
+                
+                # 清理客户端
+                if new_client:
+                    await new_client.disconnect()
+                
+                return None, False
+                
+        except Exception as e:
+            stage_result = RecoveryStageResult(
+                account_name=account_name,
+                phone=phone,
+                stage="sign_in",
+                success=False,
+                error=str(e)[:200],
+                elapsed=time.time() - stage_start
+            )
+            context.stage_results.append(stage_result)
+            self.db.insert_recovery_log(stage_result)
+            
+            # 清理客户端
+            if new_client:
+                try:
+                    await new_client.disconnect()
+                except:
+                    pass
+            
+            return None, False
+    
+    async def _stage_rotate_pwd(self, new_client: TelegramClient, session_path: str, phone: str, context: RecoveryAccountContext) -> bool:
+        """阶段6: 设置/修改2FA密码"""
+        account_name = os.path.basename(context.original_path)
+        stage_start = time.time()
+        
+        try:
+            # 生成强密码（支持可选前缀）
+            password_prefix = os.getenv("RECOVERY_PASSWORD_PREFIX", "")
+            new_password = password_prefix + self.generate_strong_password()
+            
+            # 脱敏保存
+            context.new_password_masked = self.mask_password(new_password)
+            
+            # 修改2FA密码
+            try:
+                # 使用Telethon的edit_2fa方法
+                await new_client.edit_2fa(
+                    new_password=new_password,
+                    hint=f"Recovery {datetime.now().strftime('%Y%m%d')}"
+                )
+                
+                # 保存密码到JSON文件
+                json_path = session_path.replace('.session', '.json')
+                json_data = {
+                    'phone': phone,
+                    'password': new_password,
+                    'password_hint': f"Recovery {datetime.now().strftime('%Y%m%d')}",
+                    'updated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                }
+                
+                with open(json_path, 'w', encoding='utf-8') as f:
+                    json.dump(json_data, f, ensure_ascii=False, indent=2)
+                
+                stage_result = RecoveryStageResult(
+                    account_name=account_name,
+                    phone=phone,
+                    stage="rotate_pwd",
+                    success=True,
+                    detail=f"2FA密码已设置: {context.new_password_masked}",
+                    elapsed=time.time() - stage_start
+                )
+                context.stage_results.append(stage_result)
+                self.db.insert_recovery_log(stage_result)
+                
+                return True
+                
+            except AttributeError:
+                # edit_2fa不存在，使用手动方法
+                from telethon.tl.functions.account import UpdatePasswordSettingsRequest
+                from telethon.tl.types import account as account_types
+                
+                # 获取当前密码设置
+                password_settings = await new_client(functions.account.GetPasswordRequest())
+                
+                # 设置新密码
+                new_settings = account_types.PasswordInputSettings(
+                    new_algo=password_settings.current_algo,
+                    new_password_hash=new_password.encode('utf-8'),
+                    hint=f"Recovery {datetime.now().strftime('%Y%m%d')}"
+                )
+                
+                await new_client(UpdatePasswordSettingsRequest(
+                    password=account_types.InputCheckPasswordEmpty(),
+                    new_settings=new_settings
+                ))
+                
+                # 保存密码到JSON文件
+                json_path = session_path.replace('.session', '.json')
+                json_data = {
+                    'phone': phone,
+                    'password': new_password,
+                    'password_hint': f"Recovery {datetime.now().strftime('%Y%m%d')}",
+                    'updated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                }
+                
+                with open(json_path, 'w', encoding='utf-8') as f:
+                    json.dump(json_data, f, ensure_ascii=False, indent=2)
+                
+                stage_result = RecoveryStageResult(
+                    account_name=account_name,
+                    phone=phone,
+                    stage="rotate_pwd",
+                    success=True,
+                    detail=f"2FA密码已设置(手动方式): {context.new_password_masked}",
+                    elapsed=time.time() - stage_start
+                )
+                context.stage_results.append(stage_result)
+                self.db.insert_recovery_log(stage_result)
+                
+                return True
+                
+        except Exception as e:
+            stage_result = RecoveryStageResult(
+                account_name=account_name,
+                phone=phone,
+                stage="rotate_pwd",
+                success=False,
+                error=str(e)[:200],
+                elapsed=time.time() - stage_start
+            )
+            context.stage_results.append(stage_result)
+            self.db.insert_recovery_log(stage_result)
+            
+            return False
+    
+    async def _stage_remove_devices(self, new_client: TelegramClient, context: RecoveryAccountContext) -> bool:
+        """阶段7: 删除其他设备"""
+        account_name = os.path.basename(context.original_path)
+        phone = context.phone
+        stage_start = time.time()
+        
+        try:
+            success, detail = await self.remove_other_devices(new_client)
+            
+            stage_result = RecoveryStageResult(
+                account_name=account_name,
+                phone=phone,
+                stage="remove_devices",
+                success=success,
+                detail=detail if success else "",
+                error="" if success else detail,
+                elapsed=time.time() - stage_start
+            )
+            context.stage_results.append(stage_result)
+            self.db.insert_recovery_log(stage_result)
+            
+            return success
+            
+        except Exception as e:
+            stage_result = RecoveryStageResult(
+                account_name=account_name,
+                phone=phone,
+                stage="remove_devices",
+                success=False,
+                error=str(e)[:200],
+                elapsed=time.time() - stage_start
+            )
+            context.stage_results.append(stage_result)
+            self.db.insert_recovery_log(stage_result)
+            
+            return False
+    
     async def process_single_account(self, file_path: str, file_type: str, context: RecoveryAccountContext) -> RecoveryAccountContext:
         """处理单个账号 - 完整流程"""
         async with self.semaphore:
@@ -5418,22 +5724,88 @@ class RecoveryProtectionManager:
                     if file_type == "tdata":
                         # TData需要先转换
                         if not OPENTELE_AVAILABLE:
-                            raise Exception("opentele库未安装，无法转换TData")
+                            context.status = "abnormal"
+                            context.failure_reason = "opentele库未安装，无法转换TData"
+                            stage_result = RecoveryStageResult(
+                                account_name=account_name,
+                                phone=phone,
+                                stage="load",
+                                success=False,
+                                error="opentele库未安装",
+                                elapsed=time.time() - stage_start
+                            )
+                            context.stage_results.append(stage_result)
+                            self.db.insert_recovery_log(stage_result)
+                            return context
                         
-                        # 简化：实际应该调用转换器
-                        context.status = "abnormal"
-                        context.failure_reason = "TData自动转换功能待实现"
-                        stage_result = RecoveryStageResult(
-                            account_name=account_name,
-                            phone=phone,
-                            stage="load",
-                            success=False,
-                            error="TData需要预先转换为Session",
-                            elapsed=time.time() - stage_start
-                        )
-                        context.stage_results.append(stage_result)
-                        self.db.insert_recovery_log(stage_result)
-                        return context
+                        # 调用FormatConverter转换TData到Session
+                        try:
+                            converter = FormatConverter(self.db)
+                            tdata_name = os.path.basename(file_path)
+                            status, message, _ = await converter.convert_tdata_to_session(
+                                file_path, tdata_name, config.API_ID, config.API_HASH
+                            )
+                            
+                            if status != "转换成功":
+                                context.status = "abnormal"
+                                context.failure_reason = f"TData转换失败: {message}"
+                                stage_result = RecoveryStageResult(
+                                    account_name=account_name,
+                                    phone=phone,
+                                    stage="load",
+                                    success=False,
+                                    error=f"TData转换失败: {message[:150]}",
+                                    elapsed=time.time() - stage_start
+                                )
+                                context.stage_results.append(stage_result)
+                                self.db.insert_recovery_log(stage_result)
+                                return context
+                            
+                            # 提取手机号
+                            match = re.search(r'手机号:\s*(\+?\d+)', message)
+                            if match:
+                                phone = match.group(1)
+                            
+                            # 查找转换后的session文件
+                            sessions_dir = os.path.join(os.getcwd(), "sessions")
+                            session_files = [f for f in os.listdir(sessions_dir) if f.endswith('.session')]
+                            if not session_files:
+                                raise Exception("转换成功但未找到session文件")
+                            
+                            # 使用最新的session文件
+                            session_files.sort(key=lambda x: os.path.getmtime(os.path.join(sessions_dir, x)), reverse=True)
+                            converted_session = os.path.join(sessions_dir, session_files[0])
+                            
+                            # 更新file_path和context
+                            file_path = converted_session
+                            context.old_session_path = converted_session
+                            context.phone = phone
+                            
+                            stage_result = RecoveryStageResult(
+                                account_name=account_name,
+                                phone=phone,
+                                stage="load",
+                                success=True,
+                                detail=f"TData转换成功: {message[:100]}",
+                                elapsed=time.time() - stage_start
+                            )
+                            context.stage_results.append(stage_result)
+                            self.db.insert_recovery_log(stage_result)
+                            
+                        except Exception as e:
+                            context.status = "abnormal"
+                            context.failure_reason = f"TData转换异常: {str(e)[:100]}"
+                            stage_result = RecoveryStageResult(
+                                account_name=account_name,
+                                phone=phone,
+                                stage="load",
+                                success=False,
+                                error=str(e)[:200],
+                                elapsed=time.time() - stage_start
+                            )
+                            context.stage_results.append(stage_result)
+                            self.db.insert_recovery_log(stage_result)
+                            return context
                     
                     # Session文件处理
                     if not file_path.endswith('.session'):
@@ -5524,20 +5896,39 @@ class RecoveryProtectionManager:
                     self.db.insert_recovery_log(stage_result)
                     return context
                 
-                # ===== 阶段3-9: 其他阶段（简化实现） =====
-                # 由于完整实现涉及：
-                # - 创建新session
-                # - 请求验证码
-                # - 监听777000获取验证码
-                # - 使用验证码登录新设备
-                # - 修改或设置2FA密码
-                # - 删除其他设备授权
-                # - 归档新session和元数据
-                # 这些需要大量测试和调试，这里提供框架
+                # ===== 阶段3+4: 请求并等待验证码 =====
+                code = await self._stage_request_and_wait_code(old_client, phone, context)
+                if not code:
+                    context.status = "timeout"
+                    context.failure_reason = "验证码超时或获取失败"
+                    return context
                 
-                # 标记为部分成功（核心功能待完善）
-                context.status = "partial"
-                context.failure_reason = "完整防找回流程待实现（已完成连接验证）"
+                # ===== 阶段5: 新设备登录 =====
+                new_client, sign_in_success = await self._stage_sign_in_new(phone, code, context)
+                if not sign_in_success:
+                    context.status = "failed"
+                    context.failure_reason = "新设备登录失败"
+                    return context
+                
+                # ===== 阶段6: 设置/修改2FA密码 =====
+                pwd_success = await self._stage_rotate_pwd(new_client, context.new_session_path, phone, context)
+                if not pwd_success:
+                    context.status = "partial"
+                    context.failure_reason = "2FA密码设置失败"
+                    # 继续尝试删除其他设备
+                
+                # ===== 阶段7: 删除其他设备 =====
+                devices_success = await self._stage_remove_devices(new_client, context)
+                if not devices_success and pwd_success:
+                    context.status = "partial"
+                    context.failure_reason = "删除其他设备失败"
+                elif not devices_success and not pwd_success:
+                    context.status = "partial"
+                    context.failure_reason = "2FA密码设置和删除设备均失败"
+                elif pwd_success and devices_success:
+                    # 所有阶段成功
+                    context.status = "success"
+                    context.failure_reason = ""
                 
             except Exception as e:
                 context.status = "failed"
@@ -5633,8 +6024,8 @@ class RecoveryProtectionManager:
         
         return report_data
     
-    def generate_reports(self, report_data: Dict) -> Tuple[str, str, str]:
-        """生成报告文件"""
+    def generate_reports(self, report_data: Dict) -> Tuple[str, str, str, str, str]:
+        """生成报告文件，返回(txt_path, csv_path, success_zip_path, failed_zip_path, all_zip_path)"""
         batch_id = report_data['batch_id']
         counters = report_data['counters']
         contexts = report_data['contexts']
@@ -5669,7 +6060,7 @@ class RecoveryProtectionManager:
                     f"{total_time:.2f}s"
                 ])
         
-        # 移动文件到对应目录
+        # 移动文件到对应目录并复制新session文件
         for ctx in contexts:
             if not ctx.original_path or not os.path.exists(ctx.original_path):
                 continue
@@ -5686,12 +6077,12 @@ class RecoveryProtectionManager:
             else:
                 target_dir = config.RECOVERY_FAILED_DIR
             
-            # 移动session文件及相关JSON文件
+            # 移动旧session文件及相关JSON文件
             try:
                 base_name = os.path.basename(ctx.original_path)
                 target_path = os.path.join(target_dir, base_name)
                 
-                # 复制session文件
+                # 复制旧session文件
                 if os.path.exists(ctx.original_path):
                     shutil.copy2(ctx.original_path, target_path)
                 
@@ -5701,12 +6092,88 @@ class RecoveryProtectionManager:
                     json_target = target_path.replace('.session', '.json')
                     shutil.copy2(json_path, json_target)
                 
+                # 如果有新session文件，也复制到目标目录
+                if ctx.new_session_path and os.path.exists(ctx.new_session_path):
+                    new_base_name = os.path.basename(ctx.new_session_path)
+                    new_target_path = os.path.join(target_dir, new_base_name)
+                    shutil.copy2(ctx.new_session_path, new_target_path)
+                    
+                    # 复制新session的JSON文件
+                    new_json_path = ctx.new_session_path.replace('.session', '.json')
+                    if os.path.exists(new_json_path):
+                        new_json_target = new_target_path.replace('.session', '.json')
+                        shutil.copy2(new_json_path, new_json_target)
+                
             except Exception as e:
                 print(f"⚠️ 移动文件失败 {ctx.original_path}: {e}")
         
-        # 创建ZIP归档
-        zip_path = os.path.join(config.RECOVERY_REPORTS_DIR, f"batch_{batch_id}_archives.zip")
-        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+        # 创建成功账号ZIP
+        success_contexts = [ctx for ctx in contexts if ctx.status == "success"]
+        success_zip_path = os.path.join(config.RECOVERY_REPORTS_DIR, f"{batch_id}_success.zip")
+        
+        if success_contexts:
+            with zipfile.ZipFile(success_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for ctx in success_contexts:
+                    # 添加新session文件
+                    if ctx.new_session_path and os.path.exists(ctx.new_session_path):
+                        zf.write(ctx.new_session_path, os.path.basename(ctx.new_session_path))
+                        
+                        # 添加新session的JSON文件
+                        new_json_path = ctx.new_session_path.replace('.session', '.json')
+                        if os.path.exists(new_json_path):
+                            zf.write(new_json_path, os.path.basename(new_json_path))
+        else:
+            # 创建空的成功ZIP
+            with zipfile.ZipFile(success_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr('README.txt', '本批次没有成功的账号')
+        
+        # 创建失败账号ZIP（包含失败、异常、超时账号）
+        failed_contexts = [ctx for ctx in contexts if ctx.status in ("failed", "abnormal", "timeout")]
+        failed_zip_path = os.path.join(config.RECOVERY_REPORTS_DIR, f"{batch_id}_failed.zip")
+        
+        if failed_contexts:
+            with zipfile.ZipFile(failed_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for ctx in failed_contexts:
+                    account_name = os.path.basename(ctx.original_path)
+                    
+                    # 创建失败原因说明文件
+                    failure_txt = f"账号: {account_name}\n"
+                    failure_txt += f"手机号: {ctx.phone}\n"
+                    failure_txt += f"最终状态: {ctx.status}\n"
+                    failure_txt += f"失败原因: {ctx.failure_reason}\n"
+                    failure_txt += f"代理使用: {ctx.proxy_used}\n\n"
+                    failure_txt += "处理阶段详情:\n"
+                    failure_txt += "=" * 50 + "\n"
+                    
+                    for stage_result in ctx.stage_results:
+                        failure_txt += f"\n阶段: {stage_result.stage}\n"
+                        failure_txt += f"  成功: {'是' if stage_result.success else '否'}\n"
+                        if stage_result.error:
+                            failure_txt += f"  错误: {stage_result.error}\n"
+                        if stage_result.detail:
+                            failure_txt += f"  详情: {stage_result.detail}\n"
+                        failure_txt += f"  耗时: {stage_result.elapsed:.2f}秒\n"
+                    
+                    # 添加失败原因文件到ZIP
+                    failure_filename = f"{account_name.replace('.session', '')}_failure_reason.txt"
+                    zf.writestr(failure_filename, failure_txt)
+                    
+                    # 添加旧session文件
+                    if os.path.exists(ctx.original_path):
+                        zf.write(ctx.original_path, os.path.basename(ctx.original_path))
+                        
+                        # 添加旧session的JSON文件
+                        json_path = ctx.original_path.replace('.session', '.json')
+                        if os.path.exists(json_path):
+                            zf.write(json_path, os.path.basename(json_path))
+        else:
+            # 创建空的失败ZIP
+            with zipfile.ZipFile(failed_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr('README.txt', '本批次没有失败的账号')
+        
+        # 创建完整归档ZIP（包含所有分类）
+        all_zip_path = os.path.join(config.RECOVERY_REPORTS_DIR, f"batch_{batch_id}_all_archives.zip")
+        with zipfile.ZipFile(all_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
             # 添加报告文件
             zf.write(txt_path, os.path.basename(txt_path))
             zf.write(csv_path, os.path.basename(csv_path))
@@ -5726,7 +6193,7 @@ class RecoveryProtectionManager:
                             arcname = os.path.join(dir_name, file)
                             zf.write(file_path, arcname)
         
-        return txt_path, csv_path, zip_path
+        return txt_path, csv_path, success_zip_path, failed_zip_path, all_zip_path
 
 
 # ================================
@@ -9705,36 +10172,14 @@ class EnhancedBot:
                     except:
                         pass
             
-            # 简化版批量处理（实际应该调用recovery_manager.run_batch）
-            # 这里先创建一个简单的模拟结果
-            batch_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-            counters = {
-                'total': total_files,
-                'success': 0,
-                'abnormal': 0,
-                'failed': 0,
-                'code_timeout': 0,
-                'partial': 0
-            }
+            # 运行真实的批量处理
+            report_data = await self.recovery_manager.run_batch(file_list, progress_callback)
             
-            # 由于完整实现太复杂，这里提供简化版本
-            # 实际应该: report_data = await self.recovery_manager.run_batch(file_list, progress_callback)
-            # 为了演示，我们模拟处理结果
-            for i, (file_path, ftype) in enumerate(file_list):
-                progress_callback(i + 1, total_files, counters)
-                await asyncio.sleep(0.1)  # 模拟处理时间
-                # 简化：所有文件标记为需要进一步实现
-                counters['abnormal'] += 1
-            
-            # 保存汇总到数据库
-            self.db.insert_recovery_summary(batch_id, counters)
+            batch_id = report_data['batch_id']
+            counters = report_data['counters']
             
             # 生成报告
-            txt_path, csv_path, zip_path = self.recovery_manager.generate_reports({
-                'batch_id': batch_id,
-                'counters': counters,
-                'contexts': []
-            })
+            txt_path, csv_path, success_zip_path, failed_zip_path, all_zip_path = self.recovery_manager.generate_reports(report_data)
             
             # 发送结果
             elapsed = time.time() - start_time
@@ -9771,7 +10216,7 @@ class EnhancedBot:
                             chat_id=user_id,
                             document=f,
                             filename=os.path.basename(txt_path),
-                            caption="📄 汇总报告"
+                            caption=f"📄 防止找回结果报告 (批次 {batch_id})"
                         )
             except Exception as e:
                 print(f"发送TXT报告失败: {e}")
@@ -9783,22 +10228,50 @@ class EnhancedBot:
                             chat_id=user_id,
                             document=f,
                             filename=os.path.basename(csv_path),
-                            caption="📊 详细报告"
+                            caption=f"📊 防止找回详细报告 (批次 {batch_id})"
                         )
             except Exception as e:
                 print(f"发送CSV报告失败: {e}")
             
+            # 发送成功账号ZIP
             try:
-                if os.path.exists(zip_path):
-                    with open(zip_path, 'rb') as f:
+                if os.path.exists(success_zip_path) and counters['success'] > 0:
+                    with open(success_zip_path, 'rb') as f:
                         context.bot.send_document(
                             chat_id=user_id,
                             document=f,
-                            filename=os.path.basename(zip_path),
-                            caption="📦 批次归档"
+                            filename=os.path.basename(success_zip_path),
+                            caption=f"✅ 成功账号打包 (批次 {batch_id}) - 共 {counters['success']} 个账号"
                         )
             except Exception as e:
-                print(f"发送ZIP归档失败: {e}")
+                print(f"发送成功ZIP失败: {e}")
+            
+            # 发送失败账号ZIP
+            try:
+                failed_count = counters['failed'] + counters['abnormal'] + counters['code_timeout']
+                if os.path.exists(failed_zip_path) and failed_count > 0:
+                    with open(failed_zip_path, 'rb') as f:
+                        context.bot.send_document(
+                            chat_id=user_id,
+                            document=f,
+                            filename=os.path.basename(failed_zip_path),
+                            caption=f"❌ 失败/异常账号打包 (批次 {batch_id}) - 共 {failed_count} 个账号\n包含详细失败原因说明"
+                        )
+            except Exception as e:
+                print(f"发送失败ZIP失败: {e}")
+            
+            # 发送完整归档ZIP（可选，只在有部分成功时发送）
+            try:
+                if os.path.exists(all_zip_path) and counters['partial'] > 0:
+                    with open(all_zip_path, 'rb') as f:
+                        context.bot.send_document(
+                            chat_id=user_id,
+                            document=f,
+                            filename=os.path.basename(all_zip_path),
+                            caption=f"📦 完整归档 (批次 {batch_id}) - 包含所有分类"
+                        )
+            except Exception as e:
+                print(f"发送完整归档ZIP失败: {e}")
             
         except Exception as e:
             print(f"防止找回处理异常: {e}")
