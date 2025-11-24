@@ -28,8 +28,9 @@ import time
 import re
 import secrets
 import csv
+import traceback
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, NamedTuple
 from dataclasses import dataclass, field
 from io import BytesIO
 import threading
@@ -37,7 +38,7 @@ import struct
 import base64
 from pathlib import Path
 from dataclasses import dataclass
-from collections import deque
+from collections import deque, namedtuple
 print("🔍 Telegram账号检测机器人 V8.0")
 print(f"📅 当前时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
@@ -74,8 +75,7 @@ except ImportError as e:
 
 try:
     from telethon import TelegramClient, functions
-    from telethon.errors import *
-    from telethon.errors import FloodWaitError, SessionPasswordNeededError
+    from telethon.errors import FloodWaitError, SessionPasswordNeededError, RPCError
     from telethon.tl.functions.messages import SendMessageRequest, GetHistoryRequest
     TELETHON_AVAILABLE = True
     print("✅ telethon库导入成功")
@@ -139,6 +139,16 @@ class RecoveryStageResult:
     error: str = ""
     detail: str = ""
     elapsed: float = 0.0
+
+# 报告生成结果（命名元组，提高可读性）
+RecoveryReportFiles = namedtuple('RecoveryReportFiles', [
+    'summary_txt',      # 汇总报告文本文件
+    'detail_csv',       # 账号级别详细CSV
+    'stages_csv',       # 阶段级别详细CSV
+    'success_zip',      # 成功账号ZIP
+    'failed_zip',       # 失败账号ZIP
+    'all_archives_zip'  # 完整归档ZIP
+])
 
 @dataclass
 class RecoveryAccountContext:
@@ -5399,22 +5409,27 @@ def _find_available_port(preferred: int = 8080, max_tries: int = 20) -> Optional
     import socket
     
     for port in range(preferred, preferred + max_tries):
+        sock = None
         try:
             # 尝试绑定端口
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(1)
             # 尝试绑定到端口（而不是连接）
-            try:
-                sock.bind(('127.0.0.1', port))
-                sock.close()
-                # 绑定成功，说明端口可用
-                return port
-            except OSError:
-                # 绑定失败（端口被占用），尝试下一个
-                sock.close()
-                continue
+            sock.bind(('127.0.0.1', port))
+            # 绑定成功，说明端口可用
+            return port
+        except OSError:
+            # 绑定失败（端口被占用），尝试下一个
+            continue
         except Exception:
             continue
+        finally:
+            # 确保socket总是被关闭
+            if sock:
+                try:
+                    sock.close()
+                except:
+                    pass
     
     return None
 
@@ -5728,7 +5743,6 @@ class RecoveryProtectionManager:
                 # 捕获类型错误（phone 格式问题）
                 last_error = f"TypeError: {str(e)}"
                 print(f"❌ [{account_name}] 类型错误: {e}")
-                import traceback
                 if config.DEBUG_RECOVERY:
                     print(f"🔍 [{account_name}] 堆栈跟踪:\n{traceback.format_exc()}")
                 break  # 类型错误不重试
@@ -5750,7 +5764,6 @@ class RecoveryProtectionManager:
             except Exception as e:
                 last_error = str(e)
                 print(f"❌ [{account_name}] 发送验证码请求失败 (尝试 {retry + 1}/{config.RECOVERY_CODE_REQUEST_RETRIES + 1}): {e}")
-                import traceback
                 if config.DEBUG_RECOVERY:
                     print(f"🔍 [{account_name}] 堆栈跟踪:\n{traceback.format_exc()}")
                 
@@ -5807,7 +5820,6 @@ class RecoveryProtectionManager:
                 return None
                 
         except Exception as e:
-            import traceback
             error_detail = str(e)[:200]
             if config.DEBUG_RECOVERY:
                 print(f"❌ [{account_name}] 等待验证码异常:\n{traceback.format_exc()}")
@@ -6343,7 +6355,6 @@ class RecoveryProtectionManager:
                     context.failure_reason = ""
                 
             except Exception as e:
-                import traceback
                 context.status = "failed"
                 context.failure_reason = f"处理异常: {str(e)[:100]}"
                 print(f"❌ 账号 {account_name} 处理失败: {e}")
@@ -6439,8 +6450,8 @@ class RecoveryProtectionManager:
         
         return report_data
     
-    def generate_reports(self, report_data: Dict) -> Tuple[str, str, str, str, str, str]:
-        """生成报告文件，返回(txt_path, csv_path, csv_stages_path, success_zip_path, failed_zip_path, all_zip_path)"""
+    def generate_reports(self, report_data: Dict) -> RecoveryReportFiles:
+        """生成报告文件，返回 RecoveryReportFiles 命名元组"""
         batch_id = report_data['batch_id']
         counters = report_data['counters']
         contexts = report_data['contexts']
@@ -6670,7 +6681,14 @@ class RecoveryProtectionManager:
                             arcname = os.path.join(dir_name, file)
                             zf.write(file_path, arcname)
         
-        return txt_path, csv_path, csv_stages_path, success_zip_path, failed_zip_path, all_zip_path
+        return RecoveryReportFiles(
+            summary_txt=txt_path,
+            detail_csv=csv_path,
+            stages_csv=csv_stages_path,
+            success_zip=success_zip_path,
+            failed_zip=failed_zip_path,
+            all_archives_zip=all_zip_path
+        )
 
 
 # ================================
