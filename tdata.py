@@ -703,6 +703,9 @@ class Config:
         self.PROXY_RETRY_COUNT = int(os.getenv("PROXY_RETRY_COUNT", "2"))
         self.PROXY_BATCH_SIZE = int(os.getenv("PROXY_BATCH_SIZE", "20"))
         self.PROXY_USAGE_LOG_LIMIT = int(os.getenv("PROXY_USAGE_LOG_LIMIT", "500"))
+        self.PROXY_ROTATE_RETRIES = int(os.getenv("PROXY_ROTATE_RETRIES", "2"))
+        self.PROXY_SHOW_FAILURE_REASON = os.getenv("PROXY_SHOW_FAILURE_REASON", "true").lower() == "true"
+        self.PROXY_DEBUG_VERBOSE = os.getenv("PROXY_DEBUG_VERBOSE", "false").lower() == "true"
         
         # 防止找回配置
         self.RECOVERY_CONCURRENT = int(os.getenv("RECOVERY_CONCURRENT", "10"))
