@@ -5335,16 +5335,20 @@ class RecoveryProtectionManager:
         return f"{password[:3]}***{password[-3:]}"
     
     async def wait_for_code(self, old_client: TelegramClient, phone: str, timeout: int = 300) -> Optional[str]:
-        """等待777000验证码"""
+        """等待777000验证码（带进度日志）"""
         start_time = time.time()
+        last_log_time = start_time
         
         try:
             # 获取777000实体
+            print(f"🔍 开始监听777000获取验证码 (超时: {timeout}秒)")
             entity = await old_client.get_entity(777000)
             
             # 轮询消息
+            poll_count = 0
             while time.time() - start_time < timeout:
                 messages = await old_client.get_messages(entity, limit=3)
+                poll_count += 1
                 
                 for msg in messages:
                     if msg.text:
@@ -5352,16 +5356,27 @@ class RecoveryProtectionManager:
                         match = re.search(r'\b(\d{5,6})\b', msg.text)
                         if match:
                             code = match.group(1)
-                            print(f"✅ 获取到验证码: {code[:2]}***")
+                            elapsed = time.time() - start_time
+                            print(f"✅ 获取到验证码: {code[:2]}*** (耗时: {elapsed:.1f}秒)")
                             return code
+                
+                # 每30秒打印一次进度日志
+                current_time = time.time()
+                if current_time - last_log_time >= 30:
+                    elapsed = current_time - start_time
+                    remaining = timeout - elapsed
+                    print(f"⏳ 等待验证码中... 已等待 {elapsed:.0f}秒, 剩余 {remaining:.0f}秒 (轮询次数: {poll_count})")
+                    last_log_time = current_time
                 
                 await asyncio.sleep(3)
             
-            print(f"⏱️ 等待验证码超时 ({timeout}秒)")
+            elapsed = time.time() - start_time
+            print(f"⏱️ 等待验证码超时 ({elapsed:.0f}/{timeout}秒, 轮询 {poll_count} 次)")
             return None
             
         except Exception as e:
-            print(f"❌ 获取验证码失败: {e}")
+            elapsed = time.time() - start_time
+            print(f"❌ 获取验证码失败 (耗时: {elapsed:.1f}秒): {e}")
             return None
     
     async def connect_with_proxy_retry(self, client: TelegramClient, phone: str) -> Tuple[bool, str, float]:
@@ -5463,14 +5478,16 @@ class RecoveryProtectionManager:
             return False, f"获取设备列表失败: {str(e)[:80]}"
     
     async def _stage_request_and_wait_code(self, old_client: TelegramClient, phone: str, context: RecoveryAccountContext) -> Optional[str]:
-        """阶段3+4: 请求并等待验证码"""
+        """阶段3+4: 请求并等待验证码（带详细日志）"""
         account_name = os.path.basename(context.original_path)
         
         # 阶段3: 请求验证码
         stage_start = time.time()
         try:
             # 发送验证码请求
+            print(f"📤 [{account_name}] 向 {phone} 发送验证码请求...")
             await old_client.send_code_request(phone)
+            print(f"✅ [{account_name}] 验证码请求已发送")
             
             stage_result = RecoveryStageResult(
                 account_name=account_name,
@@ -5484,6 +5501,7 @@ class RecoveryProtectionManager:
             self.db.insert_recovery_log(stage_result)
             
         except Exception as e:
+            print(f"❌ [{account_name}] 发送验证码请求失败: {e}")
             stage_result = RecoveryStageResult(
                 account_name=account_name,
                 phone=phone,
@@ -5498,6 +5516,7 @@ class RecoveryProtectionManager:
         
         # 阶段4: 等待验证码
         stage_start = time.time()
+        print(f"⏳ [{account_name}] 开始等待验证码 (超时: {config.RECOVERY_CODE_TIMEOUT}秒)...")
         try:
             code = await self.wait_for_code(old_client, phone, timeout=config.RECOVERY_CODE_TIMEOUT)
             
@@ -5893,7 +5912,7 @@ class RecoveryProtectionManager:
                     if not file_path.endswith('.session'):
                         raise Exception("文件格式不正确，需要.session文件")
                     
-                    # 尝试提取手机号（从文件名或JSON）
+                    # 尝试提取手机号（优先级：JSON > 文件名）
                     json_path = file_path.replace('.session', '.json')
                     if os.path.exists(json_path):
                         try:
@@ -5902,6 +5921,15 @@ class RecoveryProtectionManager:
                                 phone = json_data.get('phone', phone)
                         except:
                             pass
+                    
+                    # 如果还是unknown，尝试从文件名提取
+                    if phone == "unknown":
+                        # 尝试匹配文件名中的手机号（例如：94755614208.session）
+                        filename = os.path.basename(file_path)
+                        phone_match = re.search(r'(\+?\d{10,15})', filename)
+                        if phone_match:
+                            phone = phone_match.group(1)
+                            print(f"📱 从文件名提取手机号: {phone}")
                     
                     context.phone = phone
                     stage_result = RecoveryStageResult(
@@ -5951,6 +5979,12 @@ class RecoveryProtectionManager:
                     me = await old_client.get_me()
                     if not me:
                         raise Exception("Session未授权或已失效")
+                    
+                    # 如果之前没有获取到手机号，现在从账号信息中获取
+                    if phone == "unknown" and me.phone:
+                        phone = me.phone
+                        context.phone = phone
+                        print(f"📱 从账号信息获取手机号: {phone}")
                     
                     stage_result = RecoveryStageResult(
                         account_name=account_name,
