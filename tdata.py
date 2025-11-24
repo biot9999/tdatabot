@@ -717,6 +717,17 @@ class Config:
         self.RECOVERY_ENABLE_PROXY = os.getenv("RECOVERY_ENABLE_PROXY", "true").lower() == "true"
         self.RECOVERY_PROXY_RETRIES = int(os.getenv("RECOVERY_PROXY_RETRIES", "2"))
         
+        # 防风控配置：设备信息随机化
+        self.RECOVERY_DEVICE_MODEL = os.getenv("RECOVERY_DEVICE_MODEL", "")  # 留空则随机
+        self.RECOVERY_SYSTEM_VERSION = os.getenv("RECOVERY_SYSTEM_VERSION", "")  # 留空则随机
+        self.RECOVERY_APP_VERSION = os.getenv("RECOVERY_APP_VERSION", "")  # 留空则随机
+        self.RECOVERY_LANG_CODE = os.getenv("RECOVERY_LANG_CODE", "en")
+        
+        # 防风控配置：行为控制
+        self.RECOVERY_DELAY_AFTER_LOGIN = float(os.getenv("RECOVERY_DELAY_AFTER_LOGIN", "3.0"))  # 登录后延迟
+        self.RECOVERY_DELAY_BEFORE_2FA = float(os.getenv("RECOVERY_DELAY_BEFORE_2FA", "2.0"))  # 2FA前延迟
+        self.RECOVERY_DELAY_AFTER_2FA = float(os.getenv("RECOVERY_DELAY_AFTER_2FA", "3.0"))  # 2FA后延迟
+        
         # 获取当前脚本目录
         self.SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
         
@@ -790,6 +801,15 @@ RECOVERY_DEVICE_KILL_RETRIES=2
 RECOVERY_DEVICE_KILL_DELAY=1.0
 RECOVERY_ENABLE_PROXY=true
 RECOVERY_PROXY_RETRIES=2
+# 防风控配置：设备信息（留空则随机）
+RECOVERY_DEVICE_MODEL=
+RECOVERY_SYSTEM_VERSION=
+RECOVERY_APP_VERSION=
+RECOVERY_LANG_CODE=en
+# 防风控配置：行为延迟（秒）
+RECOVERY_DELAY_AFTER_LOGIN=3.0
+RECOVERY_DELAY_BEFORE_2FA=2.0
+RECOVERY_DELAY_AFTER_2FA=3.0
 """
             with open(".env", "w", encoding="utf-8") as f:
                 f.write(env_content)
@@ -5248,6 +5268,45 @@ class RecoveryProtectionManager:
         self.db = db
         self.semaphore = asyncio.Semaphore(config.RECOVERY_CONCURRENT)
     
+    def _get_random_device_info(self) -> Tuple[str, str, str]:
+        """生成随机设备信息以防风控"""
+        # 使用配置的设备信息，如果未配置则随机生成
+        
+        if config.RECOVERY_DEVICE_MODEL:
+            device_model = config.RECOVERY_DEVICE_MODEL
+        else:
+            # 随机选择常见设备型号
+            devices = [
+                "Samsung SM-G973F", "iPhone 12 Pro", "Xiaomi Redmi Note 10",
+                "OnePlus 9 Pro", "Google Pixel 5", "Huawei P40 Pro",
+                "iPhone 13", "Samsung SM-A52", "Xiaomi Mi 11",
+                "OnePlus Nord", "Realme GT", "OPPO Find X3"
+            ]
+            device_model = random.choice(devices)
+        
+        if config.RECOVERY_SYSTEM_VERSION:
+            system_version = config.RECOVERY_SYSTEM_VERSION
+        else:
+            # 根据设备型号生成合理的系统版本
+            if "iPhone" in device_model or "iPad" in device_model:
+                ios_versions = ["iOS 15.5", "iOS 15.6", "iOS 16.0", "iOS 16.1", "iOS 16.2"]
+                system_version = random.choice(ios_versions)
+            else:
+                android_versions = ["Android 11", "Android 12", "Android 13"]
+                system_version = random.choice(android_versions)
+        
+        if config.RECOVERY_APP_VERSION:
+            app_version = config.RECOVERY_APP_VERSION
+        else:
+            # 使用最新稳定版本的 Telegram
+            if "iOS" in system_version:
+                versions = ["9.2.1", "9.3.0", "9.3.1"]
+            else:
+                versions = ["9.2.3", "9.3.2", "9.4.0"]
+            app_version = random.choice(versions)
+        
+        return device_model, system_version, app_version
+    
     def generate_strong_password(self) -> str:
         """生成强密码"""
         length = config.RECOVERY_PASSWORD_LENGTH
@@ -5481,7 +5540,7 @@ class RecoveryProtectionManager:
             return None
     
     async def _stage_sign_in_new(self, phone: str, code: str, context: RecoveryAccountContext) -> Tuple[Optional[TelegramClient], bool]:
-        """阶段5: 新设备登录"""
+        """阶段5: 新设备登录（带防风控措施）"""
         account_name = os.path.basename(context.original_path)
         stage_start = time.time()
         new_client = None
@@ -5492,11 +5551,19 @@ class RecoveryProtectionManager:
             new_session_name = f"safe_{phone}_{timestamp}"
             new_session_path = os.path.join(config.RECOVERY_SAFE_DIR, f"{new_session_name}.session")
             
-            # 创建新客户端
+            # 获取随机设备信息（防风控）
+            device_model, system_version, app_version = self._get_random_device_info()
+            
+            # 创建新客户端（使用随机设备信息）
             new_client = TelegramClient(
                 new_session_path.replace('.session', ''),
                 config.API_ID,
-                config.API_HASH
+                config.API_HASH,
+                device_model=device_model,
+                system_version=system_version,
+                app_version=app_version,
+                lang_code=config.RECOVERY_LANG_CODE,
+                system_lang_code=config.RECOVERY_LANG_CODE
             )
             
             # 连接
@@ -5505,6 +5572,9 @@ class RecoveryProtectionManager:
             # 使用验证码登录
             try:
                 await new_client.sign_in(phone, code)
+                
+                # 登录后延迟，模拟真实用户行为（防风控）
+                await asyncio.sleep(config.RECOVERY_DELAY_AFTER_LOGIN)
                 
                 # 验证登录成功
                 me = await new_client.get_me()
@@ -5519,7 +5589,7 @@ class RecoveryProtectionManager:
                     phone=phone,
                     stage="sign_in",
                     success=True,
-                    detail=f"新设备登录成功: {new_session_name}",
+                    detail=f"新设备登录成功: {new_session_name} (设备: {device_model})",
                     elapsed=time.time() - stage_start
                 )
                 context.stage_results.append(stage_result)
@@ -5568,11 +5638,14 @@ class RecoveryProtectionManager:
             return None, False
     
     async def _stage_rotate_pwd(self, new_client: TelegramClient, session_path: str, phone: str, context: RecoveryAccountContext) -> bool:
-        """阶段6: 设置/修改2FA密码"""
+        """阶段6: 设置/修改2FA密码（带防风控延迟）"""
         account_name = os.path.basename(context.original_path)
         stage_start = time.time()
         
         try:
+            # 2FA操作前延迟，模拟真实用户行为（防风控）
+            await asyncio.sleep(config.RECOVERY_DELAY_BEFORE_2FA)
+            
             # 生成强密码（支持可选前缀）
             password_prefix = os.getenv("RECOVERY_PASSWORD_PREFIX", "")
             new_password = password_prefix + self.generate_strong_password()
@@ -5587,6 +5660,9 @@ class RecoveryProtectionManager:
                     new_password=new_password,
                     hint=f"Recovery {datetime.now().strftime('%Y%m%d')}"
                 )
+                
+                # 2FA操作后延迟，模拟真实用户行为（防风控）
+                await asyncio.sleep(config.RECOVERY_DELAY_AFTER_2FA)
                 
                 # 保存密码到JSON文件
                 json_path = session_path.replace('.session', '.json')
