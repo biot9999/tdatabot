@@ -5939,8 +5939,9 @@ class RecoveryProtectionManager:
                             phone = phone_match.group(1)
                             print(f"📱 从文件名提取手机号: {phone}")
                     
-                    # 确保phone最终是字符串类型
-                    context.phone = str(phone) if phone else "unknown"
+                    # 确保phone最终是字符串类型（同时更新本地变量和context）
+                    phone = str(phone) if phone else "unknown"
+                    context.phone = phone
                     stage_result = RecoveryStageResult(
                         account_name=account_name,
                         phone=phone,
