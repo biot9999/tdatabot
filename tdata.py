@@ -5615,15 +5615,18 @@ class RecoveryProtectionManager:
                 
             except AttributeError:
                 # edit_2fa不存在，使用手动方法
-                from telethon.tl.functions.account import UpdatePasswordSettingsRequest
+                from telethon.tl.functions.account import UpdatePasswordSettingsRequest, GetPasswordRequest
                 from telethon.tl.types import account as account_types
                 
                 # 获取当前密码设置
-                password_settings = await new_client(functions.account.GetPasswordRequest())
+                password_settings = await new_client(GetPasswordRequest())
                 
-                # 设置新密码
+                # 设置新密码（简化：如果已有密码，直接报错让用户处理）
+                if password_settings.has_password:
+                    raise Exception("账号已设置2FA密码，无法通过手动方式设置")
+                
                 new_settings = account_types.PasswordInputSettings(
-                    new_algo=password_settings.current_algo,
+                    new_algo=password_settings.new_algo,
                     new_password_hash=new_password.encode('utf-8'),
                     hint=f"Recovery {datetime.now().strftime('%Y%m%d')}"
                 )
@@ -5768,6 +5771,9 @@ class RecoveryProtectionManager:
                             
                             # 查找转换后的session文件
                             sessions_dir = os.path.join(os.getcwd(), "sessions")
+                            if not os.path.exists(sessions_dir):
+                                raise Exception("sessions目录不存在")
+                            
                             session_files = [f for f in os.listdir(sessions_dir) if f.endswith('.session')]
                             if not session_files:
                                 raise Exception("转换成功但未找到session文件")
@@ -6107,7 +6113,7 @@ class RecoveryProtectionManager:
             except Exception as e:
                 print(f"⚠️ 移动文件失败 {ctx.original_path}: {e}")
         
-        # 创建成功账号ZIP
+        # 创建成功账号ZIP（仅在有成功账号时创建）
         success_contexts = [ctx for ctx in contexts if ctx.status == "success"]
         success_zip_path = os.path.join(config.RECOVERY_REPORTS_DIR, f"{batch_id}_success.zip")
         
@@ -6123,11 +6129,10 @@ class RecoveryProtectionManager:
                         if os.path.exists(new_json_path):
                             zf.write(new_json_path, os.path.basename(new_json_path))
         else:
-            # 创建空的成功ZIP
-            with zipfile.ZipFile(success_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-                zf.writestr('README.txt', '本批次没有成功的账号')
+            # 不创建空的成功ZIP，success_zip_path将被检查是否存在
+            success_zip_path = ""
         
-        # 创建失败账号ZIP（包含失败、异常、超时账号）
+        # 创建失败账号ZIP（仅在有失败账号时创建）
         failed_contexts = [ctx for ctx in contexts if ctx.status in ("failed", "abnormal", "timeout")]
         failed_zip_path = os.path.join(config.RECOVERY_REPORTS_DIR, f"{batch_id}_failed.zip")
         
@@ -6167,9 +6172,8 @@ class RecoveryProtectionManager:
                         if os.path.exists(json_path):
                             zf.write(json_path, os.path.basename(json_path))
         else:
-            # 创建空的失败ZIP
-            with zipfile.ZipFile(failed_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-                zf.writestr('README.txt', '本批次没有失败的账号')
+            # 不创建空的失败ZIP
+            failed_zip_path = ""
         
         # 创建完整归档ZIP（包含所有分类）
         all_zip_path = os.path.join(config.RECOVERY_REPORTS_DIR, f"batch_{batch_id}_all_archives.zip")
@@ -10233,9 +10237,9 @@ class EnhancedBot:
             except Exception as e:
                 print(f"发送CSV报告失败: {e}")
             
-            # 发送成功账号ZIP
+            # 发送成功账号ZIP（仅在存在时发送）
             try:
-                if os.path.exists(success_zip_path) and counters['success'] > 0:
+                if success_zip_path and os.path.exists(success_zip_path):
                     with open(success_zip_path, 'rb') as f:
                         context.bot.send_document(
                             chat_id=user_id,
@@ -10246,10 +10250,10 @@ class EnhancedBot:
             except Exception as e:
                 print(f"发送成功ZIP失败: {e}")
             
-            # 发送失败账号ZIP
+            # 发送失败账号ZIP（仅在存在时发送）
             try:
-                failed_count = counters['failed'] + counters['abnormal'] + counters['code_timeout']
-                if os.path.exists(failed_zip_path) and failed_count > 0:
+                if failed_zip_path and os.path.exists(failed_zip_path):
+                    failed_count = counters['failed'] + counters['abnormal'] + counters['code_timeout']
                     with open(failed_zip_path, 'rb') as f:
                         context.bot.send_document(
                             chat_id=user_id,
