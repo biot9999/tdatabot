@@ -6283,14 +6283,38 @@ class RecoveryProtectionManager:
                     return context
                 
                 # ===== 阶段6: 设置/修改2FA密码 =====
-                pwd_success = await self._stage_rotate_pwd(new_client, context.new_session_path, phone, context)
-                if not pwd_success:
-                    context.status = "partial"
-                    context.failure_reason = "2FA密码设置失败"
-                    # 继续尝试删除其他设备
+                # 防御性检查：确保 new_client 存在
+                if not new_client:
+                    print(f"⚠️ [{account_name}] new_client 不存在，跳过 2FA 密码设置")
+                    stage_result = record_stage_result(
+                        context, "rotate_pwd", False,
+                        error="previous_stage_failed",
+                        detail="新设备登录失败，跳过密码设置"
+                    )
+                    self.db.insert_recovery_log(stage_result)
+                    pwd_success = False
+                else:
+                    pwd_success = await self._stage_rotate_pwd(new_client, context.new_session_path, phone, context)
+                    if not pwd_success:
+                        context.status = "partial"
+                        context.failure_reason = "2FA密码设置失败"
+                        # 继续尝试删除其他设备
                 
                 # ===== 阶段7: 删除其他设备 =====
-                devices_success = await self._stage_remove_devices(new_client, context)
+                # 防御性检查：确保 new_client 存在
+                if not new_client:
+                    print(f"⚠️ [{account_name}] new_client 不存在，跳过删除设备")
+                    stage_result = record_stage_result(
+                        context, "remove_devices", False,
+                        error="previous_stage_failed",
+                        detail="新设备登录失败，跳过设备删除"
+                    )
+                    self.db.insert_recovery_log(stage_result)
+                    devices_success = False
+                else:
+                    devices_success = await self._stage_remove_devices(new_client, context)
+                
+                # 最终状态判断
                 if not devices_success and pwd_success:
                     context.status = "partial"
                     context.failure_reason = "删除其他设备失败"
@@ -6303,9 +6327,12 @@ class RecoveryProtectionManager:
                     context.failure_reason = ""
                 
             except Exception as e:
+                import traceback
                 context.status = "failed"
                 context.failure_reason = f"处理异常: {str(e)[:100]}"
                 print(f"❌ 账号 {account_name} 处理失败: {e}")
+                if config.DEBUG_RECOVERY:
+                    print(f"🔍 [{account_name}] 完整堆栈跟踪:\n{traceback.format_exc()}")
             
             finally:
                 # 清理客户端连接
@@ -6396,25 +6423,69 @@ class RecoveryProtectionManager:
         
         return report_data
     
-    def generate_reports(self, report_data: Dict) -> Tuple[str, str, str, str, str]:
-        """生成报告文件，返回(txt_path, csv_path, success_zip_path, failed_zip_path, all_zip_path)"""
+    def generate_reports(self, report_data: Dict) -> Tuple[str, str, str, str, str, str]:
+        """生成报告文件，返回(txt_path, csv_path, csv_stages_path, success_zip_path, failed_zip_path, all_zip_path)"""
         batch_id = report_data['batch_id']
         counters = report_data['counters']
         contexts = report_data['contexts']
         
-        # TXT汇总报告
+        # 计算阶段统计
+        stage_stats = {}
+        error_frequencies = {}
+        total_retries = 0
+        
+        for ctx in contexts:
+            for stage_result in ctx.stage_results:
+                stage_name = stage_result.stage
+                if stage_name not in stage_stats:
+                    stage_stats[stage_name] = {'success': 0, 'failed': 0, 'total_time': 0.0}
+                
+                if stage_result.success:
+                    stage_stats[stage_name]['success'] += 1
+                else:
+                    stage_stats[stage_name]['failed'] += 1
+                    # 统计错误频率
+                    error_key = f"{stage_name}:{stage_result.error[:50]}"
+                    error_frequencies[error_key] = error_frequencies.get(error_key, 0) + 1
+                
+                stage_stats[stage_name]['total_time'] += stage_result.elapsed
+        
+        # TXT汇总报告（增强版）
         txt_path = os.path.join(config.RECOVERY_REPORTS_DIR, f"batch_{batch_id}_summary.txt")
         with open(txt_path, 'w', encoding='utf-8') as f:
             f.write(f"防止找回批次报告 - {batch_id}\n")
             f.write("=" * 50 + "\n\n")
+            
+            f.write("📊 总体统计\n")
+            f.write("-" * 50 + "\n")
             f.write(f"总数: {counters['total']}\n")
-            f.write(f"成功: {counters['success']}\n")
-            f.write(f"失败: {counters['failed']}\n")
-            f.write(f"异常: {counters['abnormal']}\n")
-            f.write(f"超时: {counters['code_timeout']}\n")
-            f.write(f"部分: {counters['partial']}\n")
+            f.write(f"成功: {counters['success']} ({counters['success']/counters['total']*100:.1f}%)\n")
+            f.write(f"失败: {counters['failed']} ({counters['failed']/counters['total']*100:.1f}%)\n")
+            f.write(f"异常: {counters['abnormal']} ({counters['abnormal']/counters['total']*100:.1f}%)\n")
+            f.write(f"超时: {counters['code_timeout']} ({counters['code_timeout']/counters['total']*100:.1f}%)\n")
+            f.write(f"部分: {counters['partial']} ({counters['partial']/counters['total']*100:.1f}%)\n\n")
+            
+            # 阶段统计
+            if stage_stats:
+                f.write("📈 阶段统计\n")
+                f.write("-" * 50 + "\n")
+                for stage_name, stats in sorted(stage_stats.items()):
+                    total = stats['success'] + stats['failed']
+                    success_rate = stats['success'] / total * 100 if total > 0 else 0
+                    avg_time = stats['total_time'] / total if total > 0 else 0
+                    f.write(f"{stage_name:20s}: 成功 {stats['success']:3d}/{total:3d} ({success_rate:5.1f}%), 平均耗时 {avg_time:6.2f}s\n")
+                f.write("\n")
+            
+            # 错误频率（Top 10）
+            if error_frequencies:
+                f.write("❌ 常见错误 (Top 10)\n")
+                f.write("-" * 50 + "\n")
+                sorted_errors = sorted(error_frequencies.items(), key=lambda x: x[1], reverse=True)[:10]
+                for error_key, count in sorted_errors:
+                    f.write(f"{count:3d}x - {error_key}\n")
+                f.write("\n")
         
-        # CSV详细报告
+        # CSV详细报告（账号级别）
         csv_path = os.path.join(config.RECOVERY_REPORTS_DIR, f"batch_{batch_id}_detail.csv")
         with open(csv_path, 'w', encoding='utf-8', newline='') as f:
             writer = csv.writer(f)
@@ -6431,6 +6502,25 @@ class RecoveryProtectionManager:
                     ctx.new_password_masked,
                     f"{total_time:.2f}s"
                 ])
+        
+        # CSV阶段级别报告（新增）
+        csv_stages_path = os.path.join(config.RECOVERY_REPORTS_DIR, f"batch_{batch_id}_stages.csv")
+        with open(csv_stages_path, 'w', encoding='utf-8', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['账号', '手机号', '阶段', '成功', '错误', '详细信息', '耗时(ms)'])
+            
+            for ctx in contexts:
+                account_name = os.path.basename(ctx.original_path)
+                for stage_result in ctx.stage_results:
+                    writer.writerow([
+                        account_name,
+                        stage_result.phone,
+                        stage_result.stage,
+                        '是' if stage_result.success else '否',
+                        stage_result.error[:100] if stage_result.error else '',
+                        stage_result.detail[:200] if stage_result.detail else '',
+                        f"{stage_result.elapsed * 1000:.0f}"  # 转换为毫秒
+                    ])
         
         # 移动文件到对应目录并复制新session文件
         for ctx in contexts:
@@ -6547,6 +6637,7 @@ class RecoveryProtectionManager:
             # 添加报告文件
             zf.write(txt_path, os.path.basename(txt_path))
             zf.write(csv_path, os.path.basename(csv_path))
+            zf.write(csv_stages_path, os.path.basename(csv_stages_path))
             
             # 添加各分类目录（如果有文件）
             for dir_name, dir_path in [
@@ -6563,7 +6654,7 @@ class RecoveryProtectionManager:
                             arcname = os.path.join(dir_name, file)
                             zf.write(file_path, arcname)
         
-        return txt_path, csv_path, success_zip_path, failed_zip_path, all_zip_path
+        return txt_path, csv_path, csv_stages_path, success_zip_path, failed_zip_path, all_zip_path
 
 
 # ================================
