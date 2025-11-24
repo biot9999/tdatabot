@@ -702,6 +702,10 @@ class Config:
         self.PROXY_FAST_MODE = os.getenv("PROXY_FAST_MODE", "true").lower() == "true"
         self.PROXY_RETRY_COUNT = int(os.getenv("PROXY_RETRY_COUNT", "2"))
         self.PROXY_BATCH_SIZE = int(os.getenv("PROXY_BATCH_SIZE", "20"))
+        self.PROXY_USAGE_LOG_LIMIT = int(os.getenv("PROXY_USAGE_LOG_LIMIT", "500"))
+        self.PROXY_ROTATE_RETRIES = int(os.getenv("PROXY_ROTATE_RETRIES", "2"))
+        self.PROXY_SHOW_FAILURE_REASON = os.getenv("PROXY_SHOW_FAILURE_REASON", "true").lower() == "true"
+        self.PROXY_DEBUG_VERBOSE = os.getenv("PROXY_DEBUG_VERBOSE", "false").lower() == "true"
         
         # 防止找回配置
         self.RECOVERY_CONCURRENT = int(os.getenv("RECOVERY_CONCURRENT", "10"))
@@ -1054,8 +1058,10 @@ class SpamBotChecker:
                 connect_timeout = self.connection_timeout if proxy_dict else 5
             
             # 创建客户端
+            # Telethon expects session path without .session extension
+            session_base = session_path.replace('.session', '') if session_path.endswith('.session') else session_path
             client = TelegramClient(
-                session_path,
+                session_base,
                 config.API_ID,
                 config.API_HASH,
                 timeout=client_timeout,
@@ -2301,7 +2307,13 @@ class FileProcessor:
                     if file.endswith('.session'):
                         file_full_path = os.path.join(root, file)
                         session_files.append((file_full_path, file))
-                        print(f"📄 找到Session文件: {file}")
+                        
+                        # 检查是否有对应的JSON文件
+                        json_path = file_full_path.replace('.session', '.json')
+                        if os.path.exists(json_path):
+                            print(f"📄 找到Session文件: {file} (带JSON)")
+                        else:
+                            print(f"📄 找到Session文件: {file} (纯Session，无JSON)")
                 
                 for dir_name in dirs:
                     dir_path = os.path.join(root, dir_name)
@@ -3256,7 +3268,7 @@ class FormatConverter:
                                 shutil.copy2(session_path, dest_path)
                                 print(f"📄 复制Session文件: {session_file}")
                             
-                            # 复制对应的JSON文件
+                            # 复制对应的JSON文件（如果存在）
                             json_file = f"{phone}.json"
                             json_path = os.path.join(sessions_dir, json_file)
                             
@@ -3264,6 +3276,8 @@ class FormatConverter:
                                 json_dest = os.path.join(status_temp_dir, json_file)
                                 shutil.copy2(json_path, json_dest)
                                 print(f"📄 复制JSON文件: {json_file}")
+                            else:
+                                print(f"ℹ️ 无JSON文件: {phone}.session (纯Session文件)")
                         
                     
                         else:  # session_to_tdata - 修复路径问题
@@ -3291,13 +3305,15 @@ class FormatConverter:
                                     shutil.copy2(file_path, session_dest)
                                     print(f"📄 复制原始Session: {os.path.basename(file_path)}")
                                 
-                                # 复制对应的json文件
+                                # 复制对应的json文件（如果存在）
                                 json_name = file_name.replace('.session', '.json')
                                 original_json = os.path.join(os.path.dirname(file_path), json_name)
                                 if os.path.exists(original_json):
                                     json_dest = os.path.join(phone_dest, json_name)
                                     shutil.copy2(original_json, json_dest)
                                     print(f"📄 复制原始JSON: {json_name}")
+                                else:
+                                    print(f"ℹ️ 无JSON文件: {file_name} (纯Session文件)")
                             else:
                                 print(f"⚠️ 找不到转换后的目录: {phone_dir}")
                     
@@ -3313,13 +3329,15 @@ class FormatConverter:
                                 shutil.copy2(file_path, dest_path)
                                 print(f"📄 复制失败的Session: {file_name}")
                                 
-                                # 复制对应的json文件
+                                # 复制对应的json文件（如果存在）
                                 json_name = file_name.replace('.session', '.json')
                                 json_path = os.path.join(os.path.dirname(file_path), json_name)
                                 if os.path.exists(json_path):
                                     json_dest = os.path.join(status_temp_dir, json_name)
                                     shutil.copy2(json_path, json_dest)
                                     print(f"📄 复制失败的JSON: {json_name}")
+                                else:
+                                    print(f"ℹ️ 无JSON文件: {file_name} (纯Session文件)")
                         
                         # 创建详细的失败原因说明
                         error_file = os.path.join(status_temp_dir, f"{file_name}_错误原因.txt")
@@ -3550,8 +3568,10 @@ class TwoFactorManager:
                             proxy_used = f"代理 {proxy_info['host']}:{proxy_info['port']}"
                 
                 # 创建客户端
+                # Telethon expects session path without .session extension
+                session_base = session_path.replace('.session', '') if session_path.endswith('.session') else session_path
                 client = TelegramClient(
-                    session_path,
+                    session_base,
                     config.API_ID,
                     config.API_HASH,
                     timeout=30,
@@ -3587,6 +3607,9 @@ class TwoFactorManager:
                     )
                     
                     # 修改成功后，更新文件中的密码
+                    json_path = session_path.replace('.session', '.json')
+                    has_json = os.path.exists(json_path)
+                    
                     update_success = await self._update_password_files(
                         session_path, 
                         new_password, 
@@ -3594,7 +3617,10 @@ class TwoFactorManager:
                     )
                     
                     if update_success:
-                        return True, f"{user_info} | {proxy_used} | 密码修改成功，文件已更新"
+                        if has_json:
+                            return True, f"{user_info} | {proxy_used} | 密码修改成功，文件已更新"
+                        else:
+                            return True, f"{user_info} | {proxy_used} | 密码修改成功，但未找到JSON文件"
                     else:
                         return True, f"{user_info} | {proxy_used} | 密码修改成功，但文件更新失败"
                     
@@ -3662,10 +3688,16 @@ class TwoFactorManager:
             ))
             
             # 更新文件
+            json_path = session_path.replace('.session', '.json')
+            has_json = os.path.exists(json_path)
+            
             update_success = await self._update_password_files(session_path, new_password, 'session')
             
             if update_success:
-                return True, f"{user_info} | {proxy_used} | 密码修改成功，文件已更新"
+                if has_json:
+                    return True, f"{user_info} | {proxy_used} | 密码修改成功，文件已更新"
+                else:
+                    return True, f"{user_info} | {proxy_used} | 密码修改成功，但未找到JSON文件"
             else:
                 return True, f"{user_info} | {proxy_used} | 密码修改成功，但文件更新失败"
             
@@ -3715,11 +3747,11 @@ class TwoFactorManager:
             file_type: 文件类型（'session' 或 'tdata'）
             
         Returns:
-            是否更新成功
+            是否更新成功。对于纯Session文件（无JSON），返回True表示成功（非阻塞）
         """
         try:
             if file_type == 'session':
-                # 更新Session对应的JSON文件
+                # 更新Session对应的JSON文件（可选，如果存在）
                 json_path = file_path.replace('.session', '.json')
                 if os.path.exists(json_path):
                     try:
@@ -3747,8 +3779,9 @@ class TwoFactorManager:
                         print(f"❌ 更新JSON文件失败 {os.path.basename(json_path)}: {e}")
                         return False
                 else:
-                    print(f"⚠️ JSON文件不存在: {json_path}")
-                    return False
+                    print(f"ℹ️ JSON文件不存在，跳过JSON更新: {os.path.basename(file_path)}")
+                    # 对于纯Session文件，不存在JSON是正常情况，返回True表示不影响密码修改成功
+                    return True
                     
             elif file_type == 'tdata':
                 # 更新TData目录中的密码文件
@@ -3948,13 +3981,15 @@ class TwoFactorManager:
                             shutil.copy2(file_path, dest_path)
                             print(f"📄 复制Session文件: {file_name}")
                         
-                        # 查找对应的 json 文件
+                        # 查找对应的 json 文件（如果存在）
                         json_name = file_name.replace('.session', '.json')
                         json_path = os.path.join(os.path.dirname(file_path), json_name)
                         if os.path.exists(json_path):
                             json_dest = os.path.join(status_temp_dir, json_name)
                             shutil.copy2(json_path, json_dest)
                             print(f"📄 复制JSON文件: {json_name}")
+                        else:
+                            print(f"ℹ️ 无JSON文件: {file_name} (纯Session文件)")
                     
                     elif file_type == "tdata":
                         # 使用原始文件夹名称（通常是手机号）
@@ -4294,7 +4329,9 @@ class APIFormatConverter:
     async def extract_account_info_from_session(self, session_file: str) -> dict:
         """从Session文件提取账号信息"""
         try:
-            client = TelegramClient(session_file, config.API_ID, config.API_HASH)
+            # Telethon expects session path without .session extension
+            session_base = session_file.replace('.session', '') if session_file.endswith('.session') else session_file
+            client = TelegramClient(session_base, config.API_ID, config.API_HASH)
             await client.connect()
             
             if not await client.is_user_authorized():
@@ -4492,7 +4529,9 @@ class APIFormatConverter:
             window_sec = int(self.history_window_sec.get(api_key, 0) or 0)  # 刷新后回扫窗口（秒）
 
             if session_path and os.path.exists(session_path):
-                client = TelegramClient(session_path, config.API_ID, config.API_HASH)
+                # Telethon expects session path without .session extension
+                session_base = session_path.replace('.session', '') if session_path.endswith('.session') else session_path
+                client = TelegramClient(session_base, config.API_ID, config.API_HASH)
             elif tdata_path and os.path.exists(tdata_path) and OPENTELE_AVAILABLE:
                 tdesk = TDesktop(tdata_path)
                 if not tdesk.isLoaded():
@@ -6067,7 +6106,7 @@ class EnhancedBot:
 • 5分钟自动过期保护
 
 <b>📤 操作说明</b>
-请上传包含TData或Session文件的ZIP压缩包...
+请上传包含TData或Session文件的ZIP压缩包（支持：tdata、session、session+json）...
         """
 
         buttons = [
@@ -6145,7 +6184,8 @@ class EnhancedBot:
 • Tdata与Session格式互转
 
 <b>📁 支持格式</b>
-• Session + JSON文件
+• Session文件 (.session)
+• Session+JSON文件 (.session + .json)
 • TData文件夹
 • ZIP压缩包
 
@@ -7195,7 +7235,8 @@ class EnhancedBot:
 
 📁 <b>支持格式</b>
 • ZIP压缩包 (推荐)
-• 包含 Session + JSON 文件
+• 包含 Session 文件 (.session)
+• 包含 Session+JSON 文件 (.session + .json)
 • 包含 TData 文件夹{proxy_info}
 
 请选择您的ZIP文件并上传...
@@ -8371,7 +8412,8 @@ class EnhancedBot:
                     progress_msg.edit_text(
                         "❌ <b>未找到有效的账号文件</b>\n\n"
                         "请确保ZIP文件包含:\n"
-                        "• Session + JSON 文件\n"
+                        "• Session 文件 (.session)\n"
+                        "• Session+JSON 文件 (.session + .json)\n"
                         "• TData 文件夹",
                         parse_mode='HTML'
                     )
@@ -10068,7 +10110,8 @@ class EnhancedBot:
                 query.edit_message_text(
                     "📤 <b>请上传账号文件</b>\n\n"
                     "支持格式：\n"
-                    "• Session + JSON 文件的ZIP包\n"
+                    "• Session 文件的ZIP包 (.session)\n"
+                    "• Session+JSON 文件的ZIP包 (.session + .json)\n"
                     "• TData 文件夹的ZIP包\n\n"
                     "⚠️ 文件大小限制100MB\n"
                     "⏰ 5分钟超时",
@@ -12211,7 +12254,7 @@ class EnhancedBot:
 <b>💡 功能说明</b>
 • 自动解压所有 ZIP 文件
 • 递归扫描识别 TData 账户
-• 递归扫描识别 Session + JSON 配对
+• 递归扫描识别 Session 文件 (支持纯.session或session+json配对)
 • 智能分类归档
 
 <b>📤 请上传 ZIP 文件</b>
@@ -12374,7 +12417,7 @@ class EnhancedBot:
                                     tdata_accounts.append((root, tdata_dir_name))
                                     break
                     
-                    # 检查当前目录中的 Session + JSON 配对
+                    # 检查当前目录中的 Session 文件 (支持纯Session或Session+JSON配对)
                     session_files = {}
                     json_files = {}
                     
@@ -12386,10 +12429,12 @@ class EnhancedBot:
                             basename = fname[:-5]  # 去掉 .json
                             json_files[basename] = os.path.join(root, fname)
                     
-                    # 找出配对的 session 和 json
+                    # 添加所有session文件，优先使用配对的JSON（如果有）
+                    # 元组格式: (session_path, json_path, basename) 其中 json_path 可以为 None
                     for basename in session_files.keys():
-                        if basename in json_files:
-                            session_json_pairs.append((session_files[basename], json_files[basename], basename))
+                        session_path = session_files[basename]
+                        json_path = json_files.get(basename, None)  # JSON可选，可能为None
+                        session_json_pairs.append((session_path, json_path, basename))
             except Exception as e:
                 print(f"❌ 扫描目录失败 {dir_path}: {e}")
         
@@ -12412,21 +12457,27 @@ class EnhancedBot:
             else:
                 tdata_without_phones.append((account_root, tdata_dir_name))
         
-        # 为Session+JSON配对提取手机号
+        # 为Session文件提取手机号 (支持纯Session或Session+JSON配对)
         session_json_with_phones = {}  # phone -> (session_path, json_path)
         
         for session_path, json_path, basename in session_json_pairs:
-            phone = self.extract_phone_from_json(json_path)
+            # 尝试从JSON提取手机号（如果JSON存在）
+            phone = None
+            if json_path:
+                phone = self.extract_phone_from_json(json_path)
+            
             if phone:
                 # 去重：如果手机号已存在，保留第一个
                 if phone not in session_json_with_phones:
                     session_json_with_phones[phone] = (session_path, json_path)
                 else:
-                    print(f"⚠️ 发现重复Session+JSON，手机号: {phone}，已跳过")
+                    print(f"⚠️ 发现重复Session，手机号: {phone}，已跳过")
             else:
-                # 如果JSON中没有手机号，使用basename作为标识
+                # 如果JSON中没有手机号或没有JSON，使用basename作为标识
                 if basename not in session_json_with_phones:
                     session_json_with_phones[basename] = (session_path, json_path)
+                    if not json_path:
+                        print(f"ℹ️ 处理纯Session文件（无JSON）: {basename}")
         
         # 第四步：创建输出 ZIP 文件
         result_dir = os.path.join(temp_dir, 'results')
@@ -12472,16 +12523,18 @@ class EnhancedBot:
             
             zip_files_created.append(('TData 账户', tdata_zip_path, total_tdata))
         
-        # 打包 Session+JSON 配对（使用手机号作为文件名）
+        # 打包 Session 文件（支持纯Session或Session+JSON配对，使用手机号作为文件名）
         if session_json_with_phones:
             session_json_zip_path = os.path.join(result_dir, f'session_json_{timestamp}.zip')
             with zipfile.ZipFile(session_json_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
                 for phone, (session_path, json_path) in session_json_with_phones.items():
                     # 使用手机号作为文件名
                     zf.write(session_path, f'{phone}.session')
-                    zf.write(json_path, f'{phone}.json')
+                    # 只在JSON存在时添加JSON文件
+                    if json_path and os.path.exists(json_path):
+                        zf.write(json_path, f'{phone}.json')
             
-            zip_files_created.append(('Session+JSON 配对', session_json_zip_path, total_session_json))
+            zip_files_created.append(('Session 文件', session_json_zip_path, total_session_json))
         
         # 发送结果
         summary = f"""
@@ -12490,7 +12543,7 @@ class EnhancedBot:
 <b>📊 处理结果</b>
 • 解压 ZIP 文件: {len(files)} 个
 • TData 账户: {total_tdata} 个
-• Session+JSON 配对: {total_session_json} 对
+• Session 文件: {total_session_json} 个 (支持纯Session或Session+JSON)
 • 去重移除: {duplicates_removed} 个
 
 <b>📦 生成文件</b>
