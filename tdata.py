@@ -1055,8 +1055,10 @@ class SpamBotChecker:
                 connect_timeout = self.connection_timeout if proxy_dict else 5
             
             # 创建客户端
+            # Telethon expects session path without .session extension
+            session_base = session_path.replace('.session', '') if session_path.endswith('.session') else session_path
             client = TelegramClient(
-                session_path,
+                session_base,
                 config.API_ID,
                 config.API_HASH,
                 timeout=client_timeout,
@@ -3563,8 +3565,10 @@ class TwoFactorManager:
                             proxy_used = f"代理 {proxy_info['host']}:{proxy_info['port']}"
                 
                 # 创建客户端
+                # Telethon expects session path without .session extension
+                session_base = session_path.replace('.session', '') if session_path.endswith('.session') else session_path
                 client = TelegramClient(
-                    session_path,
+                    session_base,
                     config.API_ID,
                     config.API_HASH,
                     timeout=30,
@@ -4322,7 +4326,9 @@ class APIFormatConverter:
     async def extract_account_info_from_session(self, session_file: str) -> dict:
         """从Session文件提取账号信息"""
         try:
-            client = TelegramClient(session_file, config.API_ID, config.API_HASH)
+            # Telethon expects session path without .session extension
+            session_base = session_file.replace('.session', '') if session_file.endswith('.session') else session_file
+            client = TelegramClient(session_base, config.API_ID, config.API_HASH)
             await client.connect()
             
             if not await client.is_user_authorized():
@@ -4520,7 +4526,9 @@ class APIFormatConverter:
             window_sec = int(self.history_window_sec.get(api_key, 0) or 0)  # 刷新后回扫窗口（秒）
 
             if session_path and os.path.exists(session_path):
-                client = TelegramClient(session_path, config.API_ID, config.API_HASH)
+                # Telethon expects session path without .session extension
+                session_base = session_path.replace('.session', '') if session_path.endswith('.session') else session_path
+                client = TelegramClient(session_base, config.API_ID, config.API_HASH)
             elif tdata_path and os.path.exists(tdata_path) and OPENTELE_AVAILABLE:
                 tdesk = TDesktop(tdata_path)
                 if not tdesk.isLoaded():
