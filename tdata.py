@@ -5489,6 +5489,10 @@ class RecoveryProtectionManager:
             if not phone_str or phone_str == "unknown":
                 raise Exception(f"无效的手机号: {phone}")
             
+            # Debug: 记录phone类型和值
+            print(f"🔍 [{account_name}] phone类型: {type(phone)}, phone值: {phone}")
+            print(f"🔍 [{account_name}] phone_str类型: {type(phone_str)}, phone_str值: {phone_str}")
+            
             # 发送验证码请求
             print(f"📤 [{account_name}] 向 {phone_str} 发送验证码请求...")
             await old_client.send_code_request(phone_str)
