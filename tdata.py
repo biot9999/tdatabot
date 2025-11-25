@@ -28,8 +28,9 @@ import time
 import re
 import secrets
 import csv
+import traceback
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, NamedTuple
 from dataclasses import dataclass, field
 from io import BytesIO
 import threading
@@ -37,7 +38,7 @@ import struct
 import base64
 from pathlib import Path
 from dataclasses import dataclass
-from collections import deque
+from collections import deque, namedtuple
 print("🔍 Telegram账号检测机器人 V8.0")
 print(f"📅 当前时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
@@ -74,7 +75,7 @@ except ImportError as e:
 
 try:
     from telethon import TelegramClient, functions
-    from telethon.errors import *
+    from telethon.errors import FloodWaitError, SessionPasswordNeededError, RPCError
     from telethon.tl.functions.messages import SendMessageRequest, GetHistoryRequest
     TELETHON_AVAILABLE = True
     print("✅ telethon库导入成功")
@@ -133,11 +134,21 @@ class RecoveryStageResult:
     """防止找回单阶段结果"""
     account_name: str
     phone: str
-    stage: str  # load/connect_old/connect_new/request_code/wait_code/sign_in/rotate_pwd/remove_devices/archive
+    stage: str  # load/connect_old/request_code/wait_code/sign_in/rotate_pwd/remove_devices
     success: bool
     error: str = ""
     detail: str = ""
     elapsed: float = 0.0
+
+# 报告生成结果（命名元组，提高可读性）
+RecoveryReportFiles = namedtuple('RecoveryReportFiles', [
+    'summary_txt',      # 汇总报告文本文件
+    'detail_csv',       # 账号级别详细CSV
+    'stages_csv',       # 阶段级别详细CSV
+    'success_zip',      # 成功账号ZIP
+    'failed_zip',       # 失败账号ZIP
+    'all_archives_zip'  # 完整归档ZIP
+])
 
 @dataclass
 class RecoveryAccountContext:
@@ -728,6 +739,15 @@ class Config:
         self.RECOVERY_DELAY_BEFORE_2FA = float(os.getenv("RECOVERY_DELAY_BEFORE_2FA", "2.0"))  # 2FA前延迟
         self.RECOVERY_DELAY_AFTER_2FA = float(os.getenv("RECOVERY_DELAY_AFTER_2FA", "3.0"))  # 2FA后延迟
         
+        # 新增：增强恢复保护配置
+        self.RECOVERY_DEFAULT_COUNTRY_PREFIX = os.getenv("RECOVERY_DEFAULT_COUNTRY_PREFIX", "+62")
+        self.RECOVERY_CODE_REQUEST_RETRIES = int(os.getenv("RECOVERY_CODE_REQUEST_RETRIES", "2"))
+        self.RECOVERY_RETRY_BACKOFF_BASE = float(os.getenv("RECOVERY_RETRY_BACKOFF_BASE", "0.75"))
+        self.RECOVERY_STAGE_TIMEOUT = int(os.getenv("RECOVERY_STAGE_TIMEOUT", "300"))
+        self.WEB_SERVER_PORT = int(os.getenv("WEB_SERVER_PORT", "8080"))
+        self.ALLOW_PORT_SHIFT = os.getenv("ALLOW_PORT_SHIFT", "true").lower() == "true"
+        self.DEBUG_RECOVERY = os.getenv("DEBUG_RECOVERY", "true").lower() == "true"
+        
         # 获取当前脚本目录
         self.SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
         
@@ -810,6 +830,14 @@ RECOVERY_LANG_CODE=en
 RECOVERY_DELAY_AFTER_LOGIN=3.0
 RECOVERY_DELAY_BEFORE_2FA=2.0
 RECOVERY_DELAY_AFTER_2FA=3.0
+# 增强恢复保护配置
+RECOVERY_DEFAULT_COUNTRY_PREFIX=+62
+RECOVERY_CODE_REQUEST_RETRIES=2
+RECOVERY_RETRY_BACKOFF_BASE=0.75
+RECOVERY_STAGE_TIMEOUT=300
+WEB_SERVER_PORT=8080
+ALLOW_PORT_SHIFT=true
+DEBUG_RECOVERY=true
 """
             with open(".env", "w", encoding="utf-8") as f:
                 f.write(env_content)
@@ -4778,10 +4806,35 @@ tick(); setInterval(tick,3000);
 
 def _run_server(self):
     host = os.getenv("API_SERVER_HOST", "0.0.0.0")
-    port = int(os.getenv("API_SERVER_PORT", "8080"))
-    print("🌐 验证码接收服务器启动: http://%s:%d (BASE_URL=%s)" % (host, port, self.base_url))
-    # 这里直接用 self.flask_app.run；Flask 已在 start_web_server 中导入并实例化
-    self.flask_app.run(host=host, port=port, debug=False)
+    preferred_port = int(os.getenv("API_SERVER_PORT", str(config.WEB_SERVER_PORT)))
+    
+    # 查找可用端口
+    port = preferred_port
+    if config.ALLOW_PORT_SHIFT:
+        available_port = _find_available_port(preferred_port)
+        if available_port and available_port != preferred_port:
+            print(f"⚠️ [API-SERVER] 端口 {preferred_port} 被占用，切换到端口 {available_port}")
+            port = available_port
+            # 更新 base_url
+            if hasattr(self, 'base_url'):
+                self.base_url = self.base_url.replace(f':{preferred_port}', f':{port}')
+        elif not available_port:
+            print(f"❌ [API-SERVER] 无法找到可用端口（尝试范围：{preferred_port}-{preferred_port + 20}）")
+            print(f"💡 [API-SERVER] 验证码服务器将不会启动，请手动释放端口或关闭 ALLOW_PORT_SHIFT")
+            return
+    
+    print(f"🌐 [API-SERVER] 验证码接收服务器启动: http://{host}:{port} (BASE_URL={self.base_url if hasattr(self, 'base_url') else 'N/A'})")
+    try:
+        # 这里直接用 self.flask_app.run；Flask 已在 start_web_server 中导入并实例化
+        self.flask_app.run(host=host, port=port, debug=False)
+    except OSError as e:
+        if "Address already in use" in str(e):
+            print(f"❌ [API-SERVER] 端口 {port} 仍被占用: {e}")
+            print(f"💡 [API-SERVER] 请检查是否有其他进程占用该端口")
+        else:
+            print(f"❌ [API-SERVER] Flask 服务器启动失败: {e}")
+    except Exception as e:
+        print(f"❌ [API-SERVER] Flask 服务器运行错误: {e}")
 # ========== APIFormatConverter 缩进安全补丁 v2（放在类定义之后、实例化之前）==========
 import os, json, threading
 
@@ -5240,9 +5293,34 @@ def _afc_start_web_server(self):
 
 def _afc_run_server(self):
     host = os.getenv("API_SERVER_HOST", "0.0.0.0")
-    port = int(os.getenv("API_SERVER_PORT", "8080"))
-    print("🌐 验证码接收服务器启动: http://%s:%d (BASE_URL=%s)" % (host, port, self.base_url))
-    self.flask_app.run(host=host, port=port, debug=False)
+    preferred_port = int(os.getenv("API_SERVER_PORT", str(config.WEB_SERVER_PORT)))
+    
+    # 查找可用端口
+    port = preferred_port
+    if config.ALLOW_PORT_SHIFT:
+        available_port = _find_available_port(preferred_port)
+        if available_port and available_port != preferred_port:
+            print(f"⚠️ [RECOVERY] 端口 {preferred_port} 被占用，切换到端口 {available_port}")
+            port = available_port
+            # 更新 base_url
+            if hasattr(self, 'base_url'):
+                self.base_url = self.base_url.replace(f':{preferred_port}', f':{port}')
+        elif not available_port:
+            print(f"❌ [RECOVERY] 无法找到可用端口（尝试范围：{preferred_port}-{preferred_port + 20}）")
+            print(f"💡 [RECOVERY] 验证码服务器将不会启动，请手动释放端口或关闭 ALLOW_PORT_SHIFT")
+            return
+    
+    print(f"🌐 [RECOVERY] 验证码接收服务器启动: http://{host}:{port} (BASE_URL={self.base_url if hasattr(self, 'base_url') else 'N/A'})")
+    try:
+        self.flask_app.run(host=host, port=port, debug=False)
+    except OSError as e:
+        if "Address already in use" in str(e):
+            print(f"❌ [RECOVERY] 端口 {port} 仍被占用: {e}")
+            print(f"💡 [RECOVERY] 请检查是否有其他进程占用该端口")
+        else:
+            print(f"❌ [RECOVERY] Flask 服务器启动失败: {e}")
+    except Exception as e:
+        print(f"❌ [RECOVERY] Flask 服务器运行错误: {e}")
 
 # 把方法安全挂到类上（先定义，后挂载；用 hasattr 避免引用未定义名字）
 if not hasattr(APIFormatConverter, "_env"):
@@ -5255,6 +5333,134 @@ if not hasattr(APIFormatConverter, "_run_server"):
     APIFormatConverter._run_server = _afc_run_server
 # ========== 补丁结束 ==========
 
+
+# ================================
+# 恢复保护工具函数
+# ================================
+
+def normalize_phone(phone: Any, default_country_prefix: str = None) -> str:
+    """
+    规范化电话号码格式，确保返回字符串类型
+    
+    Args:
+        phone: 电话号码（可以是 int、str 或其他类型）
+        default_country_prefix: 默认国家前缀（如 '+62'），如果号码缺少国际前缀则添加
+    
+    Returns:
+        规范化后的电话号码字符串
+    """
+    # 获取默认前缀
+    if default_country_prefix is None:
+        default_country_prefix = config.RECOVERY_DEFAULT_COUNTRY_PREFIX
+    
+    # 处理 None 和空值
+    if phone is None or phone == "":
+        return "unknown"
+    
+    # 转换为字符串
+    phone_str = str(phone).strip()
+    
+    # 移除空白字符
+    phone_str = phone_str.replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
+    
+    # 如果为空或是 "unknown"，直接返回
+    if not phone_str or phone_str.lower() == "unknown":
+        return "unknown"
+    
+    # 如果已经有 + 前缀，直接返回
+    if phone_str.startswith("+"):
+        return phone_str
+    
+    # 如果是纯数字且长度合理（通常手机号10-15位）
+    if phone_str.isdigit() and len(phone_str) >= 10:
+        # 如果数字很长（可能已包含国家代码），直接添加+
+        # 否则使用配置的国家前缀
+        if len(phone_str) >= 11:  # 国际号码通常11-15位
+            return f"+{phone_str}"
+        else:
+            # 短号码可能缺少国家代码，使用配置的前缀
+            # 去除前缀中的+，然后添加
+            prefix = default_country_prefix.lstrip('+')
+            return f"+{prefix}{phone_str}"
+    
+    # 其他情况尝试提取数字
+    digits_only = ''.join(c for c in phone_str if c.isdigit())
+    if digits_only and len(digits_only) >= 10:
+        if len(digits_only) >= 11:
+            return f"+{digits_only}"
+        else:
+            prefix = default_country_prefix.lstrip('+')
+            return f"+{prefix}{digits_only}"
+    
+    # 无法规范化，返回原始字符串
+    return phone_str
+
+def _find_available_port(preferred: int = 8080, max_tries: int = 20) -> Optional[int]:
+    """
+    查找可用端口
+    
+    Args:
+        preferred: 首选端口
+        max_tries: 最多尝试次数
+    
+    Returns:
+        可用端口号，如果找不到则返回 None
+    """
+    import socket
+    
+    for port in range(preferred, preferred + max_tries):
+        sock = None
+        try:
+            # 尝试绑定端口
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(1)
+            # 尝试绑定到端口（而不是连接）
+            sock.bind(('127.0.0.1', port))
+            # 绑定成功，说明端口可用
+            return port
+        except OSError:
+            # 绑定失败（端口被占用），尝试下一个
+            continue
+        except Exception:
+            continue
+        finally:
+            # 确保socket总是被关闭
+            if sock:
+                try:
+                    sock.close()
+                except:
+                    pass
+    
+    return None
+
+def record_stage_result(context: 'RecoveryAccountContext', stage: str, success: bool, 
+                       error: str = '', detail: str = '', elapsed: float = 0.0) -> RecoveryStageResult:
+    """
+    记录阶段结果的辅助函数
+    
+    Args:
+        context: 恢复账号上下文
+        stage: 阶段名称
+        success: 是否成功
+        error: 错误信息
+        detail: 详细信息
+        elapsed: 耗时（秒）
+    
+    Returns:
+        RecoveryStageResult 对象
+    """
+    account_name = os.path.basename(context.original_path) if context.original_path else "unknown"
+    stage_result = RecoveryStageResult(
+        account_name=account_name,
+        phone=context.phone,
+        stage=stage,
+        success=success,
+        error=error[:200] if error else "",  # 限制错误信息长度
+        detail=detail[:500] if detail else "",  # 限制详细信息长度
+        elapsed=elapsed
+    )
+    context.stage_results.append(stage_result)
+    return stage_result
 
 # ================================
 # 防止找回管理器
@@ -5478,45 +5684,104 @@ class RecoveryProtectionManager:
             return False, f"获取设备列表失败: {str(e)[:80]}"
     
     async def _stage_request_and_wait_code(self, old_client: TelegramClient, phone: str, context: RecoveryAccountContext) -> Optional[str]:
-        """阶段3+4: 请求并等待验证码（带详细日志）"""
+        """阶段3+4: 请求并等待验证码（带详细日志和重试机制）"""
         account_name = os.path.basename(context.original_path)
         
-        # 阶段3: 请求验证码
-        stage_start = time.time()
-        try:
-            # 确保phone是字符串类型
-            phone_str = str(phone) if phone else ""
-            if not phone_str or phone_str == "unknown":
-                raise Exception(f"无效的手机号: {phone}")
-            
-            # Debug: 记录phone类型和值
-            print(f"🔍 [{account_name}] phone类型: {type(phone)}, phone值: {phone}")
-            print(f"🔍 [{account_name}] phone_str类型: {type(phone_str)}, phone_str值: {phone_str}")
-            
-            # 发送验证码请求
-            print(f"📤 [{account_name}] 向 {phone_str} 发送验证码请求...")
-            await old_client.send_code_request(phone_str)
-            print(f"✅ [{account_name}] 验证码请求已发送")
-            
+        # 规范化电话号码（解决 TypeError）
+        phone_normalized = normalize_phone(phone)
+        if phone_normalized == "unknown" or not phone_normalized:
+            error_msg = f"无效的手机号: {phone} (类型: {type(phone).__name__})"
+            print(f"❌ [{account_name}] {error_msg}")
             stage_result = RecoveryStageResult(
                 account_name=account_name,
-                phone=phone,
+                phone=str(phone),
                 stage="request_code",
-                success=True,
-                detail="验证码请求已发送",
-                elapsed=time.time() - stage_start
+                success=False,
+                error=error_msg,
+                elapsed=0.0
             )
             context.stage_results.append(stage_result)
             self.db.insert_recovery_log(stage_result)
-            
-        except Exception as e:
-            print(f"❌ [{account_name}] 发送验证码请求失败: {e}")
+            return None
+        
+        # 更新上下文中的 phone 为规范化后的值
+        context.phone = phone_normalized
+        
+        # 阶段3: 请求验证码（带重试机制）
+        stage_start = time.time()
+        code_request_success = False
+        last_error = None
+        
+        for retry in range(config.RECOVERY_CODE_REQUEST_RETRIES + 1):
+            try:
+                if config.DEBUG_RECOVERY:
+                    print(f"🔍 [{account_name}] 尝试 {retry + 1}/{config.RECOVERY_CODE_REQUEST_RETRIES + 1}: 向 {phone_normalized} 发送验证码请求...")
+                
+                # 确保客户端已连接
+                if not old_client.is_connected():
+                    await old_client.connect()
+                
+                # 发送验证码请求
+                print(f"📤 [{account_name}] 向 {phone_normalized} 发送验证码请求...")
+                await old_client.send_code_request(phone_normalized)
+                print(f"✅ [{account_name}] 验证码请求已发送")
+                
+                code_request_success = True
+                stage_result = RecoveryStageResult(
+                    account_name=account_name,
+                    phone=phone_normalized,
+                    stage="request_code",
+                    success=True,
+                    detail=f"验证码请求已发送 (尝试 {retry + 1}/{config.RECOVERY_CODE_REQUEST_RETRIES + 1})",
+                    elapsed=time.time() - stage_start
+                )
+                context.stage_results.append(stage_result)
+                self.db.insert_recovery_log(stage_result)
+                break
+                
+            except TypeError as e:
+                # 捕获类型错误（phone 格式问题）
+                last_error = f"TypeError: {str(e)}"
+                print(f"❌ [{account_name}] 类型错误: {e}")
+                if config.DEBUG_RECOVERY:
+                    print(f"🔍 [{account_name}] 堆栈跟踪:\n{traceback.format_exc()}")
+                break  # 类型错误不重试
+                
+            except FloodWaitError as e:
+                # 处理 FloodWait 错误
+                wait_seconds = e.seconds if hasattr(e, 'seconds') else 60
+                last_error = f"FloodWait: {wait_seconds}秒"
+                print(f"⚠️ [{account_name}] 触发 FloodWait，需等待 {wait_seconds} 秒")
+                
+                if wait_seconds <= config.RECOVERY_STAGE_TIMEOUT and retry < config.RECOVERY_CODE_REQUEST_RETRIES:
+                    print(f"⏳ [{account_name}] 等待 {wait_seconds} 秒后重试...")
+                    await asyncio.sleep(wait_seconds)
+                    continue
+                else:
+                    print(f"❌ [{account_name}] FloodWait 时间过长或重试次数耗尽")
+                    break
+                    
+            except Exception as e:
+                last_error = str(e)
+                print(f"❌ [{account_name}] 发送验证码请求失败 (尝试 {retry + 1}/{config.RECOVERY_CODE_REQUEST_RETRIES + 1}): {e}")
+                if config.DEBUG_RECOVERY:
+                    print(f"🔍 [{account_name}] 堆栈跟踪:\n{traceback.format_exc()}")
+                
+                # 如果还有重试机会，等待后重试
+                if retry < config.RECOVERY_CODE_REQUEST_RETRIES:
+                    backoff_time = config.RECOVERY_RETRY_BACKOFF_BASE * (2 ** retry)
+                    print(f"⏳ [{account_name}] 等待 {backoff_time:.1f} 秒后重试...")
+                    await asyncio.sleep(backoff_time)
+        
+        # 如果请求失败，记录并返回
+        if not code_request_success:
             stage_result = RecoveryStageResult(
                 account_name=account_name,
-                phone=phone,
+                phone=phone_normalized,
                 stage="request_code",
                 success=False,
-                error=str(e)[:200],
+                error=last_error[:200] if last_error else "未知错误",
+                detail=f"重试 {config.RECOVERY_CODE_REQUEST_RETRIES + 1} 次后失败",
                 elapsed=time.time() - stage_start
             )
             context.stage_results.append(stage_result)
@@ -5527,12 +5792,12 @@ class RecoveryProtectionManager:
         stage_start = time.time()
         print(f"⏳ [{account_name}] 开始等待验证码 (超时: {config.RECOVERY_CODE_TIMEOUT}秒)...")
         try:
-            code = await self.wait_for_code(old_client, phone, timeout=config.RECOVERY_CODE_TIMEOUT)
+            code = await self.wait_for_code(old_client, phone_normalized, timeout=config.RECOVERY_CODE_TIMEOUT)
             
             if code:
                 stage_result = RecoveryStageResult(
                     account_name=account_name,
-                    phone=phone,
+                    phone=phone_normalized,
                     stage="wait_code",
                     success=True,
                     detail=f"成功获取验证码: {code[:2]}***",
@@ -5544,7 +5809,7 @@ class RecoveryProtectionManager:
             else:
                 stage_result = RecoveryStageResult(
                     account_name=account_name,
-                    phone=phone,
+                    phone=phone_normalized,
                     stage="wait_code",
                     success=False,
                     error=f"等待超时({config.RECOVERY_CODE_TIMEOUT}秒)",
@@ -5555,12 +5820,17 @@ class RecoveryProtectionManager:
                 return None
                 
         except Exception as e:
+            error_detail = str(e)[:200]
+            if config.DEBUG_RECOVERY:
+                print(f"❌ [{account_name}] 等待验证码异常:\n{traceback.format_exc()}")
+            
             stage_result = RecoveryStageResult(
                 account_name=account_name,
-                phone=phone,
+                phone=phone_normalized,
                 stage="wait_code",
                 success=False,
-                error=str(e)[:200],
+                error=error_detail,
+                detail=f"异常: {traceback.format_exc()[:300]}" if config.DEBUG_RECOVERY else "",
                 elapsed=time.time() - stage_start
             )
             context.stage_results.append(stage_result)
@@ -5868,10 +6138,10 @@ class RecoveryProtectionManager:
                                 self.db.insert_recovery_log(stage_result)
                                 return context
                             
-                            # 提取手机号
+                            # 提取手机号并规范化
                             match = re.search(r'手机号:\s*(\+?\d+)', message)
                             if match:
-                                phone = match.group(1)
+                                phone = normalize_phone(match.group(1))
                             
                             # 查找转换后的session文件
                             sessions_dir = os.path.join(os.getcwd(), "sessions")
@@ -5928,9 +6198,9 @@ class RecoveryProtectionManager:
                             with open(json_path, 'r', encoding='utf-8') as f:
                                 json_data = json.load(f)
                                 phone_value = json_data.get('phone', phone)
-                                # 确保phone是字符串类型
+                                # 规范化phone
                                 if phone_value and phone_value != "unknown":
-                                    phone = str(phone_value)
+                                    phone = normalize_phone(phone_value)
                         except:
                             pass
                     
@@ -5940,11 +6210,11 @@ class RecoveryProtectionManager:
                         filename = os.path.basename(file_path)
                         phone_match = re.search(r'(\+?\d{10,15})', filename)
                         if phone_match:
-                            phone = phone_match.group(1)
+                            phone = normalize_phone(phone_match.group(1))
                             print(f"📱 从文件名提取手机号: {phone}")
                     
-                    # 确保phone最终是字符串类型（同时更新本地变量和context）
-                    phone = str(phone) if phone else "unknown"
+                    # 确保phone最终是规范化的字符串（同时更新本地变量和context）
+                    phone = normalize_phone(phone)
                     context.phone = phone
                     stage_result = RecoveryStageResult(
                         account_name=account_name,
@@ -5996,7 +6266,7 @@ class RecoveryProtectionManager:
                     
                     # 如果之前没有获取到手机号，现在从账号信息中获取
                     if phone == "unknown" and me.phone:
-                        phone = str(me.phone)  # 确保是字符串
+                        phone = normalize_phone(me.phone)
                         context.phone = phone
                         print(f"📱 从账号信息获取手机号: {phone}")
                     
@@ -6041,14 +6311,38 @@ class RecoveryProtectionManager:
                     return context
                 
                 # ===== 阶段6: 设置/修改2FA密码 =====
-                pwd_success = await self._stage_rotate_pwd(new_client, context.new_session_path, phone, context)
-                if not pwd_success:
-                    context.status = "partial"
-                    context.failure_reason = "2FA密码设置失败"
-                    # 继续尝试删除其他设备
+                # 防御性检查：确保 new_client 存在
+                if not new_client:
+                    print(f"⚠️ [{account_name}] new_client 不存在，跳过 2FA 密码设置")
+                    stage_result = record_stage_result(
+                        context, "rotate_pwd", False,
+                        error="previous_stage_failed",
+                        detail="新设备登录失败，跳过密码设置"
+                    )
+                    self.db.insert_recovery_log(stage_result)
+                    pwd_success = False
+                else:
+                    pwd_success = await self._stage_rotate_pwd(new_client, context.new_session_path, phone, context)
+                    if not pwd_success:
+                        context.status = "partial"
+                        context.failure_reason = "2FA密码设置失败"
+                        # 继续尝试删除其他设备
                 
                 # ===== 阶段7: 删除其他设备 =====
-                devices_success = await self._stage_remove_devices(new_client, context)
+                # 防御性检查：确保 new_client 存在
+                if not new_client:
+                    print(f"⚠️ [{account_name}] new_client 不存在，跳过删除设备")
+                    stage_result = record_stage_result(
+                        context, "remove_devices", False,
+                        error="previous_stage_failed",
+                        detail="新设备登录失败，跳过设备删除"
+                    )
+                    self.db.insert_recovery_log(stage_result)
+                    devices_success = False
+                else:
+                    devices_success = await self._stage_remove_devices(new_client, context)
+                
+                # 最终状态判断
                 if not devices_success and pwd_success:
                     context.status = "partial"
                     context.failure_reason = "删除其他设备失败"
@@ -6064,6 +6358,8 @@ class RecoveryProtectionManager:
                 context.status = "failed"
                 context.failure_reason = f"处理异常: {str(e)[:100]}"
                 print(f"❌ 账号 {account_name} 处理失败: {e}")
+                if config.DEBUG_RECOVERY:
+                    print(f"🔍 [{account_name}] 完整堆栈跟踪:\n{traceback.format_exc()}")
             
             finally:
                 # 清理客户端连接
@@ -6154,25 +6450,69 @@ class RecoveryProtectionManager:
         
         return report_data
     
-    def generate_reports(self, report_data: Dict) -> Tuple[str, str, str, str, str]:
-        """生成报告文件，返回(txt_path, csv_path, success_zip_path, failed_zip_path, all_zip_path)"""
+    def generate_reports(self, report_data: Dict) -> RecoveryReportFiles:
+        """生成报告文件，返回 RecoveryReportFiles 命名元组"""
         batch_id = report_data['batch_id']
         counters = report_data['counters']
         contexts = report_data['contexts']
         
-        # TXT汇总报告
+        # 计算阶段统计
+        stage_stats = {}
+        error_frequencies = {}
+        total_retries = 0
+        
+        for ctx in contexts:
+            for stage_result in ctx.stage_results:
+                stage_name = stage_result.stage
+                if stage_name not in stage_stats:
+                    stage_stats[stage_name] = {'success': 0, 'failed': 0, 'total_time': 0.0}
+                
+                if stage_result.success:
+                    stage_stats[stage_name]['success'] += 1
+                else:
+                    stage_stats[stage_name]['failed'] += 1
+                    # 统计错误频率
+                    error_key = f"{stage_name}:{stage_result.error[:50]}"
+                    error_frequencies[error_key] = error_frequencies.get(error_key, 0) + 1
+                
+                stage_stats[stage_name]['total_time'] += stage_result.elapsed
+        
+        # TXT汇总报告（增强版）
         txt_path = os.path.join(config.RECOVERY_REPORTS_DIR, f"batch_{batch_id}_summary.txt")
         with open(txt_path, 'w', encoding='utf-8') as f:
             f.write(f"防止找回批次报告 - {batch_id}\n")
             f.write("=" * 50 + "\n\n")
+            
+            f.write("📊 总体统计\n")
+            f.write("-" * 50 + "\n")
             f.write(f"总数: {counters['total']}\n")
-            f.write(f"成功: {counters['success']}\n")
-            f.write(f"失败: {counters['failed']}\n")
-            f.write(f"异常: {counters['abnormal']}\n")
-            f.write(f"超时: {counters['code_timeout']}\n")
-            f.write(f"部分: {counters['partial']}\n")
+            f.write(f"成功: {counters['success']} ({counters['success']/counters['total']*100:.1f}%)\n")
+            f.write(f"失败: {counters['failed']} ({counters['failed']/counters['total']*100:.1f}%)\n")
+            f.write(f"异常: {counters['abnormal']} ({counters['abnormal']/counters['total']*100:.1f}%)\n")
+            f.write(f"超时: {counters['code_timeout']} ({counters['code_timeout']/counters['total']*100:.1f}%)\n")
+            f.write(f"部分: {counters['partial']} ({counters['partial']/counters['total']*100:.1f}%)\n\n")
+            
+            # 阶段统计
+            if stage_stats:
+                f.write("📈 阶段统计\n")
+                f.write("-" * 50 + "\n")
+                for stage_name, stats in sorted(stage_stats.items()):
+                    total = stats['success'] + stats['failed']
+                    success_rate = stats['success'] / total * 100 if total > 0 else 0
+                    avg_time = stats['total_time'] / total if total > 0 else 0
+                    f.write(f"{stage_name:20s}: 成功 {stats['success']:3d}/{total:3d} ({success_rate:5.1f}%), 平均耗时 {avg_time:6.2f}s\n")
+                f.write("\n")
+            
+            # 错误频率（Top 10）
+            if error_frequencies:
+                f.write("❌ 常见错误 (Top 10)\n")
+                f.write("-" * 50 + "\n")
+                sorted_errors = sorted(error_frequencies.items(), key=lambda x: x[1], reverse=True)[:10]
+                for error_key, count in sorted_errors:
+                    f.write(f"{count:3d}x - {error_key}\n")
+                f.write("\n")
         
-        # CSV详细报告
+        # CSV详细报告（账号级别）
         csv_path = os.path.join(config.RECOVERY_REPORTS_DIR, f"batch_{batch_id}_detail.csv")
         with open(csv_path, 'w', encoding='utf-8', newline='') as f:
             writer = csv.writer(f)
@@ -6189,6 +6529,25 @@ class RecoveryProtectionManager:
                     ctx.new_password_masked,
                     f"{total_time:.2f}s"
                 ])
+        
+        # CSV阶段级别报告（新增）
+        csv_stages_path = os.path.join(config.RECOVERY_REPORTS_DIR, f"batch_{batch_id}_stages.csv")
+        with open(csv_stages_path, 'w', encoding='utf-8', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['账号', '手机号', '阶段', '成功', '错误', '详细信息', '耗时(ms)'])
+            
+            for ctx in contexts:
+                account_name = os.path.basename(ctx.original_path)
+                for stage_result in ctx.stage_results:
+                    writer.writerow([
+                        account_name,
+                        stage_result.phone,
+                        stage_result.stage,
+                        '是' if stage_result.success else '否',
+                        stage_result.error[:100] if stage_result.error else '',
+                        stage_result.detail[:200] if stage_result.detail else '',
+                        f"{stage_result.elapsed * 1000:.0f}"  # 转换为毫秒
+                    ])
         
         # 移动文件到对应目录并复制新session文件
         for ctx in contexts:
@@ -6305,6 +6664,7 @@ class RecoveryProtectionManager:
             # 添加报告文件
             zf.write(txt_path, os.path.basename(txt_path))
             zf.write(csv_path, os.path.basename(csv_path))
+            zf.write(csv_stages_path, os.path.basename(csv_stages_path))
             
             # 添加各分类目录（如果有文件）
             for dir_name, dir_path in [
@@ -6321,7 +6681,14 @@ class RecoveryProtectionManager:
                             arcname = os.path.join(dir_name, file)
                             zf.write(file_path, arcname)
         
-        return txt_path, csv_path, success_zip_path, failed_zip_path, all_zip_path
+        return RecoveryReportFiles(
+            summary_txt=txt_path,
+            detail_csv=csv_path,
+            stages_csv=csv_stages_path,
+            success_zip=success_zip_path,
+            failed_zip=failed_zip_path,
+            all_archives_zip=all_zip_path
+        )
 
 
 # ================================
