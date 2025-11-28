@@ -5519,12 +5519,31 @@ def record_stage_result(context: 'RecoveryAccountContext', stage: str, success: 
 class Forget2FAManager:
     """忘记2FA管理器 - 官方密码重置流程"""
     
-    def __init__(self, proxy_manager: ProxyManager, db: Database):
+    # 配置常量 - 可根据需要调整
+    DEFAULT_CONCURRENT_LIMIT = 5       # 默认并发数限制
+    DEFAULT_MAX_PROXY_RETRIES = 3      # 默认代理重试次数
+    DEFAULT_PROXY_TIMEOUT = 30         # 默认代理超时时间（秒）
+    DEFAULT_MIN_DELAY = 5              # 账号间最小延迟（秒）
+    DEFAULT_MAX_DELAY = 15             # 账号间最大延迟（秒）
+    
+    def __init__(self, proxy_manager: ProxyManager, db: Database,
+                 concurrent_limit: int = None,
+                 max_proxy_retries: int = None,
+                 proxy_timeout: int = None,
+                 min_delay: float = None,
+                 max_delay: float = None):
         self.proxy_manager = proxy_manager
         self.db = db
-        self.semaphore = asyncio.Semaphore(5)  # 限制并发数为5，避免过快触发风控
-        self.max_proxy_retries = 3  # 代理重试次数
-        self.proxy_timeout = 30  # 代理超时时间
+        
+        # 使用传入参数或默认值
+        self.concurrent_limit = concurrent_limit or self.DEFAULT_CONCURRENT_LIMIT
+        self.max_proxy_retries = max_proxy_retries or self.DEFAULT_MAX_PROXY_RETRIES
+        self.proxy_timeout = proxy_timeout or self.DEFAULT_PROXY_TIMEOUT
+        self.min_delay = min_delay or self.DEFAULT_MIN_DELAY
+        self.max_delay = max_delay or self.DEFAULT_MAX_DELAY
+        
+        # 创建信号量控制并发
+        self.semaphore = asyncio.Semaphore(self.concurrent_limit)
     
     def create_proxy_dict(self, proxy_info: Dict) -> Optional[Dict]:
         """创建代理字典"""
@@ -5603,27 +5622,28 @@ class Forget2FAManager:
         """
         try:
             from telethon.tl.functions.account import ResetPasswordRequest
-            from telethon.tl.types import account
             
             result = await asyncio.wait_for(
                 client(ResetPasswordRequest()),
                 timeout=15
             )
             
-            # 检查结果类型
+            # 检查结果类型 - 使用类名字符串比较避免导入问题
+            result_type = type(result).__name__
+            
             if hasattr(result, 'until_date'):
                 # ResetPasswordRequestedWait - 正在等待冷却期
                 until_date = result.until_date
                 return True, "已请求密码重置，正在等待冷却期", until_date
-            elif hasattr(account, 'ResetPasswordOk') and isinstance(result, account.ResetPasswordOk):
+            elif result_type == 'ResetPasswordOk':
                 # ResetPasswordOk - 密码已被重置（极少见，通常需要等待）
                 return True, "密码已成功重置", None
-            elif hasattr(account, 'ResetPasswordFailedWait') and isinstance(result, account.ResetPasswordFailedWait):
+            elif result_type == 'ResetPasswordFailedWait':
                 # ResetPasswordFailedWait - 重置请求失败，需要等待
                 retry_date = getattr(result, 'retry_date', None)
                 return False, f"重置请求失败，需等待后重试", retry_date
             else:
-                # 其他情况
+                # 其他情况 - 通常是成功
                 return True, "密码重置请求已提交", None
                 
         except Exception as e:
@@ -5902,9 +5922,9 @@ class Forget2FAManager:
                 speed = processed / elapsed if elapsed > 0 else 0
                 await progress_callback(processed, total, results, speed, elapsed, result)
             
-            # 防风控随机延迟（5-15秒）
+            # 防风控随机延迟
             if processed < total:
-                delay = random.uniform(5, 15)
+                delay = random.uniform(self.min_delay, self.max_delay)
                 print(f"⏳ 防风控延迟 {delay:.1f} 秒...")
                 await asyncio.sleep(delay)
         
