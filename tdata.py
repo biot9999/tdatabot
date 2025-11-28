@@ -5586,6 +5586,19 @@ class Forget2FAManager:
         port = proxy_info.get('port', '')
         return f"{proxy_type} {host}:{port}"
     
+    @staticmethod
+    def mask_proxy_for_display(proxy_used: str) -> str:
+        """
+        隐藏代理详细信息，仅显示是否使用代理
+        用于报告文件和进度显示，保护用户代理隐私
+        """
+        if not proxy_used:
+            return "本地连接"
+        if "本地连接" in proxy_used or proxy_used == "本地连接":
+            return "本地连接"
+        # 只显示使用了代理，不暴露具体IP/端口
+        return "✅ 使用代理"
+    
     async def check_2fa_status(self, client) -> Tuple[bool, str, Optional[Dict]]:
         """
         检测账号是否设置2FA
@@ -6036,7 +6049,9 @@ class Forget2FAManager:
                         f.write(f"{idx}. {emoji} {item.get('account_name', '')}\n")
                         f.write(f"   手机号: {item.get('phone', '未知')}\n")
                         f.write(f"   状态: {item.get('error', status_name)}\n")
-                        f.write(f"   代理: {item.get('proxy_used', '本地连接')}\n")
+                        # 隐藏代理详细信息，保护用户隐私
+                        masked_proxy = self.mask_proxy_for_display(item.get('proxy_used', '本地连接'))
+                        f.write(f"   代理: {masked_proxy}\n")
                         if item.get('cooling_until'):
                             f.write(f"   冷却期至: {item.get('cooling_until')}\n")
                         f.write(f"   耗时: {item.get('elapsed', 0):.1f}秒\n\n")
@@ -11523,7 +11538,9 @@ class EnhancedBot:
                 # 当前处理状态
                 current_name = current_result.get('account_name', '')
                 current_status = current_result.get('status', '')
-                current_proxy = current_result.get('proxy_used', '本地连接')
+                # 隐藏代理详细信息，保护用户隐私
+                current_proxy_raw = current_result.get('proxy_used', '本地连接')
+                current_proxy = Forget2FAManager.mask_proxy_for_display(current_proxy_raw)
                 
                 # 状态映射
                 status_emoji = {
