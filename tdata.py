@@ -5724,9 +5724,10 @@ class Forget2FAManager:
             print(f"⚠️ [{account_name}] 获取/删除通知失败: {str(e)[:50]}")
             return False
     
-    async def connect_with_proxy_fallback(self, session_path: str, account_name: str) -> Tuple[Optional[TelegramClient], str, bool]:
+    async def connect_with_proxy_fallback(self, file_path: str, account_name: str, file_type: str = 'session') -> Tuple[Optional[TelegramClient], str, bool]:
         """
         使用代理连接，如果所有代理都超时则回退到本地连接
+        支持 session 和 tdata 两种格式
         
         Returns:
             (client或None, 代理描述字符串, 是否成功连接)
@@ -5736,7 +5737,13 @@ class Forget2FAManager:
         use_proxy = config.USE_PROXY and proxy_enabled and self.proxy_manager.proxies
         
         tried_proxies = []
-        session_base = session_path.replace('.session', '') if session_path.endswith('.session') else session_path
+        
+        # 处理 tdata 格式
+        if file_type == 'tdata':
+            return await self._connect_tdata_with_proxy_fallback(file_path, account_name, use_proxy, tried_proxies)
+        
+        # 处理 session 格式
+        session_base = file_path.replace('.session', '') if file_path.endswith('.session') else file_path
         
         # 优先尝试代理连接
         if use_proxy:
@@ -5829,6 +5836,134 @@ class Forget2FAManager:
                     pass
             return None, "本地连接", False
     
+    async def _connect_tdata_with_proxy_fallback(self, tdata_path: str, account_name: str, 
+                                                  use_proxy: bool, tried_proxies: list) -> Tuple[Optional[TelegramClient], str, bool]:
+        """
+        处理TData格式的连接（使用opentele转换）
+        
+        Returns:
+            (client或None, 代理描述字符串, 是否成功连接)
+        """
+        if not OPENTELE_AVAILABLE:
+            print(f"❌ [{account_name}] opentele库未安装，无法处理TData格式")
+            return None, "本地连接", False
+        
+        # 优先尝试代理连接
+        if use_proxy:
+            for attempt in range(self.max_proxy_retries):
+                proxy_info = self.proxy_manager.get_random_proxy()
+                if not proxy_info:
+                    break
+                
+                proxy_str = self.format_proxy_string(proxy_info)
+                if proxy_str in tried_proxies:
+                    continue
+                tried_proxies.append(proxy_str)
+                
+                proxy_dict = self.create_proxy_dict(proxy_info)
+                if not proxy_dict:
+                    continue
+                
+                print(f"🌐 [{account_name}] TData代理连接 #{attempt + 1}: {proxy_str}")
+                
+                client = None
+                try:
+                    # 使用opentele加载TData
+                    tdesk = TDesktop(tdata_path)
+                    
+                    if not tdesk.isLoaded():
+                        print(f"❌ [{account_name}] TData未授权或无效")
+                        return None, proxy_str, False
+                    
+                    # 创建临时session名称
+                    session_name = f"temp_forget2fa_{int(time.time()*1000)}"
+                    
+                    # 住宅代理使用更长超时
+                    timeout = config.RESIDENTIAL_PROXY_TIMEOUT if proxy_info.get('is_residential', False) else self.proxy_timeout
+                    
+                    # 转换为Telethon客户端（带代理）
+                    client = await tdesk.ToTelethon(
+                        session=session_name, 
+                        flag=UseCurrentSession, 
+                        api=API.TelegramDesktop,
+                        proxy=proxy_dict
+                    )
+                    
+                    await asyncio.wait_for(client.connect(), timeout=timeout)
+                    
+                    # 检查授权
+                    is_authorized = await asyncio.wait_for(client.is_user_authorized(), timeout=5)
+                    if not is_authorized:
+                        await client.disconnect()
+                        # 清理临时session文件
+                        self._cleanup_temp_session(session_name)
+                        return None, proxy_str, False
+                    
+                    print(f"✅ [{account_name}] TData代理连接成功: {proxy_str}")
+                    return client, proxy_str, True
+                    
+                except asyncio.TimeoutError:
+                    print(f"⏱️ [{account_name}] TData代理连接超时: {proxy_str}")
+                    if client:
+                        try:
+                            await client.disconnect()
+                        except:
+                            pass
+                except Exception as e:
+                    print(f"❌ [{account_name}] TData代理连接失败: {proxy_str} - {str(e)[:50]}")
+                    if client:
+                        try:
+                            await client.disconnect()
+                        except:
+                            pass
+        
+        # 所有代理都失败，回退到本地连接
+        print(f"🔄 [{account_name}] TData所有代理失败，回退到本地连接...")
+        try:
+            tdesk = TDesktop(tdata_path)
+            
+            if not tdesk.isLoaded():
+                print(f"❌ [{account_name}] TData未授权或无效")
+                return None, "本地连接", False
+            
+            session_name = f"temp_forget2fa_{int(time.time()*1000)}"
+            
+            # 转换为Telethon客户端（无代理）
+            client = await tdesk.ToTelethon(
+                session=session_name, 
+                flag=UseCurrentSession, 
+                api=API.TelegramDesktop
+            )
+            
+            await asyncio.wait_for(client.connect(), timeout=15)
+            
+            is_authorized = await asyncio.wait_for(client.is_user_authorized(), timeout=5)
+            if not is_authorized:
+                await client.disconnect()
+                self._cleanup_temp_session(session_name)
+                return None, "本地连接", False
+            
+            print(f"✅ [{account_name}] TData本地连接成功")
+            return client, "本地连接 (代理失败后回退)", True
+            
+        except Exception as e:
+            print(f"❌ [{account_name}] TData本地连接也失败: {str(e)[:50]}")
+            if client:
+                try:
+                    await client.disconnect()
+                except:
+                    pass
+            return None, "本地连接", False
+    
+    def _cleanup_temp_session(self, session_name: str):
+        """清理临时session文件"""
+        try:
+            session_file = f"{session_name}.session"
+            if os.path.exists(session_file):
+                os.remove(session_file)
+        except:
+            pass
+    
     async def process_single_account(self, file_path: str, file_name: str, 
                                      file_type: str, batch_id: str) -> Dict:
         """
@@ -5852,9 +5987,9 @@ class Forget2FAManager:
         async with self.semaphore:
             client = None
             try:
-                # 1. 连接（优先代理，回退本地）
+                # 1. 连接（优先代理，回退本地）- 支持 session 和 tdata 格式
                 client, proxy_used, connected = await self.connect_with_proxy_fallback(
-                    file_path, file_name
+                    file_path, file_name, file_type
                 )
                 result['proxy_used'] = proxy_used
                 
