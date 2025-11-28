@@ -1440,6 +1440,23 @@ class Database:
             )
         """)
         
+        # 忘记2FA日志表
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS forget_2fa_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_id TEXT,
+                account_name TEXT,
+                phone TEXT,
+                file_type TEXT,
+                proxy_used TEXT,
+                status TEXT,
+                error TEXT,
+                cooling_until TEXT,
+                elapsed REAL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
         # 迁移：添加expiry_time列到memberships表
         try:
             c.execute("ALTER TABLE memberships ADD COLUMN expiry_time TEXT")
@@ -2267,6 +2284,39 @@ class Database:
         except Exception as e:
             print(f"❌ 获取防止找回汇总失败: {e}")
             return []
+    
+    def insert_forget_2fa_log(self, batch_id: str, account_name: str, phone: str,
+                              file_type: str, proxy_used: str, status: str,
+                              error: str = "", cooling_until: str = "", elapsed: float = 0.0):
+        """插入忘记2FA日志"""
+        try:
+            conn = sqlite3.connect(self.db_name)
+            c = conn.cursor()
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
+            c.execute("""
+                INSERT INTO forget_2fa_logs 
+                (batch_id, account_name, phone, file_type, proxy_used, status, error, cooling_until, elapsed, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                batch_id,
+                account_name,
+                phone,
+                file_type,
+                proxy_used,
+                status,
+                error,
+                cooling_until,
+                elapsed,
+                now
+            ))
+            
+            conn.commit()
+            conn.close()
+            return True
+        except Exception as e:
+            print(f"❌ 插入忘记2FA日志失败: {e}")
+            return False
 
 # ================================
 # 文件处理器（保持原有功能）
@@ -5463,6 +5513,798 @@ def record_stage_result(context: 'RecoveryAccountContext', stage: str, success: 
     return stage_result
 
 # ================================
+# 忘记2FA管理器
+# ================================
+
+class Forget2FAManager:
+    """忘记2FA管理器 - 官方密码重置流程"""
+    
+    # 配置常量 - 可根据需要调整
+    DEFAULT_CONCURRENT_LIMIT = 30      # 默认并发数限制（同时处理30个账号）
+    DEFAULT_MAX_PROXY_RETRIES = 3      # 默认代理重试次数
+    DEFAULT_PROXY_TIMEOUT = 30         # 默认代理超时时间（秒）
+    DEFAULT_MIN_DELAY = 1              # 账号间最小延迟（秒）- 高并发模式下减少延迟
+    DEFAULT_MAX_DELAY = 3              # 账号间最大延迟（秒）- 高并发模式下减少延迟
+    
+    def __init__(self, proxy_manager: ProxyManager, db: Database,
+                 concurrent_limit: int = None,
+                 max_proxy_retries: int = None,
+                 proxy_timeout: int = None,
+                 min_delay: float = None,
+                 max_delay: float = None):
+        self.proxy_manager = proxy_manager
+        self.db = db
+        
+        # 使用传入参数或默认值
+        self.concurrent_limit = concurrent_limit or self.DEFAULT_CONCURRENT_LIMIT
+        self.max_proxy_retries = max_proxy_retries or self.DEFAULT_MAX_PROXY_RETRIES
+        self.proxy_timeout = proxy_timeout or self.DEFAULT_PROXY_TIMEOUT
+        self.min_delay = min_delay or self.DEFAULT_MIN_DELAY
+        self.max_delay = max_delay or self.DEFAULT_MAX_DELAY
+        
+        # 创建信号量控制并发
+        self.semaphore = asyncio.Semaphore(self.concurrent_limit)
+    
+    def create_proxy_dict(self, proxy_info: Dict) -> Optional[Dict]:
+        """创建代理字典"""
+        if not proxy_info:
+            return None
+        
+        try:
+            if PROXY_SUPPORT:
+                if proxy_info['type'] == 'socks5':
+                    proxy_type = socks.SOCKS5
+                elif proxy_info['type'] == 'socks4':
+                    proxy_type = socks.SOCKS4
+                else:
+                    proxy_type = socks.HTTP
+                
+                proxy_dict = {
+                    'proxy_type': proxy_type,
+                    'addr': proxy_info['host'],
+                    'port': proxy_info['port']
+                }
+                
+                if proxy_info.get('username') and proxy_info.get('password'):
+                    proxy_dict['username'] = proxy_info['username']
+                    proxy_dict['password'] = proxy_info['password']
+            else:
+                proxy_dict = (proxy_info['host'], proxy_info['port'])
+            
+            return proxy_dict
+            
+        except Exception as e:
+            print(f"❌ 创建代理配置失败: {e}")
+            return None
+    
+    def format_proxy_string(self, proxy_info: Optional[Dict]) -> str:
+        """格式化代理字符串用于显示"""
+        if not proxy_info:
+            return "本地连接"
+        proxy_type = proxy_info.get('type', 'http')
+        host = proxy_info.get('host', '')
+        port = proxy_info.get('port', '')
+        return f"{proxy_type} {host}:{port}"
+    
+    @staticmethod
+    def mask_proxy_for_display(proxy_used: str) -> str:
+        """
+        隐藏代理详细信息，仅显示是否使用代理
+        用于报告文件和进度显示，保护用户代理隐私
+        """
+        if not proxy_used:
+            return "本地连接"
+        if "本地连接" in proxy_used or proxy_used == "本地连接":
+            return "本地连接"
+        # 只显示使用了代理，不暴露具体IP/端口
+        return "✅ 使用代理"
+    
+    async def check_2fa_status(self, client) -> Tuple[bool, str, Optional[Dict]]:
+        """
+        检测账号是否设置2FA
+        
+        Returns:
+            (是否有2FA, 状态描述, 密码信息字典)
+        """
+        try:
+            from telethon.tl.functions.account import GetPasswordRequest
+            
+            pwd_info = await asyncio.wait_for(
+                client(GetPasswordRequest()),
+                timeout=10
+            )
+            
+            if pwd_info.has_password:
+                return True, "账号已设置2FA密码", {
+                    'has_password': True,
+                    'has_recovery': pwd_info.has_recovery,
+                    'hint': pwd_info.hint or ""
+                }
+            else:
+                return False, "账号未设置2FA密码", {'has_password': False}
+                
+        except Exception as e:
+            return False, f"检测2FA状态失败: {str(e)[:50]}", None
+    
+    async def request_password_reset(self, client) -> Tuple[bool, str, Optional[datetime]]:
+        """
+        请求重置密码
+        
+        Returns:
+            (是否成功, 状态描述, 冷却期结束时间)
+        """
+        try:
+            from telethon.tl.functions.account import ResetPasswordRequest
+            from datetime import timezone
+            
+            result = await asyncio.wait_for(
+                client(ResetPasswordRequest()),
+                timeout=15
+            )
+            
+            # 检查结果类型 - 使用类名字符串比较避免导入问题
+            result_type = type(result).__name__
+            
+            if hasattr(result, 'until_date'):
+                # ResetPasswordRequestedWait - 正在等待冷却期
+                until_date = result.until_date
+                
+                # 判断是新请求还是已在冷却期
+                # 如果until_date距离现在小于6天23小时，说明是已存在的冷却期（不是刚刚请求的）
+                now = datetime.now(timezone.utc) if until_date.tzinfo else datetime.now()
+                time_remaining = until_date - now
+                
+                # 7天 = 604800秒，如果剩余时间少于6天23小时(约604000秒)，说明是已在冷却期
+                if time_remaining.total_seconds() < 604000:  # 约6天23小时
+                    days_remaining = time_remaining.days
+                    hours_remaining = time_remaining.seconds // 3600
+                    return False, f"已在冷却期中 (剩余约{days_remaining}天{hours_remaining}小时)", until_date
+                else:
+                    # 新请求，剩余时间接近7天
+                    return True, "已请求密码重置，正在等待冷却期", until_date
+            elif result_type == 'ResetPasswordOk':
+                # ResetPasswordOk - 密码已被重置（极少见，通常需要等待）
+                return True, "密码已成功重置", None
+            elif result_type == 'ResetPasswordFailedWait':
+                # ResetPasswordFailedWait - 重置请求失败，需要等待
+                retry_date = getattr(result, 'retry_date', None)
+                return False, f"重置请求失败，需等待后重试", retry_date
+            else:
+                # 其他情况 - 通常是成功
+                return True, "密码重置请求已提交", None
+                
+        except Exception as e:
+            error_msg = str(e).lower()
+            if "flood" in error_msg:
+                return False, "操作过于频繁，请稍后重试", None
+            elif "fresh_reset" in error_msg or "recently" in error_msg:
+                return False, "已在冷却期中", None
+            else:
+                return False, f"请求重置失败: {str(e)[:50]}", None
+    
+    async def delete_reset_notification(self, client, account_name: str = "") -> bool:
+        """
+        删除来自777000（Telegram官方）的密码重置通知消息
+        
+        Args:
+            client: TelegramClient实例
+            account_name: 账号名称（用于日志）
+            
+        Returns:
+            是否成功删除
+        """
+        try:
+            # 获取777000实体（Telegram官方通知账号）
+            entity = await asyncio.wait_for(
+                client.get_entity(777000),
+                timeout=10
+            )
+            
+            # 获取最近的消息（通常重置通知是最新的几条之一）
+            messages = await asyncio.wait_for(
+                client.get_messages(entity, limit=5),
+                timeout=10
+            )
+            
+            deleted_count = 0
+            for msg in messages:
+                if msg.text:
+                    # 检查是否是密码重置通知（多语言匹配）
+                    text_lower = msg.text.lower()
+                    if any(keyword in text_lower for keyword in [
+                        'reset password',           # 英文
+                        'reset your telegram password',
+                        '2-step verification',
+                        'request to reset',
+                        '重置密码',                  # 中文
+                        '二次验证',
+                        '两步验证'
+                    ]):
+                        try:
+                            await client.delete_messages(entity, msg.id)
+                            deleted_count += 1
+                            print(f"🗑️ [{account_name}] 已删除重置通知消息 (ID: {msg.id})")
+                        except Exception as del_err:
+                            print(f"⚠️ [{account_name}] 删除消息失败: {str(del_err)[:30]}")
+            
+            if deleted_count > 0:
+                print(f"✅ [{account_name}] 成功删除 {deleted_count} 条重置通知")
+                return True
+            else:
+                print(f"ℹ️ [{account_name}] 未找到需要删除的重置通知")
+                return True  # 没有找到也算成功
+                
+        except Exception as e:
+            print(f"⚠️ [{account_name}] 获取/删除通知失败: {str(e)[:50]}")
+            return False
+    
+    async def connect_with_proxy_fallback(self, file_path: str, account_name: str, file_type: str = 'session') -> Tuple[Optional[TelegramClient], str, bool]:
+        """
+        使用代理连接，如果所有代理都超时则回退到本地连接
+        支持 session 和 tdata 两种格式
+        
+        Returns:
+            (client或None, 代理描述字符串, 是否成功连接)
+        """
+        # 检查代理是否可用
+        proxy_enabled = self.db.get_proxy_enabled() if self.db else True
+        use_proxy = config.USE_PROXY and proxy_enabled and self.proxy_manager.proxies
+        
+        tried_proxies = []
+        
+        # 处理 tdata 格式
+        if file_type == 'tdata':
+            return await self._connect_tdata_with_proxy_fallback(file_path, account_name, use_proxy, tried_proxies)
+        
+        # 处理 session 格式
+        session_base = file_path.replace('.session', '') if file_path.endswith('.session') else file_path
+        
+        # 优先尝试代理连接
+        if use_proxy:
+            for attempt in range(self.max_proxy_retries):
+                proxy_info = self.proxy_manager.get_random_proxy()
+                if not proxy_info:
+                    break
+                
+                proxy_str = self.format_proxy_string(proxy_info)
+                if proxy_str in tried_proxies:
+                    continue
+                tried_proxies.append(proxy_str)
+                
+                proxy_dict = self.create_proxy_dict(proxy_info)
+                if not proxy_dict:
+                    continue
+                
+                print(f"🌐 [{account_name}] 尝试代理连接 #{attempt + 1}: {proxy_str}")
+                
+                client = None
+                try:
+                    # 住宅代理使用更长超时
+                    timeout = config.RESIDENTIAL_PROXY_TIMEOUT if proxy_info.get('is_residential', False) else self.proxy_timeout
+                    
+                    client = TelegramClient(
+                        session_base,
+                        config.API_ID,
+                        config.API_HASH,
+                        timeout=timeout,
+                        connection_retries=1,
+                        retry_delay=1,
+                        proxy=proxy_dict
+                    )
+                    
+                    await asyncio.wait_for(client.connect(), timeout=timeout)
+                    
+                    # 检查授权
+                    is_authorized = await asyncio.wait_for(client.is_user_authorized(), timeout=5)
+                    if not is_authorized:
+                        await client.disconnect()
+                        return None, proxy_str, False
+                    
+                    print(f"✅ [{account_name}] 代理连接成功: {proxy_str}")
+                    return client, proxy_str, True
+                    
+                except asyncio.TimeoutError:
+                    print(f"⏱️ [{account_name}] 代理连接超时: {proxy_str}")
+                    if client:
+                        try:
+                            await client.disconnect()
+                        except:
+                            pass
+                except Exception as e:
+                    print(f"❌ [{account_name}] 代理连接失败: {proxy_str} - {str(e)[:50]}")
+                    if client:
+                        try:
+                            await client.disconnect()
+                        except:
+                            pass
+        
+        # 所有代理都失败，回退到本地连接
+        print(f"🔄 [{account_name}] 所有代理失败，回退到本地连接...")
+        try:
+            client = TelegramClient(
+                session_base,
+                config.API_ID,
+                config.API_HASH,
+                timeout=15,
+                connection_retries=2,
+                retry_delay=1,
+                proxy=None
+            )
+            
+            await asyncio.wait_for(client.connect(), timeout=15)
+            
+            is_authorized = await asyncio.wait_for(client.is_user_authorized(), timeout=5)
+            if not is_authorized:
+                await client.disconnect()
+                return None, "本地连接", False
+            
+            print(f"✅ [{account_name}] 本地连接成功")
+            return client, "本地连接 (代理失败后回退)", True
+            
+        except Exception as e:
+            print(f"❌ [{account_name}] 本地连接也失败: {str(e)[:50]}")
+            if client:
+                try:
+                    await client.disconnect()
+                except:
+                    pass
+            return None, "本地连接", False
+    
+    async def _connect_tdata_with_proxy_fallback(self, tdata_path: str, account_name: str, 
+                                                  use_proxy: bool, tried_proxies: list) -> Tuple[Optional[TelegramClient], str, bool]:
+        """
+        处理TData格式的连接（使用opentele转换）
+        
+        Returns:
+            (client或None, 代理描述字符串, 是否成功连接)
+        """
+        if not OPENTELE_AVAILABLE:
+            print(f"❌ [{account_name}] opentele库未安装，无法处理TData格式")
+            return None, "本地连接", False
+        
+        # 优先尝试代理连接
+        if use_proxy:
+            for attempt in range(self.max_proxy_retries):
+                proxy_info = self.proxy_manager.get_random_proxy()
+                if not proxy_info:
+                    break
+                
+                proxy_str = self.format_proxy_string(proxy_info)
+                if proxy_str in tried_proxies:
+                    continue
+                tried_proxies.append(proxy_str)
+                
+                proxy_dict = self.create_proxy_dict(proxy_info)
+                if not proxy_dict:
+                    continue
+                
+                print(f"🌐 [{account_name}] TData代理连接 #{attempt + 1}: {proxy_str}")
+                
+                client = None
+                try:
+                    # 使用opentele加载TData
+                    tdesk = TDesktop(tdata_path)
+                    
+                    if not tdesk.isLoaded():
+                        print(f"❌ [{account_name}] TData未授权或无效")
+                        return None, proxy_str, False
+                    
+                    # 创建临时session名称
+                    session_name = f"temp_forget2fa_{int(time.time()*1000)}"
+                    
+                    # 住宅代理使用更长超时
+                    timeout = config.RESIDENTIAL_PROXY_TIMEOUT if proxy_info.get('is_residential', False) else self.proxy_timeout
+                    
+                    # 转换为Telethon客户端（带代理）
+                    client = await tdesk.ToTelethon(
+                        session=session_name, 
+                        flag=UseCurrentSession, 
+                        api=API.TelegramDesktop,
+                        proxy=proxy_dict
+                    )
+                    
+                    await asyncio.wait_for(client.connect(), timeout=timeout)
+                    
+                    # 检查授权
+                    is_authorized = await asyncio.wait_for(client.is_user_authorized(), timeout=5)
+                    if not is_authorized:
+                        await client.disconnect()
+                        # 清理临时session文件
+                        self._cleanup_temp_session(session_name)
+                        return None, proxy_str, False
+                    
+                    print(f"✅ [{account_name}] TData代理连接成功: {proxy_str}")
+                    return client, proxy_str, True
+                    
+                except asyncio.TimeoutError:
+                    print(f"⏱️ [{account_name}] TData代理连接超时: {proxy_str}")
+                    if client:
+                        try:
+                            await client.disconnect()
+                        except:
+                            pass
+                except Exception as e:
+                    print(f"❌ [{account_name}] TData代理连接失败: {proxy_str} - {str(e)[:50]}")
+                    if client:
+                        try:
+                            await client.disconnect()
+                        except:
+                            pass
+        
+        # 所有代理都失败，回退到本地连接
+        print(f"🔄 [{account_name}] TData所有代理失败，回退到本地连接...")
+        try:
+            tdesk = TDesktop(tdata_path)
+            
+            if not tdesk.isLoaded():
+                print(f"❌ [{account_name}] TData未授权或无效")
+                return None, "本地连接", False
+            
+            session_name = f"temp_forget2fa_{int(time.time()*1000)}"
+            
+            # 转换为Telethon客户端（无代理）
+            client = await tdesk.ToTelethon(
+                session=session_name, 
+                flag=UseCurrentSession, 
+                api=API.TelegramDesktop
+            )
+            
+            await asyncio.wait_for(client.connect(), timeout=15)
+            
+            is_authorized = await asyncio.wait_for(client.is_user_authorized(), timeout=5)
+            if not is_authorized:
+                await client.disconnect()
+                self._cleanup_temp_session(session_name)
+                return None, "本地连接", False
+            
+            print(f"✅ [{account_name}] TData本地连接成功")
+            return client, "本地连接 (代理失败后回退)", True
+            
+        except Exception as e:
+            print(f"❌ [{account_name}] TData本地连接也失败: {str(e)[:50]}")
+            if client:
+                try:
+                    await client.disconnect()
+                except:
+                    pass
+            return None, "本地连接", False
+    
+    def _cleanup_temp_session(self, session_name: str):
+        """清理临时session文件"""
+        try:
+            session_file = f"{session_name}.session"
+            if os.path.exists(session_file):
+                os.remove(session_file)
+        except:
+            pass
+    
+    async def process_single_account(self, file_path: str, file_name: str, 
+                                     file_type: str, batch_id: str) -> Dict:
+        """
+        处理单个账号（强制使用代理，失败后回退本地）
+        
+        Returns:
+            结果字典
+        """
+        start_time = time.time()
+        result = {
+            'account_name': file_name,
+            'phone': '',
+            'file_type': file_type,
+            'proxy_used': '',
+            'status': 'failed',
+            'error': '',
+            'cooling_until': '',
+            'elapsed': 0.0
+        }
+        
+        async with self.semaphore:
+            client = None
+            try:
+                # 1. 连接（优先代理，回退本地）- 支持 session 和 tdata 格式
+                client, proxy_used, connected = await self.connect_with_proxy_fallback(
+                    file_path, file_name, file_type
+                )
+                result['proxy_used'] = proxy_used
+                
+                if not connected or not client:
+                    result['status'] = 'failed'
+                    result['error'] = '连接失败 (所有代理和本地都失败)'
+                    result['elapsed'] = time.time() - start_time
+                    self.db.insert_forget_2fa_log(
+                        batch_id, file_name, '', file_type, proxy_used,
+                        'failed', result['error'], '', result['elapsed']
+                    )
+                    return result
+                
+                # 2. 获取用户信息
+                try:
+                    me = await asyncio.wait_for(client.get_me(), timeout=5)
+                    result['phone'] = me.phone or ''
+                    user_info = f"ID:{me.id}"
+                    if me.username:
+                        user_info += f" @{me.username}"
+                except Exception as e:
+                    user_info = "账号"
+                
+                # 3. 检测2FA状态
+                has_2fa, status_msg, pwd_info = await self.check_2fa_status(client)
+                
+                if not has_2fa:
+                    # 账号没有设置2FA
+                    result['status'] = 'no_2fa'
+                    result['error'] = status_msg
+                    result['elapsed'] = time.time() - start_time
+                    self.db.insert_forget_2fa_log(
+                        batch_id, file_name, result['phone'], file_type, proxy_used,
+                        'no_2fa', status_msg, '', result['elapsed']
+                    )
+                    print(f"⚠️ [{file_name}] {status_msg}")
+                    return result
+                
+                # 4. 请求密码重置
+                success, reset_msg, cooling_until = await self.request_password_reset(client)
+                
+                if success:
+                    result['status'] = 'requested'
+                    if cooling_until:
+                        result['cooling_until'] = cooling_until.strftime('%Y-%m-%d %H:%M:%S')
+                        result['error'] = f"{reset_msg}，冷却期至: {result['cooling_until']}"
+                    else:
+                        result['error'] = reset_msg
+                    print(f"✅ [{file_name}] {reset_msg}")
+                    
+                    # 5. 删除来自777000的重置通知消息
+                    await asyncio.sleep(2)  # 等待2秒确保通知已到达
+                    await self.delete_reset_notification(client, file_name)
+                else:
+                    # 检查是否已在冷却期
+                    if "冷却期" in reset_msg or "recently" in reset_msg.lower():
+                        result['status'] = 'cooling'
+                        if cooling_until:
+                            result['cooling_until'] = cooling_until.strftime('%Y-%m-%d %H:%M:%S')
+                            result['error'] = f"{reset_msg}，冷却期至: {result['cooling_until']}"
+                        else:
+                            result['error'] = reset_msg
+                        print(f"⏳ [{file_name}] {reset_msg}")  # 冷却期使用⏳图标
+                    else:
+                        result['status'] = 'failed'
+                        result['error'] = reset_msg
+                        print(f"❌ [{file_name}] {reset_msg}")
+                
+                result['elapsed'] = time.time() - start_time
+                self.db.insert_forget_2fa_log(
+                    batch_id, file_name, result['phone'], file_type, proxy_used,
+                    result['status'], result['error'], result['cooling_until'], result['elapsed']
+                )
+                
+            except Exception as e:
+                result['status'] = 'failed'
+                result['error'] = f"处理异常: {str(e)[:50]}"
+                result['elapsed'] = time.time() - start_time
+                self.db.insert_forget_2fa_log(
+                    batch_id, file_name, result['phone'], file_type, result['proxy_used'],
+                    'failed', result['error'], '', result['elapsed']
+                )
+                print(f"❌ [{file_name}] {result['error']}")
+            finally:
+                if client:
+                    try:
+                        await client.disconnect()
+                    except:
+                        pass
+            
+            return result
+    
+    async def batch_process_with_progress(self, files: List[Tuple[str, str]], 
+                                         file_type: str, 
+                                         batch_id: str,
+                                         progress_callback=None) -> Dict:
+        """
+        批量处理（高并发模式 - 同时处理多个账号）
+        
+        Args:
+            files: [(文件路径, 文件名), ...]
+            file_type: 'session' 或 'tdata'
+            batch_id: 批次ID
+            progress_callback: 进度回调函数
+            
+        Returns:
+            结果字典
+        """
+        results = {
+            'requested': [],    # 已请求重置
+            'no_2fa': [],       # 无需重置
+            'cooling': [],      # 冷却期中
+            'failed': []        # 失败
+        }
+        
+        total = len(files)
+        processed = [0]  # 使用列表以便在闭包中修改
+        start_time = time.time()
+        results_lock = asyncio.Lock()  # 用于线程安全地更新results
+        
+        async def process_single_with_callback(file_path: str, file_name: str):
+            """处理单个账号并更新结果"""
+            # 处理单个账号
+            result = await self.process_single_account(
+                file_path, file_name, file_type, batch_id
+            )
+            
+            # 线程安全地更新结果
+            async with results_lock:
+                processed[0] += 1
+                
+                # 分类结果
+                status = result.get('status', 'failed')
+                if status == 'requested':
+                    results['requested'].append(result)
+                elif status == 'no_2fa':
+                    results['no_2fa'].append(result)
+                elif status == 'cooling':
+                    results['cooling'].append(result)
+                else:
+                    results['failed'].append(result)
+                
+                # 调用进度回调
+                if progress_callback:
+                    elapsed = time.time() - start_time
+                    speed = processed[0] / elapsed if elapsed > 0 else 0
+                    await progress_callback(processed[0], total, results, speed, elapsed, result)
+            
+            return result
+        
+        # 使用批量并发处理
+        batch_size = self.concurrent_limit
+        for i in range(0, len(files), batch_size):
+            batch = files[i:i + batch_size]
+            
+            # 创建任务列表
+            tasks = [
+                process_single_with_callback(file_path, file_name)
+                for file_path, file_name in batch
+            ]
+            
+            # 并发执行当前批次
+            await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # 批次间短暂延迟（防风控）
+            if i + batch_size < len(files):
+                delay = random.uniform(self.min_delay, self.max_delay)
+                print(f"⏳ 批次间延迟 {delay:.1f} 秒...")
+                await asyncio.sleep(delay)
+        
+        return results
+    
+    def create_result_files(self, results: Dict, task_id: str, files: List[Tuple[str, str]], file_type: str) -> List[Tuple[str, str, int]]:
+        """
+        生成结果压缩包（按状态分类）
+        
+        Returns:
+            [(zip路径, 状态名称, 数量), ...]
+        """
+        result_files = []
+        
+        # 状态映射
+        status_map = {
+            'requested': ('已请求重置', '✅'),
+            'no_2fa': ('无需重置', '⚠️'),
+            'cooling': ('冷却期中', '⏳'),
+            'failed': ('失败', '❌')
+        }
+        
+        # 创建文件路径映射
+        file_path_map = {name: path for path, name in files}
+        
+        for status_key, items in results.items():
+            if not items:
+                continue
+            
+            status_name, emoji = status_map.get(status_key, (status_key, '📄'))
+            
+            print(f"📦 正在创建 {status_name} 结果文件，包含 {len(items)} 个账号")
+            
+            # 创建临时目录
+            timestamp_short = str(int(time.time()))[-6:]
+            status_temp_dir = os.path.join(config.RESULTS_DIR, f"forget2fa_{status_key}_{timestamp_short}")
+            os.makedirs(status_temp_dir, exist_ok=True)
+            
+            try:
+                for item in items:
+                    account_name = item.get('account_name', '')
+                    file_path = file_path_map.get(account_name, '')
+                    
+                    if not file_path or not os.path.exists(file_path):
+                        continue
+                    
+                    if file_type == 'session':
+                        # 复制session文件
+                        dest_path = os.path.join(status_temp_dir, account_name)
+                        shutil.copy2(file_path, dest_path)
+                        
+                        # 复制对应的json文件（如果存在）
+                        json_name = account_name.replace('.session', '.json')
+                        json_path = os.path.join(os.path.dirname(file_path), json_name)
+                        if os.path.exists(json_path):
+                            shutil.copy2(json_path, os.path.join(status_temp_dir, json_name))
+                    
+                    elif file_type == 'tdata':
+                        # TData格式正确结构: 号码/tdata/D877F783D5D3EF8C
+                        # file_path 指向的是 tdata 目录本身
+                        # account_name 是号码（如 123456789）
+                        
+                        # 创建 号码/tdata 目录结构
+                        account_dir = os.path.join(status_temp_dir, account_name)
+                        tdata_dest_dir = os.path.join(account_dir, "tdata")
+                        os.makedirs(tdata_dest_dir, exist_ok=True)
+                        
+                        # 复制tdata目录内容到 号码/tdata/
+                        if os.path.isdir(file_path):
+                            for item_name in os.listdir(file_path):
+                                src_item = os.path.join(file_path, item_name)
+                                dst_item = os.path.join(tdata_dest_dir, item_name)
+                                if os.path.isdir(src_item):
+                                    shutil.copytree(src_item, dst_item, dirs_exist_ok=True)
+                                else:
+                                    shutil.copy2(src_item, dst_item)
+                        
+                        # 同时复制tdata同级目录下的密码文件（如2fa.txt等）
+                        parent_dir = os.path.dirname(file_path)
+                        for password_file in ['2fa.txt', 'twofa.txt', 'password.txt']:
+                            password_path = os.path.join(parent_dir, password_file)
+                            if os.path.exists(password_path):
+                                shutil.copy2(password_path, os.path.join(account_dir, password_file))
+                
+                # 创建ZIP文件
+                zip_filename = f"忘记2FA_{status_name}_{len(items)}个.zip"
+                zip_path = os.path.join(config.RESULTS_DIR, zip_filename)
+                
+                with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                    for root, dirs, files_list in os.walk(status_temp_dir):
+                        for file in files_list:
+                            file_path_full = os.path.join(root, file)
+                            arcname = os.path.relpath(file_path_full, status_temp_dir)
+                            zipf.write(file_path_full, arcname)
+                
+                # 创建TXT报告
+                txt_filename = f"忘记2FA_{status_name}_{len(items)}个_报告.txt"
+                txt_path = os.path.join(config.RESULTS_DIR, txt_filename)
+                
+                with open(txt_path, 'w', encoding='utf-8') as f:
+                    f.write(f"忘记2FA处理报告 - {status_name}\n")
+                    f.write("=" * 50 + "\n\n")
+                    f.write(f"总数: {len(items)}个\n")
+                    f.write(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                    
+                    f.write("详细列表:\n")
+                    f.write("-" * 50 + "\n\n")
+                    
+                    for idx, item in enumerate(items, 1):
+                        f.write(f"{idx}. {emoji} {item.get('account_name', '')}\n")
+                        f.write(f"   手机号: {item.get('phone', '未知')}\n")
+                        f.write(f"   状态: {item.get('error', status_name)}\n")
+                        # 隐藏代理详细信息，保护用户隐私
+                        masked_proxy = self.mask_proxy_for_display(item.get('proxy_used', '本地连接'))
+                        f.write(f"   代理: {masked_proxy}\n")
+                        if item.get('cooling_until'):
+                            f.write(f"   冷却期至: {item.get('cooling_until')}\n")
+                        f.write(f"   耗时: {item.get('elapsed', 0):.1f}秒\n\n")
+                
+                print(f"✅ 创建文件: {zip_filename}")
+                result_files.append((zip_path, txt_path, status_name, len(items)))
+                
+            except Exception as e:
+                print(f"❌ 创建{status_name}结果文件失败: {e}")
+                import traceback
+                traceback.print_exc()
+            finally:
+                # 清理临时目录
+                if os.path.exists(status_temp_dir):
+                    shutil.rmtree(status_temp_dir, ignore_errors=True)
+        
+        return result_files
+
+# ================================
 # 防止找回管理器
 # ================================
 
@@ -6979,7 +7821,7 @@ class EnhancedBot:
         """
         
 
-        # 创建横排2x2布局的主菜单按钮（在原有两行后新增一行“🔗 API转换”）
+        # 创建横排2x2布局的主菜单按钮（在原有两行后新增一行"🔗 API转换"）
         buttons = [
             [
                 InlineKeyboardButton("🚀 账号检测", callback_data="start_check"),
@@ -6990,20 +7832,22 @@ class EnhancedBot:
                 InlineKeyboardButton("🛡️ 防止找回", callback_data="prevent_recovery")
             ],
             [
-                InlineKeyboardButton("🔗 API转换", callback_data="api_conversion"),
-                InlineKeyboardButton("📦 账号拆分", callback_data="classify_menu")
+                InlineKeyboardButton("🔓 忘记2FA", callback_data="forget_2fa"),
+                InlineKeyboardButton("🔗 API转换", callback_data="api_conversion")
             ],
             [
-                InlineKeyboardButton("📝 文件重命名", callback_data="rename_start"),
-                InlineKeyboardButton("🧩 账户合并", callback_data="merge_start")
+                InlineKeyboardButton("📦 账号拆分", callback_data="classify_menu"),
+                InlineKeyboardButton("📝 文件重命名", callback_data="rename_start")
             ],
             [
+                InlineKeyboardButton("🧩 账户合并", callback_data="merge_start"),
                 InlineKeyboardButton("💳 开通/兑换会员", callback_data="vip_menu")
             ],
             [
                 InlineKeyboardButton("ℹ️ 帮助", callback_data="help")
             ]
         ]
+
 
         # 管理员按钮
         if self.db.is_admin(user_id):
@@ -8020,6 +8864,8 @@ class EnhancedBot:
             self.handle_change_2fa(query)
         elif data == "prevent_recovery":
             self.handle_prevent_recovery(query)
+        elif data == "forget_2fa":
+            self.handle_forget_2fa(query)
         elif data == "convert_tdata_to_session":
             self.handle_convert_tdata_to_session(query)
         elif data == "convert_session_to_tdata":
@@ -8075,6 +8921,10 @@ class EnhancedBot:
                 [
                     InlineKeyboardButton("🔐 修改2FA", callback_data="change_2fa"),
                     InlineKeyboardButton("🛡️ 防止找回", callback_data="prevent_recovery")
+                ],
+                [
+                    InlineKeyboardButton("🔓 忘记2FA", callback_data="forget_2fa"),
+                    InlineKeyboardButton("🔗 API转换", callback_data="api_conversion")
                 ]
             ]
             
@@ -8427,6 +9277,62 @@ class EnhancedBot:
         # 设置用户状态 - 等待上传文件
         self.db.save_user(user_id, query.from_user.username or "", 
                          query.from_user.first_name or "", "waiting_recovery_file")
+    
+    def handle_forget_2fa(self, query):
+        """处理忘记2FA"""
+        query.answer()
+        user_id = query.from_user.id
+        
+        # 检查权限
+        is_member, level, _ = self.db.check_membership(user_id)
+        if not is_member and not self.db.is_admin(user_id):
+            self.safe_edit_message(query, "❌ 需要会员权限才能使用忘记2FA功能")
+            return
+        
+        if not TELETHON_AVAILABLE:
+            self.safe_edit_message(query, "❌ 忘记2FA功能不可用\n\n原因: Telethon库未安装")
+            return
+        
+        # 检查代理是否可用
+        proxy_count = len(self.proxy_manager.proxies)
+        proxy_warning = ""
+        if proxy_count < 3:
+            proxy_warning = f"\n⚠️ <b>警告：代理数量不足！当前仅有 {proxy_count} 个，建议至少 10 个以上</b>\n"
+        
+        text = f"""
+🔓 <b>忘记二级验证密码</b>
+
+⚠️ <b>重要说明：</b>
+• 将启动 Telegram 官方密码重置流程
+• 需要等待 <b>7 天冷却期</b>后密码才会被移除
+• 优先使用代理连接（防风控）
+• 代理失败后自动回退本地连接
+• 账号间自动随机延迟处理（5-15秒）
+{proxy_warning}
+<b>📡 当前代理状态</b>
+• 代理模式: {'🟢启用' if self.proxy_manager.is_proxy_mode_active(self.db) else '🔴本地连接'}
+• 可用代理: {proxy_count} 个
+
+<b>📤 请上传账号文件：</b>
+• 支持 .zip 压缩包（Tdata/Session）
+• 自动识别文件格式
+
+<b>📊 结果分类：</b>
+• ✅ 已请求重置 - 成功请求密码重置（需等待7天）
+• ⚠️ 无需重置 - 账号没有设置2FA密码
+• ⏳ 冷却期中 - 已在冷却期内
+• ❌ 失败 - 连接失败/其他错误
+        """
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 返回主菜单", callback_data="back_to_main")]
+        ])
+        
+        self.safe_edit_message(query, text, 'HTML', keyboard)
+        
+        # 设置用户状态 - 等待上传文件
+        self.db.save_user(user_id, query.from_user.username or "", 
+                         query.from_user.first_name or "", "waiting_forget_2fa_file")
     
     def handle_help_callback(self, query):
         query.answer()
@@ -8945,6 +9851,7 @@ class EnhancedBot:
                 "waiting_rename_file",
                 "waiting_merge_files",
                 "waiting_recovery_file",
+                "waiting_forget_2fa_file",
             ]:
                 self.safe_send_message(update, "❌ 请先点击相应的功能按钮")
                 return
@@ -9021,6 +9928,12 @@ class EnhancedBot:
             def process_recovery():
                 asyncio.run(self.process_recovery_protection(update, context, document))
             thread = threading.Thread(target=process_recovery, daemon=True)
+            thread.start()
+        elif user_status == "waiting_forget_2fa_file":
+            # 忘记2FA处理
+            def process_forget_2fa():
+                asyncio.run(self.process_forget_2fa(update, context, document))
+            thread = threading.Thread(target=process_forget_2fa, daemon=True)
             thread.start()
         # 清空用户状态
         self.db.save_user(
@@ -10778,6 +11691,205 @@ class EnhancedBot:
             except:
                 self.safe_send_message(update, f"❌ <b>处理失败</b>\n\n错误: {str(e)}", 'HTML')
         
+        finally:
+            # 清理临时文件
+            if temp_zip and os.path.exists(os.path.dirname(temp_zip)):
+                try:
+                    shutil.rmtree(os.path.dirname(temp_zip), ignore_errors=True)
+                except:
+                    pass
+    
+    async def process_forget_2fa(self, update, context, document):
+        """忘记2FA处理 - 批量请求密码重置"""
+        user_id = update.effective_user.id
+        start_time = time.time()
+        task_id = f"{user_id}_{int(start_time)}"
+        batch_id = f"forget2fa_{task_id}"
+        
+        progress_msg = self.safe_send_message(update, "📥 <b>正在处理您的文件...</b>", 'HTML')
+        if not progress_msg:
+            return
+        
+        temp_zip = None
+        try:
+            temp_dir = tempfile.mkdtemp(prefix="temp_forget2fa_")
+            temp_zip = os.path.join(temp_dir, document.file_name)
+            document.get_file().download(temp_zip)
+            
+            # 使用FileProcessor扫描
+            files, extract_dir, file_type = self.processor.scan_zip_file(temp_zip, user_id, task_id)
+            
+            if not files:
+                try:
+                    progress_msg.edit_text(
+                        "❌ <b>未找到有效文件</b>\n\n请确保ZIP包含Session或TData格式的文件",
+                        parse_mode='HTML'
+                    )
+                except:
+                    pass
+                return
+            
+            total_files = len(files)
+            proxy_count = len(self.proxy_manager.proxies)
+            
+            try:
+                progress_msg.edit_text(
+                    f"🔓 <b>正在处理忘记2FA...</b>\n\n"
+                    f"📊 找到 {total_files} 个账号\n"
+                    f"📁 格式: {file_type.upper()}\n"
+                    f"📡 代理: {proxy_count} 个可用\n\n"
+                    f"⏳ 正在初始化...",
+                    parse_mode='HTML'
+                )
+            except:
+                pass
+            
+            # 创建Forget2FAManager实例
+            forget_manager = Forget2FAManager(self.proxy_manager, self.db)
+            
+            # 进度回调函数
+            last_update_time = [time.time()]
+            
+            async def progress_callback(processed, total, results, speed, elapsed, current_result):
+                # 限制更新频率（每3秒最多更新一次）
+                current_time = time.time()
+                if current_time - last_update_time[0] < 3 and processed < total:
+                    return
+                last_update_time[0] = current_time
+                
+                # 格式化时间
+                minutes = int(elapsed) // 60
+                seconds = int(elapsed) % 60
+                time_str = f"{minutes}分{seconds}秒" if minutes > 0 else f"{seconds}秒"
+                
+                # 统计各状态数量
+                requested = len(results.get('requested', []))
+                no_2fa = len(results.get('no_2fa', []))
+                cooling = len(results.get('cooling', []))
+                failed = len(results.get('failed', []))
+                pending = total - processed
+                
+                # 当前处理状态
+                current_name = current_result.get('account_name', '')
+                current_status = current_result.get('status', '')
+                # 隐藏代理详细信息，保护用户隐私
+                current_proxy_raw = current_result.get('proxy_used', '本地连接')
+                current_proxy = Forget2FAManager.mask_proxy_for_display(current_proxy_raw)
+                
+                # 状态映射
+                status_emoji = {
+                    'requested': '✅ 已请求重置',
+                    'no_2fa': '⚠️ 无需重置',
+                    'cooling': '⏳ 冷却期中',
+                    'failed': '❌ 失败'
+                }.get(current_status, '处理中')
+                
+                progress_text = f"""
+🔓 <b>正在处理忘记2FA...</b>
+
+<b>进度:</b> {processed}/{total} ({processed*100//total}%)
+⏱ 已用时间: {time_str}
+⚡ 处理速度: {speed:.2f}个/秒
+
+✅ 已请求重置: {requested}
+⚠️ 无需重置: {no_2fa}
+⏳ 冷却期中: {cooling}
+❌ 失败: {failed}
+📊 待处理: {pending}
+
+<b>当前:</b> {current_name[:30]}...
+<b>状态:</b> {status_emoji}
+<b>代理:</b> {current_proxy}
+                """
+                
+                try:
+                    progress_msg.edit_text(progress_text, parse_mode='HTML')
+                except:
+                    pass
+            
+            # 批量处理
+            results = await forget_manager.batch_process_with_progress(
+                files, file_type, batch_id, progress_callback
+            )
+            
+            # 处理完成
+            total_time = time.time() - start_time
+            minutes = int(total_time) // 60
+            seconds = int(total_time) % 60
+            time_str = f"{minutes}分{seconds}秒" if minutes > 0 else f"{seconds}秒"
+            
+            # 统计各状态数量
+            requested = len(results.get('requested', []))
+            no_2fa = len(results.get('no_2fa', []))
+            cooling = len(results.get('cooling', []))
+            failed = len(results.get('failed', []))
+            
+            # 完成消息
+            completion_text = f"""
+✅ <b>忘记2FA处理完成！</b>
+
+<b>📊 处理结果</b>
+• 总账号数: {total_files} 个
+• ✅ 已请求重置: {requested} 个
+• ⚠️ 无需重置: {no_2fa} 个
+• ⏳ 冷却期中: {cooling} 个
+• ❌ 失败: {failed} 个
+
+<b>⏱ 总用时:</b> {time_str}
+<b>🆔 批次ID:</b> <code>{batch_id}</code>
+
+<b>📝 说明:</b>
+• 已请求重置的账号需等待7天冷却期
+• 冷却期结束后2FA密码将被移除
+            """
+            
+            try:
+                progress_msg.edit_text(completion_text, parse_mode='HTML')
+            except:
+                pass
+            
+            # 生成结果文件
+            result_files = forget_manager.create_result_files(results, task_id, files, file_type)
+            
+            # 发送结果文件
+            for zip_path, txt_path, status_name, count in result_files:
+                try:
+                    # 发送ZIP文件
+                    if os.path.exists(zip_path):
+                        caption = f"📦 忘记2FA - {status_name} ({count}个)"
+                        with open(zip_path, 'rb') as f:
+                            context.bot.send_document(
+                                chat_id=user_id,
+                                document=f,
+                                caption=caption,
+                                filename=os.path.basename(zip_path)
+                            )
+                        os.remove(zip_path)
+                    
+                    # 发送TXT报告
+                    if os.path.exists(txt_path):
+                        with open(txt_path, 'rb') as f:
+                            context.bot.send_document(
+                                chat_id=user_id,
+                                document=f,
+                                caption=f"📝 详细报告 - {status_name}",
+                                filename=os.path.basename(txt_path)
+                            )
+                        os.remove(txt_path)
+                except Exception as e:
+                    print(f"❌ 发送结果文件失败: {e}")
+            
+        except Exception as e:
+            print(f"❌ 忘记2FA处理失败: {e}")
+            import traceback
+            traceback.print_exc()
+            try:
+                progress_msg.edit_text(
+                    f"❌ <b>处理失败</b>\n\n错误: {str(e)[:100]}",
+                    parse_mode='HTML'
+                )
+            except:
+                pass
         finally:
             # 清理临时文件
             if temp_zip and os.path.exists(os.path.dirname(temp_zip)):
