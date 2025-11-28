@@ -5520,11 +5520,11 @@ class Forget2FAManager:
     """忘记2FA管理器 - 官方密码重置流程"""
     
     # 配置常量 - 可根据需要调整
-    DEFAULT_CONCURRENT_LIMIT = 5       # 默认并发数限制
+    DEFAULT_CONCURRENT_LIMIT = 30      # 默认并发数限制（同时处理30个账号）
     DEFAULT_MAX_PROXY_RETRIES = 3      # 默认代理重试次数
     DEFAULT_PROXY_TIMEOUT = 30         # 默认代理超时时间（秒）
-    DEFAULT_MIN_DELAY = 5              # 账号间最小延迟（秒）
-    DEFAULT_MAX_DELAY = 15             # 账号间最大延迟（秒）
+    DEFAULT_MIN_DELAY = 1              # 账号间最小延迟（秒）- 高并发模式下减少延迟
+    DEFAULT_MAX_DELAY = 3              # 账号间最大延迟（秒）- 高并发模式下减少延迟
     
     def __init__(self, proxy_manager: ProxyManager, db: Database,
                  concurrent_limit: int = None,
@@ -5875,7 +5875,7 @@ class Forget2FAManager:
                                          batch_id: str,
                                          progress_callback=None) -> Dict:
         """
-        批量处理（含防风控延迟）
+        批量处理（高并发模式 - 同时处理多个账号）
         
         Args:
             files: [(文件路径, 文件名), ...]
@@ -5894,38 +5894,58 @@ class Forget2FAManager:
         }
         
         total = len(files)
-        processed = 0
+        processed = [0]  # 使用列表以便在闭包中修改
         start_time = time.time()
+        results_lock = asyncio.Lock()  # 用于线程安全地更新results
         
-        for file_path, file_name in files:
-            processed += 1
-            
+        async def process_single_with_callback(file_path: str, file_name: str):
+            """处理单个账号并更新结果"""
             # 处理单个账号
             result = await self.process_single_account(
                 file_path, file_name, file_type, batch_id
             )
             
-            # 分类结果
-            status = result.get('status', 'failed')
-            if status == 'requested':
-                results['requested'].append(result)
-            elif status == 'no_2fa':
-                results['no_2fa'].append(result)
-            elif status == 'cooling':
-                results['cooling'].append(result)
-            else:
-                results['failed'].append(result)
+            # 线程安全地更新结果
+            async with results_lock:
+                processed[0] += 1
+                
+                # 分类结果
+                status = result.get('status', 'failed')
+                if status == 'requested':
+                    results['requested'].append(result)
+                elif status == 'no_2fa':
+                    results['no_2fa'].append(result)
+                elif status == 'cooling':
+                    results['cooling'].append(result)
+                else:
+                    results['failed'].append(result)
+                
+                # 调用进度回调
+                if progress_callback:
+                    elapsed = time.time() - start_time
+                    speed = processed[0] / elapsed if elapsed > 0 else 0
+                    await progress_callback(processed[0], total, results, speed, elapsed, result)
             
-            # 调用进度回调
-            if progress_callback:
-                elapsed = time.time() - start_time
-                speed = processed / elapsed if elapsed > 0 else 0
-                await progress_callback(processed, total, results, speed, elapsed, result)
+            return result
+        
+        # 使用批量并发处理
+        batch_size = self.concurrent_limit
+        for i in range(0, len(files), batch_size):
+            batch = files[i:i + batch_size]
             
-            # 防风控随机延迟
-            if processed < total:
+            # 创建任务列表
+            tasks = [
+                process_single_with_callback(file_path, file_name)
+                for file_path, file_name in batch
+            ]
+            
+            # 并发执行当前批次
+            await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # 批次间短暂延迟（防风控）
+            if i + batch_size < len(files):
                 delay = random.uniform(self.min_delay, self.max_delay)
-                print(f"⏳ 防风控延迟 {delay:.1f} 秒...")
+                print(f"⏳ 批次间延迟 {delay:.1f} 秒...")
                 await asyncio.sleep(delay)
         
         return results
