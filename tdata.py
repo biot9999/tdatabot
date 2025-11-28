@@ -5635,6 +5635,7 @@ class Forget2FAManager:
         """
         try:
             from telethon.tl.functions.account import ResetPasswordRequest
+            from datetime import timezone
             
             result = await asyncio.wait_for(
                 client(ResetPasswordRequest()),
@@ -5647,7 +5648,20 @@ class Forget2FAManager:
             if hasattr(result, 'until_date'):
                 # ResetPasswordRequestedWait - 正在等待冷却期
                 until_date = result.until_date
-                return True, "已请求密码重置，正在等待冷却期", until_date
+                
+                # 判断是新请求还是已在冷却期
+                # 如果until_date距离现在小于6天23小时，说明是已存在的冷却期（不是刚刚请求的）
+                now = datetime.now(timezone.utc) if until_date.tzinfo else datetime.now()
+                time_remaining = until_date - now
+                
+                # 7天 = 604800秒，如果剩余时间少于6天23小时(约604000秒)，说明是已在冷却期
+                if time_remaining.total_seconds() < 604000:  # 约6天23小时
+                    days_remaining = time_remaining.days
+                    hours_remaining = time_remaining.seconds // 3600
+                    return False, f"已在冷却期中 (剩余约{days_remaining}天{hours_remaining}小时)", until_date
+                else:
+                    # 新请求，剩余时间接近7天
+                    return True, "已请求密码重置，正在等待冷却期", until_date
             elif result_type == 'ResetPasswordOk':
                 # ResetPasswordOk - 密码已被重置（极少见，通常需要等待）
                 return True, "密码已成功重置", None
@@ -6049,10 +6063,14 @@ class Forget2FAManager:
                         result['status'] = 'cooling'
                         if cooling_until:
                             result['cooling_until'] = cooling_until.strftime('%Y-%m-%d %H:%M:%S')
+                            result['error'] = f"{reset_msg}，冷却期至: {result['cooling_until']}"
+                        else:
+                            result['error'] = reset_msg
+                        print(f"⏳ [{file_name}] {reset_msg}")  # 冷却期使用⏳图标
                     else:
                         result['status'] = 'failed'
-                    result['error'] = reset_msg
-                    print(f"❌ [{file_name}] {reset_msg}")
+                        result['error'] = reset_msg
+                        print(f"❌ [{file_name}] {reset_msg}")
                 
                 result['elapsed'] = time.time() - start_time
                 self.db.insert_forget_2fa_log(
@@ -6211,10 +6229,31 @@ class Forget2FAManager:
                             shutil.copy2(json_path, os.path.join(status_temp_dir, json_name))
                     
                     elif file_type == 'tdata':
-                        # 复制整个tdata目录
-                        dest_dir = os.path.join(status_temp_dir, account_name)
+                        # TData格式正确结构: 号码/tdata/D877F783D5D3EF8C
+                        # file_path 指向的是 tdata 目录本身
+                        # account_name 是号码（如 123456789）
+                        
+                        # 创建 号码/tdata 目录结构
+                        account_dir = os.path.join(status_temp_dir, account_name)
+                        tdata_dest_dir = os.path.join(account_dir, "tdata")
+                        os.makedirs(tdata_dest_dir, exist_ok=True)
+                        
+                        # 复制tdata目录内容到 号码/tdata/
                         if os.path.isdir(file_path):
-                            shutil.copytree(file_path, dest_dir, dirs_exist_ok=True)
+                            for item_name in os.listdir(file_path):
+                                src_item = os.path.join(file_path, item_name)
+                                dst_item = os.path.join(tdata_dest_dir, item_name)
+                                if os.path.isdir(src_item):
+                                    shutil.copytree(src_item, dst_item, dirs_exist_ok=True)
+                                else:
+                                    shutil.copy2(src_item, dst_item)
+                        
+                        # 同时复制tdata同级目录下的密码文件（如2fa.txt等）
+                        parent_dir = os.path.dirname(file_path)
+                        for password_file in ['2fa.txt', 'twofa.txt', 'password.txt']:
+                            password_path = os.path.join(parent_dir, password_file)
+                            if os.path.exists(password_path):
+                                shutil.copy2(password_path, os.path.join(account_dir, password_file))
                 
                 # 创建ZIP文件
                 zip_filename = f"忘记2FA_{status_name}_{len(items)}个.zip"
