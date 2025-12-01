@@ -1252,7 +1252,7 @@ class SpamBotChecker:
             try:
                 is_authorized = await asyncio.wait_for(client.is_user_authorized(), timeout=15)
                 if not is_authorized:
-                    return "未授权", "账号未登录或已失效", account_name
+                    return "封禁", "账号未登录或已失效", account_name
             except asyncio.TimeoutError:
                 return "连接错误", f"{proxy_used} | 授权检查超时", account_name
             except Exception as e:
@@ -1261,7 +1261,7 @@ class SpamBotChecker:
                 if "deactivated" in error_msg or "banned" in error_msg or "deleted" in error_msg:
                     return "冻结", f"{proxy_used} | 账号已被冻结/删除", account_name
                 if "auth key" in error_msg or "unregistered" in error_msg:
-                    return "未授权", f"{proxy_used} | 会话密钥无效", account_name
+                    return "封禁", f"{proxy_used} | 会话密钥无效", account_name
                 return "连接错误", f"{proxy_used} | 授权检查失败: {str(e)[:30]}", account_name
             
             # 3. 获取账号基本信息验证（带超时）
@@ -1269,7 +1269,7 @@ class SpamBotChecker:
             try:
                 me = await asyncio.wait_for(client.get_me(), timeout=15)
                 if not me:
-                    return "无效", "无法获取账号信息", account_name
+                    return "封禁", "无法获取账号信息", account_name
                 user_info = f"ID:{me.id}"
                 if me.username:
                     user_info += f" @{me.username}"
@@ -1284,19 +1284,19 @@ class SpamBotChecker:
                     return "冻结", f"{proxy_used} | 账号已被冻结/删除", account_name
                 # 快速模式下用户信息获取失败不算严重错误
                 if not config.PROXY_FAST_MODE:
-                    return "无效", f"账号信息获取失败: {str(e)[:30]}", account_name
+                    return "封禁", f"账号信息获取失败: {str(e)[:30]}", account_name
             
             # 4. 发送消息给 SpamBot（带超时）
             try:
                 await asyncio.wait_for(
-                    client.send_message('@SpamBot', '/start'), 
+                    client.send_message('SpamBot', '/start'), 
                     timeout=15
                 )
                 await asyncio.sleep(2)  # 等待响应
                 
                 # 获取最新消息（带超时）
                 messages = await asyncio.wait_for(
-                    client.get_messages('@SpamBot', limit=1), 
+                    client.get_messages('SpamBot', limit=1), 
                     timeout=15
                 )
                 
@@ -1331,9 +1331,9 @@ class SpamBotChecker:
                 if "deactivated" in error_str or "banned" in error_str or "deleted" in error_str:
                     return "冻结", f"{user_info} | {proxy_used} | 账号已被冻结", account_name
                 if any(word in error_str for word in ["restricted", "limited", "blocked", "flood"]):
-                    return "受限", f"{user_info} | {proxy_used} | 账号受限制", account_name
+                    return "封禁", f"{user_info} | {proxy_used} | 账号受限制", account_name
                 if "peer" in error_str and "access" in error_str:
-                    return "受限", f"{user_info} | {proxy_used} | 无法访问SpamBot", account_name
+                    return "封禁", f"{user_info} | {proxy_used} | 无法访问SpamBot", account_name
                 last_error = str(e)
                 return "连接错误", f"{user_info} | {proxy_used} | SpamBot通信失败: {str(e)[:20]}", account_name
             
