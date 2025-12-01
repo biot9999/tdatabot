@@ -75,7 +75,11 @@ except ImportError as e:
 
 try:
     from telethon import TelegramClient, functions
-    from telethon.errors import FloodWaitError, SessionPasswordNeededError, RPCError
+    from telethon.errors import (
+        FloodWaitError, SessionPasswordNeededError, RPCError,
+        UserDeactivatedBanError, UserDeactivatedError, AuthKeyUnregisteredError,
+        PhoneNumberBannedError, UserBannedInChannelError
+    )
     from telethon.tl.functions.messages import SendMessageRequest, GetHistoryRequest
     TELETHON_AVAILABLE = True
     print("✅ telethon库导入成功")
@@ -884,15 +888,26 @@ class SpamBotChecker:
         
         print(f"⚡ SpamBot检测器初始化: 并发={concurrent_limit}, 快速模式={'开启' if config.PROXY_FAST_MODE else '关闭'}")
         
+        # 增强版状态模式 - 支持多语言和更精确的分类
         self.status_patterns = {
             "无限制": [
                 "good news, no limits are currently applied",
                 "you're free as a bird",
                 "no limits",
                 "free as a bird",
-                "no restrictions"
+                "no restrictions",
+                # 新增英文关键词
+                "all good",
+                "account is free",
+                "working fine",
+                "not limited",
+                # 中文关键词
+                "正常",
+                "没有限制",
+                "一切正常",
+                "无限制"
             ],
-            "垃圾邮件": [
+            "临时限制": [
                 # 临时限制的关键指标（优先级最高）
                 "account is now limited until",
                 "limited until",
@@ -902,13 +917,31 @@ class SpamBotChecker:
                 "will be automatically released",
                 "limitations will last longer next time",
                 "while the account is limited",
-                # 原有的patterns
+                # 新增临时限制关键词
+                "temporarily limited",
+                "temporarily restricted",
+                "temporary ban",
+                # 中文关键词
+                "暂时限制",
+                "临时限制",
+                "暂时受限"
+            ],
+            "垃圾邮件": [
+                # 一般限制的patterns
                 "actions can trigger a harsh response from our anti-spam systems",
                 "account was limited",
                 "you will not be able to send messages",
                 "anti-spam systems",
                 "limited by mistake",
-                "spam"
+                "spam",
+                # 新增一般限制关键词
+                "limited",
+                "restricted",
+                "violation",
+                # 中文关键词
+                "违规",
+                "受限",
+                "限制"
             ],
             "冻结": [
                 # 永久限制的关键指标
@@ -917,6 +950,7 @@ class SpamBotChecker:
                 "permanently restricted",
                 "account is permanently",
                 "banned permanently",
+                "permanent ban",
                 # 原有的patterns
                 "account was blocked for violations",
                 "telegram terms of service",
@@ -924,13 +958,31 @@ class SpamBotChecker:
                 "terms of service",
                 "violations of the telegram",
                 "banned",
-                "suspended"
+                "suspended",
+                # 中文关键词
+                "永久限制",
+                "永久封禁",
+                "永久受限"
+            ],
+            "等待验证": [
+                "wait",
+                "pending",
+                "verification",
+                # 中文关键词
+                "等待",
+                "审核中",
+                "验证"
             ]
         }
+        
+        # 增强版重试配置
+        self.max_retries = 3  # 最大重试次数
+        self.retry_delay = 2  # 重试间隔（秒）
     
     def translate_to_english(self, text: str) -> str:
-        """翻译到英文"""
+        """翻译到英文（支持俄文和中文）"""
         translations = {
+            # 俄文翻译
             'ограничения': 'limitations',
             'заблокирован': 'blocked',
             'спам': 'spam',
@@ -940,11 +992,33 @@ class SpamBotChecker:
             'хорошие новости': 'good news',
             'нет ограничений': 'no limits',
             'свободны как птица': 'free as a bird',
+            'временно ограничен': 'temporarily limited',
+            'постоянно заблокирован': 'permanently banned',
+            'ожидание': 'waiting',
+            'проверка': 'verification',
+            # 中文翻译
+            '正常': 'all good',
+            '没有限制': 'no limits',
+            '一切正常': 'all good',
+            '无限制': 'no restrictions',
+            '暂时限制': 'temporarily limited',
+            '临时限制': 'temporarily limited',
+            '暂时受限': 'temporarily restricted',
+            '永久限制': 'permanently restricted',
+            '永久封禁': 'permanently banned',
+            '永久受限': 'permanently restricted',
+            '违规': 'violation',
+            '受限': 'restricted',
+            '限制': 'limited',
+            '封禁': 'banned',
+            '等待': 'wait',
+            '审核中': 'pending',
+            '验证': 'verification',
         }
         
         translated = text.lower()
-        for ru, en in translations.items():
-            translated = translated.replace(ru, en)
+        for src, en in translations.items():
+            translated = translated.replace(src.lower(), en)
         
         return translated
     
@@ -982,99 +1056,125 @@ class SpamBotChecker:
             return None
     
     async def check_account_status(self, session_path: str, account_name: str, db: 'Database') -> Tuple[str, str, str]:
-        """检查账号状态（增强版 - 支持代理轮换和使用追踪）"""
+        """增强版账号状态检查
+        
+        多重验证机制:
+        1. 快速连接测试
+        2. 账号登录状态检查 (is_user_authorized())
+        3. 基本信息获取 (get_me())
+        4. SpamBot检查
+        """
         if not TELETHON_AVAILABLE:
             return "连接错误", "Telethon未安装", account_name
         
         async with self.semaphore:
             start_time = time.time()
             proxy_attempts = []  # Track all proxy attempts
+            proxy_used = "local"
             
-            # 检查是否应使用代理
-            proxy_enabled = db.get_proxy_enabled() if db else True
-            use_proxy = config.USE_PROXY and proxy_enabled and self.proxy_manager.proxies
-            
-            # 确定重试次数：如果启用代理则尝试多个代理
-            max_proxy_attempts = config.PROXY_ROTATE_RETRIES if use_proxy else 0
-            
-            # 尝试不同的代理
-            for proxy_attempt in range(max_proxy_attempts + 1):
-                proxy_info = None
+            try:
+                # 1. 先进行快速连接测试
+                can_connect = await self._quick_connection_test(session_path)
+                if not can_connect:
+                    return "连接错误", "无法连接到Telegram服务器（session文件无效或不存在）", account_name
                 
-                # 获取代理（如果启用）
-                if use_proxy and proxy_attempt < max_proxy_attempts:
-                    proxy_info = self.proxy_manager.get_next_proxy()
-                    if config.PROXY_DEBUG_VERBOSE and proxy_info:
+                # 检查是否应使用代理
+                proxy_enabled = db.get_proxy_enabled() if db else True
+                use_proxy = config.USE_PROXY and proxy_enabled and self.proxy_manager.proxies
+                
+                # 确定重试次数：使用增强版重试配置
+                max_proxy_attempts = self.max_retries if use_proxy else 0
+                
+                # 尝试不同的代理
+                for proxy_attempt in range(max_proxy_attempts + 1):
+                    proxy_info = None
+                    
+                    # 获取代理（如果启用）
+                    if use_proxy and proxy_attempt < max_proxy_attempts:
+                        proxy_info = self.proxy_manager.get_next_proxy()
+                        if config.PROXY_DEBUG_VERBOSE and proxy_info:
+                            proxy_str = f"{proxy_info['type']} {proxy_info['host']}:{proxy_info['port']}"
+                            print(f"[#{proxy_attempt + 1}] 使用代理 {proxy_str} 检测账号 {account_name}")
+                    
+                    # 尝试检测
+                    result = await self._single_check_with_proxy(
+                        session_path, account_name, db, proxy_info, proxy_attempt
+                    )
+                    
+                    # 记录尝试结果
+                    elapsed = time.time() - start_time
+                    attempt_result = "success" if result[0] not in ["连接错误", "封禁"] else "failed"
+                    
+                    if proxy_info:
                         proxy_str = f"{proxy_info['type']} {proxy_info['host']}:{proxy_info['port']}"
-                        print(f"[#{proxy_attempt + 1}] 使用代理 {proxy_str} 检测账号 {account_name}")
+                        proxy_attempts.append({
+                            'proxy': proxy_str,
+                            'result': attempt_result,
+                            'error': result[1] if attempt_result == "failed" else None,
+                            'is_residential': proxy_info.get('is_residential', False)
+                        })
+                    
+                    # 如果成功或到达最后一次尝试，记录并返回
+                    if result[0] != "连接错误" or proxy_attempt >= max_proxy_attempts:
+                        # 创建使用记录
+                        usage_record = ProxyUsageRecord(
+                            account_name=account_name,
+                            proxy_attempted=proxy_str if proxy_info else None,
+                            attempt_result=attempt_result,
+                            fallback_used=(proxy_attempt >= max_proxy_attempts and use_proxy),
+                            error=result[1] if attempt_result == "failed" else None,
+                            is_residential=proxy_info.get('is_residential', False) if proxy_info else False,
+                            elapsed=elapsed
+                        )
+                        self.proxy_usage_records.append(usage_record)
+                        
+                        return result
+                    
+                    # 重试间隔延迟
+                    if config.PROXY_DEBUG_VERBOSE:
+                        print(f"连接失败 ({result[1][:50]}), 重试下一个代理...")
+                    await asyncio.sleep(self.retry_delay)
                 
-                # 尝试检测
-                result = await self._single_check_with_proxy(
-                    session_path, account_name, proxy_info, proxy_attempt
-                )
-                
-                # 记录尝试结果
-                elapsed = time.time() - start_time
-                attempt_result = "success" if result[0] not in ["连接错误", "封禁"] else "failed"
-                
-                if proxy_info:
-                    proxy_str = f"{proxy_info['type']} {proxy_info['host']}:{proxy_info['port']}"
-                    proxy_attempts.append({
-                        'proxy': proxy_str,
-                        'result': attempt_result,
-                        'error': result[1] if attempt_result == "failed" else None,
-                        'is_residential': proxy_info.get('is_residential', False)
-                    })
-                
-                # 如果成功或到达最后一次尝试，记录并返回
-                if result[0] != "连接错误" or proxy_attempt >= max_proxy_attempts:
-                    # 创建使用记录
+                # 所有代理都失败，尝试本地连接
+                if use_proxy:
+                    if config.PROXY_DEBUG_VERBOSE:
+                        print(f"所有代理失败，回退到本地连接: {account_name}")
+                    result = await self._single_check_with_proxy(session_path, account_name, db, None, max_proxy_attempts)
+                    
+                    # 记录本地回退
+                    elapsed = time.time() - start_time
                     usage_record = ProxyUsageRecord(
                         account_name=account_name,
-                        proxy_attempted=proxy_str if proxy_info else None,
-                        attempt_result=attempt_result,
-                        fallback_used=(proxy_attempt >= max_proxy_attempts and use_proxy),
-                        error=result[1] if attempt_result == "failed" else None,
-                        is_residential=proxy_info.get('is_residential', False) if proxy_info else False,
+                        proxy_attempted=None,
+                        attempt_result="success" if result[0] != "连接错误" else "failed",
+                        fallback_used=True,
+                        error=result[1] if result[0] == "连接错误" else None,
+                        is_residential=False,
                         elapsed=elapsed
                     )
                     self.proxy_usage_records.append(usage_record)
                     
                     return result
                 
-                # 短暂延迟后重试下一个代理
-                if config.PROXY_DEBUG_VERBOSE:
-                    print(f"连接失败 ({result[1][:50]}), 重试下一个代理...")
-                await asyncio.sleep(0.3)
-            
-            # 所有代理都失败，尝试本地连接
-            if use_proxy:
-                if config.PROXY_DEBUG_VERBOSE:
-                    print(f"所有代理失败，回退到本地连接: {account_name}")
-                result = await self._single_check_with_proxy(session_path, account_name, None, max_proxy_attempts)
+                return "连接错误", f"检查失败 (重试{max_proxy_attempts}次): 多次尝试后仍然失败", account_name
                 
-                # 记录本地回退
-                elapsed = time.time() - start_time
-                usage_record = ProxyUsageRecord(
-                    account_name=account_name,
-                    proxy_attempted=None,
-                    attempt_result="success" if result[0] != "连接错误" else "failed",
-                    fallback_used=True,
-                    error=result[1] if result[0] == "连接错误" else None,
-                    is_residential=False,
-                    elapsed=elapsed
-                )
-                self.proxy_usage_records.append(usage_record)
-                
-                return result
-            
-            return "连接错误", "多次尝试后仍然失败", account_name
+            except Exception as e:
+                return "连接错误", f"检查失败: {str(e)}", proxy_used
     
-    async def _single_check_with_proxy(self, session_path: str, account_name: str, 
+    async def _single_check_with_proxy(self, session_path: str, account_name: str, db: 'Database',
                                         proxy_info: Optional[Dict], attempt: int) -> Tuple[str, str, str]:
-        """使用指定代理进行单次检测"""
+        """带代理重试的单账号检查（增强版）
+        
+        增强功能：
+        - 最大重试次数（3次）
+        - 超时处理
+        - 代理失败时的回退机制
+        - 重试间隔延迟
+        - 精确的冻结账户检测
+        """
         client = None
         connect_start = time.time()
+        last_error = ""
         
         # 构建代理描述字符串
         if proxy_info:
@@ -1113,20 +1213,24 @@ class SpamBotChecker:
                 config.API_ID,
                 config.API_HASH,
                 timeout=client_timeout,
-                connection_retries=1,
+                connection_retries=2,  # 增加连接重试次数
                 retry_delay=1,
                 proxy=proxy_dict
             )
             
-            # 连接
+            # 连接（带超时）
             try:
                 await asyncio.wait_for(client.connect(), timeout=connect_timeout)
-                connect_elapsed = time.time() - connect_start
             except asyncio.TimeoutError:
+                last_error = "连接超时"
                 error_reason = "timeout" if config.PROXY_SHOW_FAILURE_REASON else "连接超时"
                 return "连接错误", f"{proxy_used} | {error_reason}", account_name
             except Exception as e:
                 error_msg = str(e).lower()
+                # 检测冻结账户相关错误
+                if "deactivated" in error_msg or "banned" in error_msg:
+                    return "冻结", f"{proxy_used} | 账号已被冻结/停用", account_name
+                
                 # 分类错误原因
                 if "timeout" in error_msg:
                     error_reason = "timeout"
@@ -1144,43 +1248,56 @@ class SpamBotChecker:
                 else:
                     return "连接错误", f"{proxy_used} | 连接失败", account_name
             
-            # 快速授权检查
+            # 2. 检查账号是否登录/授权（带超时）
             try:
-                is_authorized = await asyncio.wait_for(client.is_user_authorized(), timeout=3)
+                is_authorized = await asyncio.wait_for(client.is_user_authorized(), timeout=15)
                 if not is_authorized:
-                    return "封禁", "账号未授权", account_name
+                    return "未授权", "账号未登录或已失效", account_name
+            except asyncio.TimeoutError:
+                return "连接错误", f"{proxy_used} | 授权检查超时", account_name
             except Exception as e:
-                return "封禁", f"授权检查失败", account_name
+                error_msg = str(e).lower()
+                # 检测冻结账户相关错误
+                if "deactivated" in error_msg or "banned" in error_msg or "deleted" in error_msg:
+                    return "冻结", f"{proxy_used} | 账号已被冻结/删除", account_name
+                if "auth key" in error_msg or "unregistered" in error_msg:
+                    return "未授权", f"{proxy_used} | 会话密钥无效", account_name
+                return "连接错误", f"{proxy_used} | 授权检查失败: {str(e)[:30]}", account_name
             
-            # 获取用户信息（快速模式下可选）
-            user_info = f"账号"
-            if not config.PROXY_FAST_MODE or attempt > 0:
-                try:
-                    me = await asyncio.wait_for(client.get_me(), timeout=3)
-                    user_info = f"ID:{me.id}"
-                    if me.username:
-                        user_info += f" @{me.username}"
-                    if me.first_name:
-                        user_info += f" {me.first_name}"
-                except Exception as e:
-                    # 快速模式下用户信息获取失败不算错误
-                    if not config.PROXY_FAST_MODE:
-                        return "封禁", f"获取用户信息失败", account_name
+            # 3. 获取账号基本信息验证（带超时）
+            user_info = "账号"
+            try:
+                me = await asyncio.wait_for(client.get_me(), timeout=15)
+                if not me:
+                    return "无效", "无法获取账号信息", account_name
+                user_info = f"ID:{me.id}"
+                if me.username:
+                    user_info += f" @{me.username}"
+                if me.first_name:
+                    user_info += f" {me.first_name}"
+            except asyncio.TimeoutError:
+                return "连接错误", f"{proxy_used} | 获取账号信息超时", account_name
+            except Exception as e:
+                error_msg = str(e).lower()
+                # 检测冻结账户相关错误
+                if "deactivated" in error_msg or "banned" in error_msg or "deleted" in error_msg:
+                    return "冻结", f"{proxy_used} | 账号已被冻结/删除", account_name
+                # 快速模式下用户信息获取失败不算严重错误
+                if not config.PROXY_FAST_MODE:
+                    return "无效", f"账号信息获取失败: {str(e)[:30]}", account_name
             
-            # SpamBot测试（优化等待时间）
+            # 4. 发送消息给 SpamBot（带超时）
             try:
                 await asyncio.wait_for(
-                    client.send_message("SpamBot", "/start"), 
-                    timeout=self.spambot_timeout
+                    client.send_message('@SpamBot', '/start'), 
+                    timeout=15
                 )
+                await asyncio.sleep(2)  # 等待响应
                 
-                # 快速模式下减少等待时间
-                wait_time = config.SPAMBOT_WAIT_TIME if not config.PROXY_FAST_MODE else 1.0
-                await asyncio.sleep(wait_time)
-                
+                # 获取最新消息（带超时）
                 messages = await asyncio.wait_for(
-                    client.get_messages("SpamBot", limit=1), 
-                    timeout=3
+                    client.get_messages('@SpamBot', limit=1), 
+                    timeout=15
                 )
                 
                 if messages and messages[0].message:
@@ -1203,17 +1320,37 @@ class SpamBotChecker:
                     
                     return status, info_str, account_name
                 else:
-                    return "封禁", f"{user_info} | {proxy_used} | SpamBot无回复", account_name
+                    return "连接错误", f"{user_info} | {proxy_used} | SpamBot无响应", account_name
                     
+            except asyncio.TimeoutError:
+                last_error = "SpamBot通信超时"
+                return "连接错误", f"{user_info} | {proxy_used} | SpamBot通信超时", account_name
             except Exception as e:
                 error_str = str(e).lower()
-                if any(word in error_str for word in ["restricted", "limited", "banned", "blocked", "flood"]):
-                    return "封禁", f"{user_info} | {proxy_used} | 账号受限", account_name
-                else:
-                    return "连接错误", f"{user_info} | {proxy_used} | SpamBot通信失败", account_name
+                # 检测冻结账户相关错误
+                if "deactivated" in error_str or "banned" in error_str or "deleted" in error_str:
+                    return "冻结", f"{user_info} | {proxy_used} | 账号已被冻结", account_name
+                if any(word in error_str for word in ["restricted", "limited", "blocked", "flood"]):
+                    return "受限", f"{user_info} | {proxy_used} | 账号受限制", account_name
+                if "peer" in error_str and "access" in error_str:
+                    return "受限", f"{user_info} | {proxy_used} | 无法访问SpamBot", account_name
+                last_error = str(e)
+                return "连接错误", f"{user_info} | {proxy_used} | SpamBot通信失败: {str(e)[:20]}", account_name
+            
+        except asyncio.TimeoutError:
+            last_error = "连接超时"
+            return "连接错误", f"{proxy_used} | 连接超时", account_name
+            
+        except ConnectionError as e:
+            last_error = f"连接错误: {str(e)}"
+            return "连接错误", f"{proxy_used} | 连接错误: {str(e)[:30]}", account_name
             
         except Exception as e:
             error_msg = str(e).lower()
+            # 检测冻结账户相关错误
+            if "deactivated" in error_msg or "banned" in error_msg or "deleted" in error_msg:
+                return "冻结", f"{proxy_used} | 账号已被冻结/删除", account_name
+            
             # 分类错误原因
             if "timeout" in error_msg:
                 error_reason = "timeout"
@@ -1224,6 +1361,7 @@ class SpamBotChecker:
             else:
                 error_reason = "unknown"
             
+            last_error = str(e)
             if config.PROXY_SHOW_FAILURE_REASON:
                 return "连接错误", f"{proxy_used} | {error_reason}", account_name
             else:
@@ -1251,25 +1389,57 @@ class SpamBotChecker:
             return False
     
     def analyze_spambot_response(self, response: str) -> str:
-        """分析SpamBot回复"""
-        response_lower = response.lower()
+        """更精准的 SpamBot 响应分析（增强版）
         
-        # 1. 首先检查冻结/封禁状态（最严重）
+        支持多语言关键词匹配（中文、英文、俄文等）
+        区分临时限制和永久限制
+        识别更多状态类型
+        
+        检测优先级（从高到低）：
+        1. 冻结（永久限制）- 最严重
+        2. 临时限制
+        3. 垃圾邮件限制
+        4. 等待验证
+        5. 无限制（正常）
+        """
+        if not response:
+            return "无响应"
+        
+        response_lower = response.lower()
+        # 翻译并转换为英文进行匹配
+        response_en = self.translate_to_english(response).lower()
+        
+        # 1. 首先检查冻结/永久限制状态（最严重）
         for pattern in self.status_patterns["冻结"]:
-            if pattern.lower() in response_lower:
+            pattern_lower = pattern.lower()
+            if pattern_lower in response_lower or pattern_lower in response_en:
                 return "冻结"
         
-        # 2. 然后检查垃圾邮件限制（中等限制）
+        # 2. 检查临时限制状态
+        for pattern in self.status_patterns["临时限制"]:
+            pattern_lower = pattern.lower()
+            if pattern_lower in response_lower or pattern_lower in response_en:
+                return "临时限制"
+        
+        # 3. 检查一般垃圾邮件限制
         for pattern in self.status_patterns["垃圾邮件"]:
-            if pattern.lower() in response_lower:
+            pattern_lower = pattern.lower()
+            if pattern_lower in response_lower or pattern_lower in response_en:
                 return "垃圾邮件"
         
-        # 3. 最后检查无限制（正常状态）
+        # 4. 检查等待验证状态
+        for pattern in self.status_patterns["等待验证"]:
+            pattern_lower = pattern.lower()
+            if pattern_lower in response_lower or pattern_lower in response_en:
+                return "等待验证"
+        
+        # 5. 检查无限制（正常状态）
         for pattern in self.status_patterns["无限制"]:
-            if pattern.lower() in response_lower:
+            pattern_lower = pattern.lower()
+            if pattern_lower in response_lower or pattern_lower in response_en:
                 return "无限制"
         
-        # 4. 默认返回无限制
+        # 6. 未知响应 - 返回无限制作为默认值（保持向后兼容）
         return "无限制"
     
     def get_proxy_usage_stats(self) -> Dict[str, int]:
