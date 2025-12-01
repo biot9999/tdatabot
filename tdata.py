@@ -2659,18 +2659,17 @@ class FileProcessor:
                 # 将状态映射到正确的分类
                 mapped_status = status_mapping.get(status, status)
                 
-                # 如果状态不在结果字典中，归类为连接错误
+                # 如果状态不在结果字典中，记录警告并归类为连接错误
                 if mapped_status not in results:
+                    print(f"⚠️ 未知状态 '{mapped_status}'，归类为连接错误: {file_name}")
                     mapped_status = "连接错误"
                 
                 results[mapped_status].append((file_path, file_name, info))
                 processed += 1
                 
-                # 如果状态被映射，显示原始状态和映射后的状态
-                if status != mapped_status:
-                    print(f"✅ 检测完成 {processed}/{total}: {file_name} -> '{status}' (归类为 '{mapped_status}')")
-                else:
-                    print(f"✅ 检测完成 {processed}/{total}: {file_name} -> {status}")
+                # 显示检测结果（如果状态被映射，显示原始状态和映射后的状态）
+                status_display = f"'{status}' (归类为 '{mapped_status}')" if status != mapped_status else status
+                print(f"✅ 检测完成 {processed}/{total}: {file_name} -> {status_display}")
                 
                 # 控制更新频率，每3秒或每10个账号更新一次
                 current_time = time.time()
