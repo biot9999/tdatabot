@@ -890,6 +890,12 @@ class SpamBotChecker:
         
         # 增强版状态模式 - 支持多语言和更精确的分类
         self.status_patterns = {
+            # 地理限制提示 - 判定为无限制（优先级最高）
+            # "some phone numbers may trigger a harsh response" 是地理限制，不是双向限制
+            "地理限制": [
+                "some phone numbers may trigger a harsh response",
+                "phone numbers may trigger",
+            ],
             "无限制": [
                 "good news, no limits are currently applied",
                 "you're free as a bird",
@@ -927,21 +933,15 @@ class SpamBotChecker:
                 "暂时受限"
             ],
             "垃圾邮件": [
-                # 一般限制的patterns
+                # 真正的限制 - "actions can trigger" 表示账号行为触发了限制
                 "actions can trigger a harsh response from our anti-spam systems",
                 "account was limited",
                 "you will not be able to send messages",
-                "anti-spam systems",
                 "limited by mistake",
-                "spam",
-                # 新增一般限制关键词
-                "limited",
-                "restricted",
-                "violation",
+                # 注意：移除了 "anti-spam systems" 因为地理限制也包含这个词
+                # 注意：移除了 "spam" 因为太宽泛
                 # 中文关键词
                 "违规",
-                "受限",
-                "限制"
             ],
             "冻结": [
                 # 永久限制的关键指标
@@ -1396,11 +1396,12 @@ class SpamBotChecker:
         识别更多状态类型
         
         检测优先级（从高到低）：
-        1. 冻结（永久限制）- 最严重
-        2. 临时限制
-        3. 垃圾邮件限制
-        4. 等待验证
-        5. 无限制（正常）
+        1. 地理限制（判定为无限制）- 最高优先级
+        2. 冻结（永久限制）- 最严重
+        3. 临时限制
+        4. 垃圾邮件限制
+        5. 等待验证
+        6. 无限制（正常）
         """
         if not response:
             return "无响应"
@@ -1409,37 +1410,44 @@ class SpamBotChecker:
         # 翻译并转换为英文进行匹配
         response_en = self.translate_to_english(response).lower()
         
-        # 1. 首先检查冻结/永久限制状态（最严重）
+        # 1. 首先检查地理限制（判定为无限制）- 最高优先级
+        # "some phone numbers may trigger a harsh response" 是地理限制提示，不是双向限制
+        for pattern in self.status_patterns["地理限制"]:
+            pattern_lower = pattern.lower()
+            if pattern_lower in response_lower or pattern_lower in response_en:
+                return "无限制"
+        
+        # 2. 检查冻结/永久限制状态（最严重）
         for pattern in self.status_patterns["冻结"]:
             pattern_lower = pattern.lower()
             if pattern_lower in response_lower or pattern_lower in response_en:
                 return "冻结"
         
-        # 2. 检查临时限制状态
+        # 3. 检查临时限制状态
         for pattern in self.status_patterns["临时限制"]:
             pattern_lower = pattern.lower()
             if pattern_lower in response_lower or pattern_lower in response_en:
                 return "临时限制"
         
-        # 3. 检查一般垃圾邮件限制
+        # 4. 检查一般垃圾邮件限制
         for pattern in self.status_patterns["垃圾邮件"]:
             pattern_lower = pattern.lower()
             if pattern_lower in response_lower or pattern_lower in response_en:
                 return "垃圾邮件"
         
-        # 4. 检查等待验证状态
+        # 5. 检查等待验证状态
         for pattern in self.status_patterns["等待验证"]:
             pattern_lower = pattern.lower()
             if pattern_lower in response_lower or pattern_lower in response_en:
                 return "等待验证"
         
-        # 5. 检查无限制（正常状态）
+        # 6. 检查无限制（正常状态）
         for pattern in self.status_patterns["无限制"]:
             pattern_lower = pattern.lower()
             if pattern_lower in response_lower or pattern_lower in response_en:
                 return "无限制"
         
-        # 6. 未知响应 - 返回无限制作为默认值（保持向后兼容）
+        # 7. 未知响应 - 返回无限制作为默认值（保持向后兼容）
         return "无限制"
     
     def get_proxy_usage_stats(self) -> Dict[str, int]:
@@ -2761,18 +2769,27 @@ class FileProcessor:
                     # 智能翻译和状态判断
                     english_text = self.translate_spambot_reply(text)
                     
-                    # 1. 首先检查临时限制（垃圾邮件）- 优先级最高
+                    # 1. 首先检查地理限制（判定为无限制）- 最高优先级
+                    # "some phone numbers may trigger a harsh response" 是地理限制提示，不是双向限制
+                    if any(keyword in english_text for keyword in [
+                        'some phone numbers may trigger a harsh response',
+                        'phone numbers may trigger'
+                    ]):
+                        return "无限制", f"手机号:{phone} | 正常无限制（地理限制提示）", tdata_name
+                    
+                    # 2. 检查临时限制（垃圾邮件）
                     if any(keyword in english_text for keyword in [
                         'account is now limited until', 'limited until', 'account is limited until',
                         'moderators have confirmed the report', 'users found your messages annoying',
                         'will be automatically released', 'limitations will last longer next time',
                         'while the account is limited', 'account was limited',
-                        'you will not be able to send messages', 'anti-spam systems', 'harsh response',
-                        'spam'
+                        'you will not be able to send messages',
+                        # 注意："actions can trigger" 表示账号行为触发了限制，是真正的限制
+                        'actions can trigger a harsh response'
                     ]):
                         return "垃圾邮件", f"手机号:{phone} | 垃圾邮件限制", tdata_name
                     
-                    # 2. 然后检查永久冻结
+                    # 3. 然后检查永久冻结
                     elif any(keyword in english_text for keyword in [
                         'permanently banned', 'account has been frozen permanently',
                         'permanently restricted', 'account is permanently', 'banned permanently',
@@ -2781,13 +2798,13 @@ class FileProcessor:
                     ]):
                         return "冻结", f"手机号:{phone} | 账号被冻结/封禁", tdata_name
                     
-                    # 3. 检查无限制状态
+                    # 4. 检查无限制状态
                     elif any(keyword in english_text for keyword in [
                         'no limits', 'free as a bird', 'no restrictions', 'good news'
                     ]):
                         return "无限制", f"手机号:{phone} | 正常无限制", tdata_name
                     
-                    # 4. 默认返回无限制
+                    # 5. 默认返回无限制
                     else:
                         return "无限制", f"手机号:{phone} | 正常无限制", tdata_name
                 
