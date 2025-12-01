@@ -579,15 +579,15 @@ class ProxyTester:
                 if progress_callback:
                     await progress_callback(statistics['tested'], statistics['total'], statistics)
         
-        # 分批处理代理
+        # 分批处理代理（使用较大批次以提高速度）
         batch_size = config.PROXY_BATCH_SIZE
         for i in range(0, len(self.proxy_manager.proxies), batch_size):
             batch = self.proxy_manager.proxies[i:i + batch_size]
             tasks = [test_single_proxy(proxy) for proxy in batch]
             await asyncio.gather(*tasks, return_exceptions=True)
             
-            # 批次间短暂休息
-            await asyncio.sleep(0.1)
+            # 批次间短暂休息（减少到0.05秒以提高速度）
+            await asyncio.sleep(0.05)
         
         total_time = time.time() - statistics['start_time']
         test_speed = statistics['total'] / total_time if total_time > 0 else 0
@@ -711,12 +711,12 @@ class Config:
         ...
         print(f"🌐 验证码网页 BASE_URL: {self.BASE_URL}")
         # 新增速度优化配置
-        self.PROXY_CHECK_CONCURRENT = int(os.getenv("PROXY_CHECK_CONCURRENT", "50"))
+        self.PROXY_CHECK_CONCURRENT = int(os.getenv("PROXY_CHECK_CONCURRENT", "100"))
         self.PROXY_CHECK_TIMEOUT = int(os.getenv("PROXY_CHECK_TIMEOUT", "3"))
         self.PROXY_AUTO_CLEANUP = os.getenv("PROXY_AUTO_CLEANUP", "true").lower() == "true"
         self.PROXY_FAST_MODE = os.getenv("PROXY_FAST_MODE", "true").lower() == "true"
         self.PROXY_RETRY_COUNT = int(os.getenv("PROXY_RETRY_COUNT", "2"))
-        self.PROXY_BATCH_SIZE = int(os.getenv("PROXY_BATCH_SIZE", "20"))
+        self.PROXY_BATCH_SIZE = int(os.getenv("PROXY_BATCH_SIZE", "100"))
         self.PROXY_USAGE_LOG_LIMIT = int(os.getenv("PROXY_USAGE_LOG_LIMIT", "500"))
         self.PROXY_ROTATE_RETRIES = int(os.getenv("PROXY_ROTATE_RETRIES", "2"))
         self.PROXY_SHOW_FAILURE_REASON = os.getenv("PROXY_SHOW_FAILURE_REASON", "true").lower() == "true"
@@ -806,12 +806,12 @@ PROXY_TIMEOUT=10
 PROXY_FILE=proxy.txt
 RESIDENTIAL_PROXY_TIMEOUT=30
 RESIDENTIAL_PROXY_PATTERNS=abcproxy,residential,resi,mobile
-PROXY_CHECK_CONCURRENT=50
+PROXY_CHECK_CONCURRENT=100
 PROXY_CHECK_TIMEOUT=3
 PROXY_AUTO_CLEANUP=true
 PROXY_FAST_MODE=true
 PROXY_RETRY_COUNT=2
-PROXY_BATCH_SIZE=20
+PROXY_BATCH_SIZE=100
 PROXY_ROTATE_RETRIES=2
 PROXY_SHOW_FAILURE_REASON=true
 PROXY_USAGE_LOG_LIMIT=500
@@ -2632,6 +2632,16 @@ class FileProcessor:
             "连接错误": []
         }
         
+        # 状态映射：将各种限制状态映射到正确的分类
+        # 临时限制是账号因垃圾邮件行为被限制，应归类为垃圾邮件（spam）
+        # 等待验证是账号需要验证，归类为封禁
+        # 无响应是网络问题，归类为连接错误
+        status_mapping = {
+            "临时限制": "垃圾邮件",
+            "等待验证": "封禁",
+            "无响应": "连接错误",
+        }
+        
         total = len(files)
         processed = 0
         start_time = time.time()
@@ -2646,10 +2656,20 @@ class FileProcessor:
                     # 使用新的真实SpamBot检测方法
                     status, info, account_name = await self.check_tdata_with_spambot(file_path, file_name)
                 
-                results[status].append((file_path, file_name, info))
+                # 将状态映射到正确的分类
+                mapped_status = status_mapping.get(status, status)
+                
+                # 如果状态不在结果字典中，记录警告并归类为连接错误
+                if mapped_status not in results:
+                    print(f"⚠️ 未知状态 '{mapped_status}'，归类为连接错误: {file_name}")
+                    mapped_status = "连接错误"
+                
+                results[mapped_status].append((file_path, file_name, info))
                 processed += 1
                 
-                print(f"✅ 检测完成 {processed}/{total}: {file_name} -> {status}")
+                # 显示检测结果（如果状态被映射，显示原始状态和映射后的状态）
+                status_display = f"'{status}' (归类为 '{mapped_status}')" if status != mapped_status else status
+                print(f"✅ 检测完成 {processed}/{total}: {file_name} -> {status_display}")
                 
                 # 控制更新频率，每3秒或每10个账号更新一次
                 current_time = time.time()
