@@ -210,11 +210,15 @@ class RecoveryAccountContext:
     failure_reason: str = ""
     stage_results: List[RecoveryStageResult] = field(default_factory=list)
     
-    # 新增字段 - 用户提供的新密码（登录成功后设置的密码）
-    # 注意：这是要设置的"新"密码，不是用于2FA登录验证的"旧"密码
-    user_provided_password: str = ""  # 用户提供的新密码（处理时使用，不持久化到报告）
+    # 用户提供的新密码（登录成功后设置的密码）
+    # 这是要设置的"新"密码，不是用于2FA登录验证的"旧"密码
+    user_provided_password: str = ""  # 新密码（处理时使用，不持久化到报告）
     
-    # 新增字段 - 检测到的旧密码（用于2FA登录验证）
+    # 用户提供的旧密码（用于2FA登录验证，当文件中没有密码时使用）
+    # 支持多个密码用|分隔
+    user_provided_old_password: str = ""  # 旧密码（仅当文件中无密码时使用）
+    
+    # 检测到的旧密码（从TData/JSON文件中提取，用于2FA登录验证）
     detected_old_passwords: List[str] = field(default_factory=list)  # 从文件中检测到的旧密码列表
     
     # 新增字段 - 设备信息
@@ -6922,11 +6926,13 @@ class RecoveryProtectionManager:
         """收集所有可用的旧密码（含类型标识）
         
         用于2FA登录验证时尝试的旧密码。
-        注意：user_provided_password 是用户想要设置的新密码，不是旧密码，不应包含在这里。
         
         按优先级收集密码：
-        1. 从TData目录提取的密码（2fa.txt等文件）
+        1. 从TData目录提取的密码（2fa.txt等文件）- 最高优先级
         2. 从JSON文件提取的密码（twoFA、2fa等字段）
+        3. 用户提供的旧密码（当文件中没有密码时使用）- 最低优先级
+        
+        注意：user_provided_password 是用户想要设置的新密码，不是旧密码，不应包含在这里。
         
         Args:
             context: 账号上下文
@@ -6938,10 +6944,7 @@ class RecoveryProtectionManager:
         """
         passwords_with_type = []
         
-        # 注意：user_provided_password 是新密码（用于登录后设置），不是旧密码（用于2FA验证）
-        # 因此不应将其添加到旧密码列表中
-        
-        # 1. 从TData目录提取旧密码
+        # 1. 从TData目录提取旧密码（最高优先级）
         if file_type == "tdata":
             tdata_passwords = self._extract_old_passwords_from_tdata(file_path)
             for pwd in tdata_passwords:
@@ -6960,6 +6963,14 @@ class RecoveryProtectionManager:
             for pwd in json_passwords:
                 if not any(p[0] == pwd for p in passwords_with_type):
                     passwords_with_type.append((pwd, "JSON文件"))
+        
+        # 3. 用户提供的旧密码（仅当文件中没有密码时使用，作为备选）
+        # 注意：user_provided_password 是新密码，user_provided_old_password 是旧密码
+        if context.user_provided_old_password:
+            user_old_passwords = self._parse_manual_passwords(context.user_provided_old_password)
+            for pwd in user_old_passwords:
+                if not any(p[0] == pwd for p in passwords_with_type):
+                    passwords_with_type.append((pwd, "用户提供旧密码"))
         
         return passwords_with_type
     
@@ -8438,16 +8449,6 @@ class RecoveryProtectionManager:
                     self.db.insert_recovery_log(stage_result)
                     return context
                 
-                # ===== 阶段2.5: 从旧会话踢出其他设备 =====
-                # 注意：必须在旧会话中踢出设备，因为新会话太新无法执行此操作
-                print(f"🔄 [{account_name}] 从旧会话踢出其他设备...")
-                devices_success, devices_detail = await self._stage_kick_devices(old_client, context)
-                if not devices_success:
-                    print(f"⚠️ [{account_name}] 踢出设备失败: {devices_detail}，继续执行后续流程...")
-                    # 不返回，继续执行后续流程（设备踢出失败不影响主流程）
-                else:
-                    print(f"✅ [{account_name}] 踢出设备成功: {devices_detail}")
-                
                 # ===== 阶段3+4: 请求并等待验证码 =====
                 code = await self._stage_request_and_wait_code(old_client, phone, context)
                 if not code:
@@ -8480,24 +8481,42 @@ class RecoveryProtectionManager:
                         context.failure_reason = "2FA密码设置失败"
                         # 继续执行后续流程
                 
-                # 设备踢出已在阶段2.5从旧会话完成，这里不再需要
-                # devices_success 变量已在阶段2.5设置
+                # ===== 阶段7: 从新会话踢出其他设备（包括旧设备）=====
+                # 在密码修改成功后执行踢出操作，此时新设备已有足够权限
+                devices_success = False
+                if new_client and pwd_success:
+                    print(f"🔄 [{account_name}] 从新会话踢出其他设备（包括旧设备）...")
+                    devices_success, devices_detail = await self._stage_kick_devices(new_client, context)
+                    if not devices_success:
+                        print(f"⚠️ [{account_name}] 踢出设备失败: {devices_detail}")
+                    else:
+                        print(f"✅ [{account_name}] 踢出设备成功: {devices_detail}")
+                        # 标记旧会话已失效
+                        context.old_session_valid = False
+                elif not new_client:
+                    print(f"⚠️ [{account_name}] new_client 不存在，跳过踢出设备")
+                    devices_success = False
+                elif not pwd_success:
+                    print(f"⚠️ [{account_name}] 密码设置失败，跳过踢出设备")
+                    devices_success = False
                 
                 # 最终状态判断
-                if not devices_success and pwd_success:
-                    context.status = "partial"
-                    context.failure_reason = "从旧会话踢出其他设备失败"
-                elif not devices_success and not pwd_success:
-                    context.status = "partial"
-                    context.failure_reason = "2FA密码设置和踢出设备均失败"
-                elif pwd_success and devices_success:
+                if pwd_success and devices_success:
                     # 所有阶段成功
                     context.status = "success"
                     context.failure_reason = ""
                 elif pwd_success and not devices_success:
-                    # 密码设置成功但设备踢出失败，仍标记为部分成功
+                    # 密码设置成功但设备踢出失败
                     context.status = "partial"
-                    context.failure_reason = "从旧会话踢出其他设备失败"
+                    context.failure_reason = "踢出其他设备失败"
+                elif not pwd_success and devices_success:
+                    # 密码设置失败但设备踢出成功（不太可能）
+                    context.status = "partial"
+                    context.failure_reason = "2FA密码设置失败"
+                else:
+                    # 都失败
+                    context.status = "partial"
+                    context.failure_reason = "2FA密码设置和踢出设备均失败"
                 
             except Exception as e:
                 context.status = "failed"
@@ -8521,13 +8540,16 @@ class RecoveryProtectionManager:
             
             return context
     
-    async def run_batch(self, files: List[Tuple[str, str]], progress_callback=None, user_password: str = "") -> Dict:
+    async def run_batch(self, files: List[Tuple[str, str]], progress_callback=None, 
+                        user_password: str = "", user_old_password: str = "") -> Dict:
         """批量运行防止找回
         
         Args:
             files: 文件列表，每个元素为 (file_path, file_type) 元组
             progress_callback: 进度回调函数
-            user_password: 用户提供的新密码，如果为空则自动生成
+            user_password: 用户提供的新密码（登录成功后设置），如果为空则自动生成
+            user_old_password: 用户提供的旧密码（用于2FA登录验证），支持多个密码用|分隔
+                              仅当文件中没有密码时使用
         """
         batch_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         contexts = []
@@ -8548,7 +8570,8 @@ class RecoveryProtectionManager:
                 old_session_path=file_path,
                 new_session_path="",
                 phone="",
-                user_provided_password=user_password  # 传入用户提供的密码
+                user_provided_password=user_password,  # 新密码（登录成功后设置）
+                user_provided_old_password=user_old_password  # 旧密码（用于2FA登录验证）
             )
             task = self.process_single_account(file_path, file_type, context)
             tasks.append(task)
