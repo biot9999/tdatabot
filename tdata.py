@@ -707,7 +707,8 @@ class Config:
     def __init__(self):
         self.TOKEN = os.getenv("TOKEN") or os.getenv("BOT_TOKEN")
         self.API_ID = int(os.getenv("API_ID", "0"))
-        self.API_HASH = os.getenv("API_HASH", "")
+        # Ensure API_HASH is always a string to prevent TypeError in Telethon
+        self.API_HASH = str(os.getenv("API_HASH", ""))
         
         admin_ids = os.getenv("ADMIN_IDS", "")
         self.ADMIN_IDS = []
@@ -1257,8 +1258,8 @@ class SpamBotChecker:
             session_base = session_path.replace('.session', '') if session_path.endswith('.session') else session_path
             client = TelegramClient(
                 session_base,
-                config.API_ID,
-                config.API_HASH,
+                int(config.API_ID),
+                str(config.API_HASH),
                 timeout=client_timeout,
                 connection_retries=2,  # 增加连接重试次数
                 retry_delay=1,
@@ -3931,8 +3932,8 @@ class TwoFactorManager:
                 session_base = session_path.replace('.session', '') if session_path.endswith('.session') else session_path
                 client = TelegramClient(
                     session_base,
-                    config.API_ID,
-                    config.API_HASH,
+                    int(config.API_ID),
+                    str(config.API_HASH),
                     timeout=30,
                     connection_retries=2,
                     retry_delay=1,
@@ -4226,8 +4227,8 @@ class TwoFactorManager:
                     status, info, name = await converter.convert_tdata_to_session(
                         file_path, 
                         file_name,
-                        config.API_ID,
-                        config.API_HASH
+                        int(config.API_ID),
+                        str(config.API_HASH)
                     )
                     
                     if status != "转换成功":
@@ -4692,7 +4693,7 @@ class APIFormatConverter:
         try:
             # Telethon expects session path without .session extension
             session_base = session_file.replace('.session', '') if session_file.endswith('.session') else session_file
-            client = TelegramClient(session_base, config.API_ID, config.API_HASH)
+            client = TelegramClient(session_base, int(config.API_ID), str(config.API_HASH))
             await client.connect()
             
             if not await client.is_user_authorized():
@@ -4895,7 +4896,7 @@ class APIFormatConverter:
             if session_path and os.path.exists(session_path):
                 # Telethon expects session path without .session extension
                 session_base = session_path.replace('.session', '') if session_path.endswith('.session') else session_path
-                client = TelegramClient(session_base, config.API_ID, config.API_HASH)
+                client = TelegramClient(session_base, int(config.API_ID), str(config.API_HASH))
             elif tdata_path and os.path.exists(tdata_path) and OPENTELE_AVAILABLE:
                 tdesk = TDesktop(tdata_path)
                 if not tdesk.isLoaded():
@@ -6099,8 +6100,8 @@ class Forget2FAManager:
                     
                     client = TelegramClient(
                         session_base,
-                        config.API_ID,
-                        config.API_HASH,
+                        int(config.API_ID),
+                        str(config.API_HASH),
                         timeout=timeout,
                         connection_retries=1,
                         retry_delay=1,
@@ -6138,8 +6139,8 @@ class Forget2FAManager:
         try:
             client = TelegramClient(
                 session_base,
-                config.API_ID,
-                config.API_HASH,
+                int(config.API_ID),
+                str(config.API_HASH),
                 timeout=15,
                 connection_retries=2,
                 retry_delay=1,
@@ -6636,6 +6637,19 @@ class RecoveryProtectionManager:
         self.db = db
         self.semaphore = asyncio.Semaphore(config.RECOVERY_CONCURRENT)
     
+    @staticmethod
+    def _fix_client_api_hash(client: TelegramClient, api_hash: str) -> None:
+        """
+        Fix Telethon's internal api_hash to ensure it's a string.
+        Some Telethon versions may incorrectly convert api_hash to int.
+        """
+        if hasattr(client, '_api_hash'):
+            if not isinstance(client._api_hash, str):
+                client._api_hash = str(api_hash)
+        if hasattr(client, 'api_hash') and not callable(getattr(client, 'api_hash', None)):
+            if not isinstance(client.api_hash, str):
+                client.api_hash = str(api_hash)
+    
     def _get_random_device_info(self) -> Tuple[str, str, str]:
         """生成随机设备信息以防风控"""
         # 使用配置的设备信息，如果未配置则随机生成
@@ -7043,13 +7057,17 @@ class RecoveryProtectionManager:
         try:
             # 尝试用旧session连接
             session_base = old_session_path.replace('.session', '') if old_session_path.endswith('.session') else old_session_path
+            api_hash_str = str(config.API_HASH)
             
             old_client = TelegramClient(
                 session_base,
-                config.API_ID,
-                config.API_HASH,
+                int(config.API_ID),
+                api_hash_str,
                 timeout=10
             )
+            
+            # WORKAROUND: Force api_hash to be a string after client creation
+            self._fix_client_api_hash(old_client, api_hash_str)
             
             try:
                 await asyncio.wait_for(old_client.connect(), timeout=10)
@@ -7186,29 +7204,84 @@ class RecoveryProtectionManager:
                 temp_session_name = f"temp_code_request_{phone_normalized.lstrip('+')}_{timestamp}"
                 temp_session_path = os.path.join(config.RECOVERY_SAFE_DIR, temp_session_name)
                 
-                # 确保API_ID和API_HASH类型正确
+                # 确保API_ID和API_HASH类型正确，添加调试信息
+                # Validate API_ID
+                if not config.API_ID:
+                    raise ValueError(f"API_ID is invalid or not set: '{config.API_ID}'")
                 api_id = int(config.API_ID)
+                
+                # Validate API_HASH - check for None, empty, and string "None"
+                if config.API_HASH is None or config.API_HASH == "" or str(config.API_HASH) == "None":
+                    raise ValueError(f"API_HASH is invalid: '{config.API_HASH}' (type: {type(config.API_HASH).__name__})")
                 api_hash = str(config.API_HASH)
                 
+                if config.DEBUG_RECOVERY:
+                    print(f"🔍 [{account_name}] API_ID类型: {type(api_id).__name__}, API_HASH类型: {type(api_hash).__name__}, API_HASH长度: {len(api_hash)}")
+                
+                # 确保所有字符串参数类型正确
+                device_model_str = str(device_model) if device_model else "Unknown Device"
+                system_version_str = str(system_version) if system_version else "Unknown Version"
+                app_version_str = str(app_version) if app_version else "1.0.0"
+                lang_code_str = str(config.RECOVERY_LANG_CODE) if config.RECOVERY_LANG_CODE else "en"
+                session_path_str = str(temp_session_path)
+                
+                if config.DEBUG_RECOVERY:
+                    session_display = session_path_str if len(session_path_str) <= 50 else session_path_str[:50] + "..."
+                    print(f"🔍 [{account_name}] 创建TelegramClient: session={session_display}, device={device_model_str}, version={system_version_str}")
+                
                 temp_client = TelegramClient(
-                    temp_session_path,
+                    session_path_str,
                     api_id,
                     api_hash,
-                    device_model=device_model,
-                    system_version=system_version,
-                    app_version=app_version,
-                    lang_code=config.RECOVERY_LANG_CODE,
-                    system_lang_code=config.RECOVERY_LANG_CODE
+                    device_model=device_model_str,
+                    system_version=system_version_str,
+                    app_version=app_version_str,
+                    lang_code=lang_code_str,
+                    system_lang_code=lang_code_str
                 )
                 
+                # WORKAROUND: Force api_hash to be a string after client creation
+                # Telethon may incorrectly convert api_hash to int in some versions
+                self._fix_client_api_hash(temp_client, api_hash)
+                if config.DEBUG_RECOVERY:
+                    # Verify the fix worked
+                    fixed_type = type(getattr(temp_client, 'api_hash', None)).__name__ if hasattr(temp_client, 'api_hash') else 'N/A'
+                    print(f"🔧 [{account_name}] api_hash类型修正后: {fixed_type}")
+                
+                if config.DEBUG_RECOVERY:
+                    print(f"🔍 [{account_name}] TelegramClient创建成功，正在连接...")
+                
                 await temp_client.connect()
+                
+                if config.DEBUG_RECOVERY:
+                    print(f"🔍 [{account_name}] 连接成功")
                 
                 # 确保phone是字符串类型
                 phone_str = str(phone_normalized)
                 
+                if config.DEBUG_RECOVERY:
+                    print(f"🔍 [{account_name}] phone_str类型: {type(phone_str).__name__}, 值: {phone_str}")
+                
                 # 发送验证码请求
                 print(f"📤 [{account_name}] 向 {phone_str} 发送验证码请求...")
-                sent_code = await temp_client.send_code_request(phone_str)
+                try:
+                    # Debug: print client's internal api_hash type before send_code_request
+                    if hasattr(temp_client, '_api_hash'):
+                        print(f"🔍 [{account_name}] temp_client._api_hash类型: {type(temp_client._api_hash).__name__}")
+                    if hasattr(temp_client, 'api_hash'):
+                        print(f"🔍 [{account_name}] temp_client.api_hash类型: {type(temp_client.api_hash).__name__}")
+                    
+                    sent_code = await temp_client.send_code_request(phone_str)
+                except TypeError as inner_e:
+                    # Get more details about the TypeError
+                    import sys
+                    exc_type, exc_value, exc_tb = sys.exc_info()
+                    print(f"🔍 [{account_name}] send_code_request TypeError详情:")
+                    print(f"   错误类型: {exc_type.__name__}")
+                    print(f"   错误消息: {exc_value}")
+                    print(f"   错误参数: {exc_value.args}")
+                    # Re-raise to be caught by outer except
+                    raise
                 print(f"✅ [{account_name}] 验证码请求已发送 (phone_code_hash: {sent_code.phone_code_hash[:10]}...)")
                 
                 # 保存sent_code信息到context以便后续使用
@@ -7244,8 +7317,8 @@ class RecoveryProtectionManager:
                 # 捕获类型错误（phone 格式问题）
                 last_error = f"TypeError: {str(e)}"
                 print(f"❌ [{account_name}] 类型错误: {e}")
-                if config.DEBUG_RECOVERY:
-                    print(f"🔍 [{account_name}] 堆栈跟踪:\n{traceback.format_exc()}")
+                # Always print stack trace for TypeError to help debug
+                print(f"🔍 [{account_name}] 堆栈跟踪:\n{traceback.format_exc()}")
                 # 清理临时客户端
                 if temp_client:
                     try:
@@ -7386,28 +7459,43 @@ class RecoveryProtectionManager:
                 device_model, system_version, app_version = self._get_random_device_info()
                 phone_code_hash = None
             
+            # 确保所有字符串参数类型正确
+            device_model_str = str(device_model) if device_model else "Unknown Device"
+            system_version_str = str(system_version) if system_version else "Unknown Version"
+            app_version_str = str(app_version) if app_version else "1.0.0"
+            lang_code_str = str(config.RECOVERY_LANG_CODE) if config.RECOVERY_LANG_CODE else "en"
+            
             # 创建/重连客户端
+            api_hash_str = str(config.API_HASH)
             new_client = TelegramClient(
-                session_path,
-                config.API_ID,
-                config.API_HASH,
-                device_model=device_model,
-                system_version=system_version,
-                app_version=app_version,
-                lang_code=config.RECOVERY_LANG_CODE,
-                system_lang_code=config.RECOVERY_LANG_CODE
+                str(session_path),
+                int(config.API_ID),
+                api_hash_str,
+                device_model=device_model_str,
+                system_version=system_version_str,
+                app_version=app_version_str,
+                lang_code=lang_code_str,
+                system_lang_code=lang_code_str
             )
+            
+            # WORKAROUND: Force api_hash to be a string after client creation
+            # Telethon may incorrectly convert api_hash to int in some versions
+            self._fix_client_api_hash(new_client, api_hash_str)
             
             # 连接
             await new_client.connect()
             
             # 使用验证码登录（包含phone_code_hash如果有的话）
             try:
+                # 确保phone和code是字符串类型
+                phone_str = str(phone)
+                code_str = str(code)
+                
                 if phone_code_hash:
                     print(f"🔐 [{account_name}] 使用phone_code_hash进行登录...")
-                    await new_client.sign_in(phone, code, phone_code_hash=phone_code_hash)
+                    await new_client.sign_in(phone_str, code_str, phone_code_hash=str(phone_code_hash))
                 else:
-                    await new_client.sign_in(phone, code)
+                    await new_client.sign_in(phone_str, code_str)
                 
                 # 登录后延迟，模拟真实用户行为（防风控）
                 await asyncio.sleep(config.RECOVERY_DELAY_AFTER_LOGIN)
@@ -7712,7 +7800,7 @@ class RecoveryProtectionManager:
                             converter = FormatConverter(self.db)
                             tdata_name = os.path.basename(file_path)
                             status, message, _ = await converter.convert_tdata_to_session(
-                                file_path, tdata_name, config.API_ID, config.API_HASH
+                                file_path, tdata_name, int(config.API_ID), str(config.API_HASH)
                             )
                             
                             if status != "转换成功":
@@ -7842,7 +7930,11 @@ class RecoveryProtectionManager:
                     
                     # 创建旧客户端
                     session_name = file_path.replace('.session', '')
-                    old_client = TelegramClient(session_name, config.API_ID, config.API_HASH)
+                    api_hash_str = str(config.API_HASH)
+                    old_client = TelegramClient(session_name, int(config.API_ID), api_hash_str)
+                    
+                    # WORKAROUND: Force api_hash to be a string after client creation
+                    self._fix_client_api_hash(old_client, api_hash_str)
                     
                     # 使用代理重试连接
                     success, proxy_info, elapsed = await self.connect_with_proxy_retry(old_client, phone)
@@ -11486,8 +11578,8 @@ class EnhancedBot:
             results = await self.converter.batch_convert_with_progress(
                 files, 
                 conversion_type,
-                config.API_ID,
-                config.API_HASH,
+                int(config.API_ID),
+                str(config.API_HASH),
                 conversion_callback
             )
             
