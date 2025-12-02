@@ -82,7 +82,7 @@ try:
         PasswordHashInvalidError, PhoneCodeInvalidError, AuthRestartError
     )
     from telethon.tl.functions.messages import SendMessageRequest, GetHistoryRequest
-    from telethon.tl.functions.account import GetPasswordRequest, ResetAuthorizationRequest
+    from telethon.tl.functions.account import GetPasswordRequest
     from telethon.tl.functions.auth import ResetAuthorizationsRequest
     TELETHON_AVAILABLE = True
     print("✅ telethon库导入成功")
@@ -6745,8 +6745,12 @@ class DeviceParamsLoader:
         api_cred = self._get_random_param('api_credentials', '')
         if api_cred and ':' in api_cred:
             api_id, api_hash = api_cred.split(':', 1)
-            config_dict['api_id'] = int(api_id)
-            config_dict['api_hash'] = api_hash
+            try:
+                config_dict['api_id'] = int(api_id)
+                config_dict['api_hash'] = api_hash
+            except ValueError:
+                # Skip invalid API credentials
+                pass
         
         # App version
         config_dict['app_version'] = self._get_random_param('app_version', '4.12.2 x64')
@@ -6833,9 +6837,18 @@ class DeviceParamsLoader:
         cpu_cores = config.get('cpu_cores', 8)
         if cpu_cores >= 16:
             # 高核心数配合更大内存
-            high_ram = [r for r in self.params.get('ram_size', []) if int(r) >= 32768]
+            high_ram = []
+            for r in self.params.get('ram_size', []):
+                try:
+                    if int(r) >= 32768:
+                        high_ram.append(r)
+                except ValueError:
+                    continue
             if high_ram:
-                config['ram_size'] = int(random.choice(high_ram))
+                try:
+                    config['ram_size'] = int(random.choice(high_ram))
+                except ValueError:
+                    pass
         
         return config
 
