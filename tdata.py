@@ -7140,7 +7140,10 @@ class RecoveryProtectionManager:
             return True, "无法验证（假设已失效）"
     
     async def _stage_request_and_wait_code(self, old_client: TelegramClient, phone: str, context: RecoveryAccountContext) -> Optional[str]:
-        """阶段3+4: 请求并等待验证码（带详细日志和重试机制）"""
+        """阶段3+4: 请求并等待验证码（带详细日志和重试机制）
+        
+        使用一个新的临时客户端来请求验证码，然后从旧客户端的777000消息中获取验证码。
+        """
         account_name = os.path.basename(context.original_path)
         
         # 规范化电话号码（解决 TypeError）
@@ -7164,23 +7167,61 @@ class RecoveryProtectionManager:
         context.phone = phone_normalized
         
         # 阶段3: 请求验证码（带重试机制）
+        # 创建一个新的临时客户端来请求验证码
         stage_start = time.time()
         code_request_success = False
         last_error = None
+        temp_client = None
+        
+        # 获取随机设备信息
+        device_model, system_version, app_version = self._get_random_device_info()
         
         for retry in range(config.RECOVERY_CODE_REQUEST_RETRIES + 1):
             try:
                 if config.DEBUG_RECOVERY:
                     print(f"🔍 [{account_name}] 尝试 {retry + 1}/{config.RECOVERY_CODE_REQUEST_RETRIES + 1}: 向 {phone_normalized} 发送验证码请求...")
                 
-                # 确保客户端已连接
-                if not old_client.is_connected():
-                    await old_client.connect()
+                # 创建临时客户端用于请求验证码
+                timestamp = int(time.time())
+                temp_session_name = f"temp_code_request_{phone_normalized.lstrip('+')}_{timestamp}"
+                temp_session_path = os.path.join(config.RECOVERY_SAFE_DIR, temp_session_name)
+                
+                temp_client = TelegramClient(
+                    temp_session_path,
+                    config.API_ID,
+                    config.API_HASH,
+                    device_model=device_model,
+                    system_version=system_version,
+                    app_version=app_version,
+                    lang_code=config.RECOVERY_LANG_CODE,
+                    system_lang_code=config.RECOVERY_LANG_CODE
+                )
+                
+                await temp_client.connect()
+                
+                # 确保phone是字符串类型
+                phone_str = str(phone_normalized)
                 
                 # 发送验证码请求
-                print(f"📤 [{account_name}] 向 {phone_normalized} 发送验证码请求...")
-                await old_client.send_code_request(phone_normalized)
-                print(f"✅ [{account_name}] 验证码请求已发送")
+                print(f"📤 [{account_name}] 向 {phone_str} 发送验证码请求...")
+                sent_code = await temp_client.send_code_request(phone_str)
+                print(f"✅ [{account_name}] 验证码请求已发送 (phone_code_hash: {sent_code.phone_code_hash[:10]}...)")
+                
+                # 保存sent_code信息到context以便后续使用
+                context.verification_code = ""  # 将在等待阶段填充
+                
+                # 断开临时客户端（不删除会话文件，后面sign_in需要用）
+                # 保存temp_client的session路径供后续使用
+                context.new_session_path = temp_session_path + ".session"
+                context.new_device_info = {
+                    'device_model': device_model,
+                    'system_version': system_version,
+                    'app_version': app_version,
+                    'phone_code_hash': sent_code.phone_code_hash
+                }
+                
+                await temp_client.disconnect()
+                temp_client = None
                 
                 code_request_success = True
                 stage_result = RecoveryStageResult(
@@ -7201,6 +7242,12 @@ class RecoveryProtectionManager:
                 print(f"❌ [{account_name}] 类型错误: {e}")
                 if config.DEBUG_RECOVERY:
                     print(f"🔍 [{account_name}] 堆栈跟踪:\n{traceback.format_exc()}")
+                # 清理临时客户端
+                if temp_client:
+                    try:
+                        await temp_client.disconnect()
+                    except Exception:
+                        pass
                 break  # 类型错误不重试
                 
             except FloodWaitError as e:
@@ -7208,6 +7255,12 @@ class RecoveryProtectionManager:
                 wait_seconds = e.seconds if hasattr(e, 'seconds') else 60
                 last_error = f"FloodWait: {wait_seconds}秒"
                 print(f"⚠️ [{account_name}] 触发 FloodWait，需等待 {wait_seconds} 秒")
+                # 清理临时客户端
+                if temp_client:
+                    try:
+                        await temp_client.disconnect()
+                    except Exception:
+                        pass
                 
                 if wait_seconds <= config.RECOVERY_STAGE_TIMEOUT and retry < config.RECOVERY_CODE_REQUEST_RETRIES:
                     print(f"⏳ [{account_name}] 等待 {wait_seconds} 秒后重试...")
@@ -7222,6 +7275,12 @@ class RecoveryProtectionManager:
                 print(f"❌ [{account_name}] 发送验证码请求失败 (尝试 {retry + 1}/{config.RECOVERY_CODE_REQUEST_RETRIES + 1}): {e}")
                 if config.DEBUG_RECOVERY:
                     print(f"🔍 [{account_name}] 堆栈跟踪:\n{traceback.format_exc()}")
+                # 清理临时客户端
+                if temp_client:
+                    try:
+                        await temp_client.disconnect()
+                    except Exception:
+                        pass
                 
                 # 如果还有重试机会，等待后重试
                 if retry < config.RECOVERY_CODE_REQUEST_RETRIES:
@@ -7294,23 +7353,38 @@ class RecoveryProtectionManager:
             return None
     
     async def _stage_sign_in_new(self, phone: str, code: str, context: RecoveryAccountContext) -> Tuple[Optional[TelegramClient], bool]:
-        """阶段5: 新设备登录（带防风控措施）"""
+        """阶段5: 新设备登录（带防风控措施）
+        
+        使用在request_code阶段创建的临时会话进行登录。
+        """
         account_name = os.path.basename(context.original_path)
         stage_start = time.time()
         new_client = None
         
         try:
-            # 生成新session文件名
-            timestamp = int(time.time())
-            new_session_name = f"safe_{phone}_{timestamp}"
-            new_session_path = os.path.join(config.RECOVERY_SAFE_DIR, f"{new_session_name}.session")
+            # 使用request_code阶段保存的会话路径和设备信息
+            if context.new_session_path and context.new_device_info:
+                # 使用已创建的session
+                session_path = context.new_session_path.replace('.session', '')
+                device_info = context.new_device_info
+                device_model = device_info.get('device_model', 'Unknown')
+                system_version = device_info.get('system_version', 'Unknown')
+                app_version = device_info.get('app_version', 'Unknown')
+                phone_code_hash = device_info.get('phone_code_hash', '')
+                
+                print(f"📱 [{account_name}] 使用已创建的临时会话进行登录...")
+            else:
+                # 回退：创建新会话（不应该发生）
+                print(f"⚠️ [{account_name}] 未找到临时会话，创建新会话...")
+                timestamp = int(time.time())
+                new_session_name = f"safe_{phone}_{timestamp}"
+                session_path = os.path.join(config.RECOVERY_SAFE_DIR, new_session_name)
+                device_model, system_version, app_version = self._get_random_device_info()
+                phone_code_hash = None
             
-            # 获取随机设备信息（防风控）
-            device_model, system_version, app_version = self._get_random_device_info()
-            
-            # 创建新客户端（使用随机设备信息）
+            # 创建/重连客户端
             new_client = TelegramClient(
-                new_session_path.replace('.session', ''),
+                session_path,
                 config.API_ID,
                 config.API_HASH,
                 device_model=device_model,
@@ -7323,9 +7397,13 @@ class RecoveryProtectionManager:
             # 连接
             await new_client.connect()
             
-            # 使用验证码登录
+            # 使用验证码登录（包含phone_code_hash如果有的话）
             try:
-                await new_client.sign_in(phone, code)
+                if phone_code_hash:
+                    print(f"🔐 [{account_name}] 使用phone_code_hash进行登录...")
+                    await new_client.sign_in(phone, code, phone_code_hash=phone_code_hash)
+                else:
+                    await new_client.sign_in(phone, code)
                 
                 # 登录后延迟，模拟真实用户行为（防风控）
                 await asyncio.sleep(config.RECOVERY_DELAY_AFTER_LOGIN)
@@ -7335,15 +7413,15 @@ class RecoveryProtectionManager:
                 if not me:
                     raise Exception("登录成功但无法获取用户信息")
                 
-                # 更新上下文
-                context.new_session_path = new_session_path
+                # 更新上下文的session路径
+                context.new_session_path = session_path + ".session"
                 
                 stage_result = RecoveryStageResult(
                     account_name=account_name,
                     phone=phone,
                     stage="sign_in",
                     success=True,
-                    detail=f"新设备登录成功: {new_session_name} (设备: {device_model})",
+                    detail=f"新设备登录成功 (设备: {device_model})",
                     elapsed=time.time() - stage_start
                 )
                 context.stage_results.append(stage_result)
@@ -7352,23 +7430,68 @@ class RecoveryProtectionManager:
                 return new_client, True
                 
             except SessionPasswordNeededError:
-                # 账号已有2FA密码
-                stage_result = RecoveryStageResult(
-                    account_name=account_name,
-                    phone=phone,
-                    stage="sign_in",
-                    success=False,
-                    error="账号已设置2FA，缺少旧密码",
-                    elapsed=time.time() - stage_start
-                )
-                context.stage_results.append(stage_result)
-                self.db.insert_recovery_log(stage_result)
+                # 账号已有2FA密码 - 需要使用密码登录
+                print(f"🔐 [{account_name}] 账号已设置2FA，尝试使用新密码登录...")
                 
-                # 清理客户端
-                if new_client:
-                    await new_client.disconnect()
-                
-                return None, False
+                # 尝试使用用户提供的密码
+                if context.user_provided_password:
+                    try:
+                        await new_client.sign_in(password=context.user_provided_password)
+                        
+                        # 验证登录成功
+                        me = await new_client.get_me()
+                        if not me:
+                            raise Exception("2FA登录成功但无法获取用户信息")
+                        
+                        # 更新上下文
+                        context.new_session_path = session_path + ".session"
+                        
+                        stage_result = RecoveryStageResult(
+                            account_name=account_name,
+                            phone=phone,
+                            stage="sign_in",
+                            success=True,
+                            detail=f"新设备登录成功(2FA) (设备: {device_model})",
+                            elapsed=time.time() - stage_start
+                        )
+                        context.stage_results.append(stage_result)
+                        self.db.insert_recovery_log(stage_result)
+                        
+                        return new_client, True
+                        
+                    except Exception as pwd_e:
+                        stage_result = RecoveryStageResult(
+                            account_name=account_name,
+                            phone=phone,
+                            stage="sign_in",
+                            success=False,
+                            error=f"2FA密码验证失败: {str(pwd_e)[:100]}",
+                            elapsed=time.time() - stage_start
+                        )
+                        context.stage_results.append(stage_result)
+                        self.db.insert_recovery_log(stage_result)
+                        
+                        if new_client:
+                            await new_client.disconnect()
+                        
+                        return None, False
+                else:
+                    stage_result = RecoveryStageResult(
+                        account_name=account_name,
+                        phone=phone,
+                        stage="sign_in",
+                        success=False,
+                        error="账号已设置2FA，但未提供密码",
+                        elapsed=time.time() - stage_start
+                    )
+                    context.stage_results.append(stage_result)
+                    self.db.insert_recovery_log(stage_result)
+                    
+                    # 清理客户端
+                    if new_client:
+                        await new_client.disconnect()
+                    
+                    return None, False
                 
         except Exception as e:
             stage_result = RecoveryStageResult(
