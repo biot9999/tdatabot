@@ -8069,35 +8069,63 @@ class RecoveryProtectionManager:
                 print(f"⚠️ 移动文件失败 {ctx.original_path}: {e}")
         
         # 创建成功账号ZIP（仅在有成功账号时创建）
+        # 文件名格式: 成功授权x个 - 20251202.zip
         success_contexts = [ctx for ctx in contexts if ctx.status == "success"]
-        success_zip_path = os.path.join(config.RECOVERY_REPORTS_DIR, f"{batch_id}_success.zip")
+        date_str = datetime.now().strftime("%Y%m%d")
+        success_count = len(success_contexts)
+        success_zip_filename = f"成功授权{success_count}个 - {date_str}.zip"
+        success_zip_path = os.path.join(config.RECOVERY_REPORTS_DIR, success_zip_filename)
         
         if success_contexts:
             with zipfile.ZipFile(success_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                # 添加 success.txt 说明文件
+                success_txt = f"防止找回处理成功\n"
+                success_txt += f"=" * 50 + "\n\n"
+                success_txt += f"处理时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                success_txt += f"成功数量: {success_count}\n\n"
+                success_txt += "账号列表:\n"
+                success_txt += "-" * 50 + "\n"
+                
                 for ctx in success_contexts:
-                    # 添加新session文件
+                    # 确定手机号
+                    phone = ctx.phone if ctx.phone and ctx.phone != "unknown" else "unknown"
+                    phone_clean = phone.lstrip('+').replace(' ', '')
+                    
+                    success_txt += f"• {phone} - 密码: {ctx.new_password_masked}\n"
+                    
+                    # 添加新session文件，使用 {phone}.session 命名
                     if ctx.new_session_path and os.path.exists(ctx.new_session_path):
-                        zf.write(ctx.new_session_path, os.path.basename(ctx.new_session_path))
+                        session_filename = f"{phone_clean}.session"
+                        zf.write(ctx.new_session_path, session_filename)
                         
-                        # 添加新session的JSON文件
+                        # 添加新session的JSON文件，使用 {phone}.json 命名
                         new_json_path = ctx.new_session_path.replace('.session', '.json')
                         if os.path.exists(new_json_path):
-                            zf.write(new_json_path, os.path.basename(new_json_path))
+                            json_filename = f"{phone_clean}.json"
+                            zf.write(new_json_path, json_filename)
+                
+                # 写入 success.txt
+                zf.writestr("success.txt", success_txt)
         else:
             # 不创建空的成功ZIP，success_zip_path将被检查是否存在
             success_zip_path = ""
         
         # 创建失败账号ZIP（仅在有失败账号时创建）
+        # 文件名格式: 授权失败xx个 - 20251202.zip
         failed_contexts = [ctx for ctx in contexts if ctx.status in ("failed", "abnormal", "timeout")]
-        failed_zip_path = os.path.join(config.RECOVERY_REPORTS_DIR, f"{batch_id}_failed.zip")
+        failed_count = len(failed_contexts)
+        failed_zip_filename = f"授权失败{failed_count}个 - {date_str}.zip"
+        failed_zip_path = os.path.join(config.RECOVERY_REPORTS_DIR, failed_zip_filename)
         
         if failed_contexts:
             with zipfile.ZipFile(failed_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
                 for ctx in failed_contexts:
-                    account_name = os.path.basename(ctx.original_path)
+                    # 确定手机号
+                    phone = ctx.phone if ctx.phone and ctx.phone != "unknown" else "unknown"
+                    phone_clean = phone.lstrip('+').replace(' ', '')
                     
-                    # 创建失败原因说明文件
-                    failure_txt = f"账号: {account_name}\n"
+                    # 创建失败原因说明文件 {phone}.txt
+                    failure_txt = f"账号: {os.path.basename(ctx.original_path)}\n"
                     failure_txt += f"手机号: {ctx.phone}\n"
                     failure_txt += f"最终状态: {ctx.status}\n"
                     failure_txt += f"失败原因: {ctx.failure_reason}\n"
@@ -8114,18 +8142,20 @@ class RecoveryProtectionManager:
                             failure_txt += f"  详情: {stage_result.detail}\n"
                         failure_txt += f"  耗时: {stage_result.elapsed:.2f}秒\n"
                     
-                    # 添加失败原因文件到ZIP
-                    failure_filename = f"{account_name.replace('.session', '')}_failure_reason.txt"
+                    # 添加失败原因文件到ZIP，使用 {phone}.txt 命名
+                    failure_filename = f"{phone_clean}.txt"
                     zf.writestr(failure_filename, failure_txt)
                     
-                    # 添加旧session文件
+                    # 添加旧session或tdata文件，使用 {phone}.session 或保持tdata格式
                     if os.path.exists(ctx.original_path):
-                        zf.write(ctx.original_path, os.path.basename(ctx.original_path))
-                        
-                        # 添加旧session的JSON文件
-                        json_path = ctx.original_path.replace('.session', '.json')
-                        if os.path.exists(json_path):
-                            zf.write(json_path, os.path.basename(json_path))
+                        original_filename = os.path.basename(ctx.original_path)
+                        if original_filename.endswith('.session'):
+                            # session文件使用 {phone}.session 命名
+                            new_filename = f"{phone_clean}.session"
+                            zf.write(ctx.original_path, new_filename)
+                        else:
+                            # tdata文件保持原格式
+                            zf.write(ctx.original_path, original_filename)
         else:
             # 不创建空的失败ZIP
             failed_zip_path = ""
