@@ -81,6 +81,7 @@ try:
         PhoneNumberBannedError, UserBannedInChannelError
     )
     from telethon.tl.functions.messages import SendMessageRequest, GetHistoryRequest
+    from telethon.tl.functions.account import GetPasswordRequest
     TELETHON_AVAILABLE = True
     print("✅ telethon库导入成功")
 except ImportError:
@@ -6860,9 +6861,7 @@ class RecoveryProtectionManager:
         stage_start = time.time()
         
         try:
-            from telethon.tl.functions.account import GetPasswordRequest
-            
-            # 获取当前密码状态
+            # 获取当前密码状态（GetPasswordRequest已在模块顶层导入）
             pwd_info = await asyncio.wait_for(client(GetPasswordRequest()), timeout=15)
             has_password = pwd_info.has_password
             
@@ -7111,8 +7110,8 @@ class RecoveryProtectionManager:
                 context.old_session_valid = False
                 try:
                     await old_client.disconnect()
-                except:
-                    pass
+                except Exception:
+                    pass  # 忽略断开连接时的异常
                 stage_result = RecoveryStageResult(
                     account_name=account_name,
                     phone=context.phone,
@@ -12210,7 +12209,7 @@ class EnhancedBot:
                     update,
                     f"⚠️ <b>密码较短（{len(password)}位）</b>\n\n"
                     f"建议使用至少8位的密码。\n"
-                    f"您输入的密码: <code>{password[:3]}***</code>\n\n"
+                    f"您输入的密码已接收。\n\n"
                     f"继续使用此密码...",
                     'HTML'
                 )
