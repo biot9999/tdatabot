@@ -7239,7 +7239,24 @@ class RecoveryProtectionManager:
                 
                 # 发送验证码请求
                 print(f"📤 [{account_name}] 向 {phone_str} 发送验证码请求...")
-                sent_code = await temp_client.send_code_request(phone_str)
+                try:
+                    # Debug: print client's internal api_hash type before send_code_request
+                    if hasattr(temp_client, '_api_hash'):
+                        print(f"🔍 [{account_name}] temp_client._api_hash类型: {type(temp_client._api_hash).__name__}")
+                    if hasattr(temp_client, 'api_hash'):
+                        print(f"🔍 [{account_name}] temp_client.api_hash类型: {type(temp_client.api_hash).__name__}")
+                    
+                    sent_code = await temp_client.send_code_request(phone_str)
+                except TypeError as inner_e:
+                    # Get more details about the TypeError
+                    import sys
+                    exc_type, exc_value, exc_tb = sys.exc_info()
+                    print(f"🔍 [{account_name}] send_code_request TypeError详情:")
+                    print(f"   错误类型: {exc_type.__name__}")
+                    print(f"   错误消息: {exc_value}")
+                    print(f"   错误参数: {exc_value.args}")
+                    # Re-raise to be caught by outer except
+                    raise
                 print(f"✅ [{account_name}] 验证码请求已发送 (phone_code_hash: {sent_code.phone_code_hash[:10]}...)")
                 
                 # 保存sent_code信息到context以便后续使用
