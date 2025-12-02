@@ -8687,8 +8687,12 @@ class RecoveryProtectionManager:
                                 context.old_session_valid = False
                             else:
                                 print(f"⚠️ [{account_name}] 踢出其他设备部分失败: {kick_detail}")
+                                # Still mark as invalid since we attempted and password was changed
+                                context.old_session_valid = False
                         except Exception as kick_err:
                             print(f"⚠️ [{account_name}] 踢出其他设备异常: {kick_err}")
+                            # Still mark as invalid since password was changed
+                            context.old_session_valid = False
                         
                     except Exception as e:
                         print(f"⚠️ [{account_name}] 验证新设备失败: {e}")
@@ -8841,12 +8845,14 @@ class RecoveryProtectionManager:
         reason_lower = failure_reason.lower() if failure_reason else ""
         
         # Also check stage results for more context
-        all_errors = [failure_reason]
+        all_errors = []
+        if failure_reason:
+            all_errors.append(failure_reason.lower())
         for sr in stage_results:
             if sr.error:
                 all_errors.append(sr.error.lower())
         
-        combined_text = " ".join(str(e).lower() for e in all_errors if e)
+        combined_text = " ".join(all_errors)
         
         # 1. 未授权封禁 (Unauthorized/Banned)
         banned_keywords = [
