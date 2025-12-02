@@ -7187,18 +7187,33 @@ class RecoveryProtectionManager:
                 temp_session_name = f"temp_code_request_{phone_normalized.lstrip('+')}_{timestamp}"
                 temp_session_path = os.path.join(config.RECOVERY_SAFE_DIR, temp_session_name)
                 
-                # 确保API_ID和API_HASH类型正确
+                # 确保API_ID和API_HASH类型正确，添加调试信息
+                # Validate API_ID
+                if not config.API_ID:
+                    raise ValueError(f"API_ID is invalid or not set: '{config.API_ID}'")
                 api_id = int(config.API_ID)
+                
+                # Validate API_HASH - check for None, empty, and string "None"
+                if config.API_HASH is None or config.API_HASH == "" or str(config.API_HASH) == "None":
+                    raise ValueError(f"API_HASH is invalid: '{config.API_HASH}' (type: {type(config.API_HASH).__name__})")
                 api_hash = str(config.API_HASH)
+                
+                if config.DEBUG_RECOVERY:
+                    print(f"🔍 [{account_name}] API_ID类型: {type(api_id).__name__}, API_HASH类型: {type(api_hash).__name__}, API_HASH长度: {len(api_hash)}")
                 
                 # 确保所有字符串参数类型正确
                 device_model_str = str(device_model) if device_model else "Unknown Device"
                 system_version_str = str(system_version) if system_version else "Unknown Version"
                 app_version_str = str(app_version) if app_version else "1.0.0"
                 lang_code_str = str(config.RECOVERY_LANG_CODE) if config.RECOVERY_LANG_CODE else "en"
+                session_path_str = str(temp_session_path)
+                
+                if config.DEBUG_RECOVERY:
+                    session_display = session_path_str if len(session_path_str) <= 50 else session_path_str[:50] + "..."
+                    print(f"🔍 [{account_name}] 创建TelegramClient: session={session_display}, device={device_model_str}, version={system_version_str}")
                 
                 temp_client = TelegramClient(
-                    str(temp_session_path),
+                    session_path_str,
                     api_id,
                     api_hash,
                     device_model=device_model_str,
@@ -7208,10 +7223,19 @@ class RecoveryProtectionManager:
                     system_lang_code=lang_code_str
                 )
                 
+                if config.DEBUG_RECOVERY:
+                    print(f"🔍 [{account_name}] TelegramClient创建成功，正在连接...")
+                
                 await temp_client.connect()
+                
+                if config.DEBUG_RECOVERY:
+                    print(f"🔍 [{account_name}] 连接成功")
                 
                 # 确保phone是字符串类型
                 phone_str = str(phone_normalized)
+                
+                if config.DEBUG_RECOVERY:
+                    print(f"🔍 [{account_name}] phone_str类型: {type(phone_str).__name__}, 值: {phone_str}")
                 
                 # 发送验证码请求
                 print(f"📤 [{account_name}] 向 {phone_str} 发送验证码请求...")
@@ -7251,8 +7275,8 @@ class RecoveryProtectionManager:
                 # 捕获类型错误（phone 格式问题）
                 last_error = f"TypeError: {str(e)}"
                 print(f"❌ [{account_name}] 类型错误: {e}")
-                if config.DEBUG_RECOVERY:
-                    print(f"🔍 [{account_name}] 堆栈跟踪:\n{traceback.format_exc()}")
+                # Always print stack trace for TypeError to help debug
+                print(f"🔍 [{account_name}] 堆栈跟踪:\n{traceback.format_exc()}")
                 # 清理临时客户端
                 if temp_client:
                     try:
