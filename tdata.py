@@ -14955,7 +14955,9 @@ def create_sample_proxy_file():
 
 def setup_session_directory():
     """确保sessions目录和sessions/sessions_bak目录存在，并移动任何残留的session文件和JSON文件"""
-    sessions_dir = os.path.join(os.getcwd(), "sessions")
+    # 获取脚本目录（与Config类使用相同的方式）
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    sessions_dir = os.path.join(script_dir, "sessions")
     sessions_bak_dir = os.path.join(sessions_dir, "sessions_bak")
     
     # 创建sessions目录（用户上传的session文件）和sessions/sessions_bak目录（临时处理文件）
@@ -14969,12 +14971,11 @@ def setup_session_directory():
     
     # 移动根目录中的session文件和JSON文件到sessions目录
     moved_count = 0
-    current_dir = os.getcwd()
     
     # 系统必需文件，不移动
     system_files = ['tdata.session', 'tdata.session-journal']
     
-    for filename in os.listdir(current_dir):
+    for filename in os.listdir(script_dir):
         # 检查是否是session文件或journal文件或对应的JSON文件
         should_move = False
         
@@ -14991,7 +14992,7 @@ def setup_session_directory():
                     should_move = True
         
         if should_move:
-            file_path = os.path.join(current_dir, filename)
+            file_path = os.path.join(script_dir, filename)
             if os.path.isfile(file_path):
                 new_path = os.path.join(sessions_dir, filename)
                 try:
