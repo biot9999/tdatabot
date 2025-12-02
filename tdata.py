@@ -6637,6 +6637,19 @@ class RecoveryProtectionManager:
         self.db = db
         self.semaphore = asyncio.Semaphore(config.RECOVERY_CONCURRENT)
     
+    @staticmethod
+    def _fix_client_api_hash(client: TelegramClient, api_hash: str) -> None:
+        """
+        Fix Telethon's internal api_hash to ensure it's a string.
+        Some Telethon versions may incorrectly convert api_hash to int.
+        """
+        if hasattr(client, '_api_hash'):
+            if not isinstance(client._api_hash, str):
+                client._api_hash = str(api_hash)
+        if hasattr(client, 'api_hash') and not callable(getattr(client, 'api_hash', None)):
+            if not isinstance(client.api_hash, str):
+                client.api_hash = str(api_hash)
+    
     def _get_random_device_info(self) -> Tuple[str, str, str]:
         """生成随机设备信息以防风控"""
         # 使用配置的设备信息，如果未配置则随机生成
@@ -7044,13 +7057,17 @@ class RecoveryProtectionManager:
         try:
             # 尝试用旧session连接
             session_base = old_session_path.replace('.session', '') if old_session_path.endswith('.session') else old_session_path
+            api_hash_str = str(config.API_HASH)
             
             old_client = TelegramClient(
                 session_base,
                 int(config.API_ID),
-                str(config.API_HASH),
+                api_hash_str,
                 timeout=10
             )
+            
+            # WORKAROUND: Force api_hash to be a string after client creation
+            self._fix_client_api_hash(old_client, api_hash_str)
             
             try:
                 await asyncio.wait_for(old_client.connect(), timeout=10)
@@ -7222,6 +7239,14 @@ class RecoveryProtectionManager:
                     lang_code=lang_code_str,
                     system_lang_code=lang_code_str
                 )
+                
+                # WORKAROUND: Force api_hash to be a string after client creation
+                # Telethon may incorrectly convert api_hash to int in some versions
+                self._fix_client_api_hash(temp_client, api_hash)
+                if config.DEBUG_RECOVERY:
+                    # Verify the fix worked
+                    fixed_type = type(getattr(temp_client, 'api_hash', None)).__name__ if hasattr(temp_client, 'api_hash') else 'N/A'
+                    print(f"🔧 [{account_name}] api_hash类型修正后: {fixed_type}")
                 
                 if config.DEBUG_RECOVERY:
                     print(f"🔍 [{account_name}] TelegramClient创建成功，正在连接...")
@@ -7441,16 +7466,21 @@ class RecoveryProtectionManager:
             lang_code_str = str(config.RECOVERY_LANG_CODE) if config.RECOVERY_LANG_CODE else "en"
             
             # 创建/重连客户端
+            api_hash_str = str(config.API_HASH)
             new_client = TelegramClient(
                 str(session_path),
                 int(config.API_ID),
-                str(config.API_HASH),
+                api_hash_str,
                 device_model=device_model_str,
                 system_version=system_version_str,
                 app_version=app_version_str,
                 lang_code=lang_code_str,
                 system_lang_code=lang_code_str
             )
+            
+            # WORKAROUND: Force api_hash to be a string after client creation
+            # Telethon may incorrectly convert api_hash to int in some versions
+            self._fix_client_api_hash(new_client, api_hash_str)
             
             # 连接
             await new_client.connect()
@@ -7900,7 +7930,11 @@ class RecoveryProtectionManager:
                     
                     # 创建旧客户端
                     session_name = file_path.replace('.session', '')
-                    old_client = TelegramClient(session_name, int(config.API_ID), str(config.API_HASH))
+                    api_hash_str = str(config.API_HASH)
+                    old_client = TelegramClient(session_name, int(config.API_ID), api_hash_str)
+                    
+                    # WORKAROUND: Force api_hash to be a string after client creation
+                    self._fix_client_api_hash(old_client, api_hash_str)
                     
                     # 使用代理重试连接
                     success, proxy_info, elapsed = await self.connect_with_proxy_retry(old_client, phone)
