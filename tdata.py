@@ -10600,7 +10600,7 @@ class EnhancedBot:
                     f"📊 文件类型: {file_type.upper()}\n"
                     f"{proxy_status}\n"
                     f"⚡ 并发线程: {config.MAX_CONCURRENT_CHECKS}个\n\n"
-                    f"请稍等，状态|数量分离按钮将实时显示检测进度...",
+                    f"请稍等，实时显示检测进度...",
                     parse_mode='HTML'
                 )
             except:
@@ -10703,8 +10703,6 @@ class EnhancedBot:
 ⚡ <b>性能统计</b>
 • 检测时间: {int(total_time)}秒 ({total_time/60:.1f}分钟)
 • 平均速度: {final_speed:.1f} 账号/秒
-• 优化模式: {'🟢快速模式' if config.PROXY_FAST_MODE else '🔴标准模式'}
-• 并发数: {config.PROXY_CHECK_CONCURRENT if config.PROXY_FAST_MODE else config.MAX_CONCURRENT_CHECKS}
 
 🚀 正在自动发送分类文件，请稍等...
             """
