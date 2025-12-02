@@ -7191,15 +7191,21 @@ class RecoveryProtectionManager:
                 api_id = int(config.API_ID)
                 api_hash = str(config.API_HASH)
                 
+                # 确保所有字符串参数类型正确
+                device_model_str = str(device_model) if device_model else "Unknown Device"
+                system_version_str = str(system_version) if system_version else "Unknown Version"
+                app_version_str = str(app_version) if app_version else "1.0.0"
+                lang_code_str = str(config.RECOVERY_LANG_CODE) if config.RECOVERY_LANG_CODE else "en"
+                
                 temp_client = TelegramClient(
-                    temp_session_path,
+                    str(temp_session_path),
                     api_id,
                     api_hash,
-                    device_model=device_model,
-                    system_version=system_version,
-                    app_version=app_version,
-                    lang_code=config.RECOVERY_LANG_CODE,
-                    system_lang_code=config.RECOVERY_LANG_CODE
+                    device_model=device_model_str,
+                    system_version=system_version_str,
+                    app_version=app_version_str,
+                    lang_code=lang_code_str,
+                    system_lang_code=lang_code_str
                 )
                 
                 await temp_client.connect()
@@ -7387,16 +7393,22 @@ class RecoveryProtectionManager:
                 device_model, system_version, app_version = self._get_random_device_info()
                 phone_code_hash = None
             
+            # 确保所有字符串参数类型正确
+            device_model_str = str(device_model) if device_model else "Unknown Device"
+            system_version_str = str(system_version) if system_version else "Unknown Version"
+            app_version_str = str(app_version) if app_version else "1.0.0"
+            lang_code_str = str(config.RECOVERY_LANG_CODE) if config.RECOVERY_LANG_CODE else "en"
+            
             # 创建/重连客户端
             new_client = TelegramClient(
-                session_path,
+                str(session_path),
                 int(config.API_ID),
                 str(config.API_HASH),
-                device_model=device_model,
-                system_version=system_version,
-                app_version=app_version,
-                lang_code=config.RECOVERY_LANG_CODE,
-                system_lang_code=config.RECOVERY_LANG_CODE
+                device_model=device_model_str,
+                system_version=system_version_str,
+                app_version=app_version_str,
+                lang_code=lang_code_str,
+                system_lang_code=lang_code_str
             )
             
             # 连接
@@ -7404,11 +7416,15 @@ class RecoveryProtectionManager:
             
             # 使用验证码登录（包含phone_code_hash如果有的话）
             try:
+                # 确保phone和code是字符串类型
+                phone_str = str(phone)
+                code_str = str(code)
+                
                 if phone_code_hash:
                     print(f"🔐 [{account_name}] 使用phone_code_hash进行登录...")
-                    await new_client.sign_in(phone, code, phone_code_hash=phone_code_hash)
+                    await new_client.sign_in(phone_str, code_str, phone_code_hash=str(phone_code_hash))
                 else:
-                    await new_client.sign_in(phone, code)
+                    await new_client.sign_in(phone_str, code_str)
                 
                 # 登录后延迟，模拟真实用户行为（防风控）
                 await asyncio.sleep(config.RECOVERY_DELAY_AFTER_LOGIN)
