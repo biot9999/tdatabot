@@ -565,11 +565,13 @@ class ProxyTester:
                     working_proxies.append(proxy_info)
                     statistics['working'] += 1
                     response_times.append(response_time)
-                    print(f"✅ {proxy_info['host']}:{proxy_info['port']} - {message}")
+                    # 隐藏代理详细信息
+                    print(f"✅ 代理测试通过 - {message}")
                 else:
                     failed_proxies.append(proxy_info)
                     statistics['failed'] += 1
-                    print(f"❌ {proxy_info['host']}:{proxy_info['port']} - {message}")
+                    # 隐藏代理详细信息
+                    print(f"❌ 代理测试失败 - {message}")
                 
                 # 更新统计
                 if response_times:
@@ -1103,8 +1105,8 @@ class SpamBotChecker:
                     if use_proxy and proxy_attempt < max_proxy_attempts:
                         proxy_info = self.proxy_manager.get_next_proxy()
                         if config.PROXY_DEBUG_VERBOSE and proxy_info:
-                            proxy_str = f"{proxy_info['type']} {proxy_info['host']}:{proxy_info['port']}"
-                            print(f"[#{proxy_attempt + 1}] 使用代理 {proxy_str} 检测账号 {account_name}")
+                            # 服务器日志中也隐藏代理详细信息
+                            print(f"[#{proxy_attempt + 1}] 使用代理 检测账号 {account_name}")
                     
                     # 尝试检测
                     result = await self._single_check_with_proxy(
@@ -1116,7 +1118,8 @@ class SpamBotChecker:
                     attempt_result = "success" if result[0] not in ["连接错误", "封禁"] else "failed"
                     
                     if proxy_info:
-                        proxy_str = f"{proxy_info['type']} {proxy_info['host']}:{proxy_info['port']}"
+                        # 内部记录使用隐藏的代理标识
+                        proxy_str = "使用代理"
                         proxy_attempts.append({
                             'proxy': proxy_str,
                             'result': attempt_result,
@@ -1186,10 +1189,10 @@ class SpamBotChecker:
         connect_start = time.time()
         last_error = ""
         
-        # 构建代理描述字符串
+        # 构建代理描述字符串 - 隐藏代理详细信息，保护用户隐私
         if proxy_info:
-            proxy_type_display = "住宅代理" if proxy_info.get('is_residential', False) else proxy_info['type'].upper()
-            proxy_used = f"{proxy_type_display} {proxy_info['host']}:{proxy_info['port']}"
+            proxy_type_display = "住宅代理" if proxy_info.get('is_residential', False) else "代理"
+            proxy_used = f"使用{proxy_type_display}"
         else:
             proxy_used = "本地连接"
         
@@ -3659,9 +3662,11 @@ class FormatConverter:
                         # 创建详细的失败原因说明
                         error_file = os.path.join(status_temp_dir, f"{file_name}_错误原因.txt")
                         with open(error_file, 'w', encoding='utf-8') as f:
+                            # 隐藏代理详细信息，保护用户隐私
+                            masked_info = Forget2FAManager.mask_proxy_in_string(info)
                             f.write(f"文件: {file_name}\n")
                             f.write(f"转换类型: {conversion_type}\n")
-                            f.write(f"失败原因: {info}\n")
+                            f.write(f"失败原因: {masked_info}\n")
                             f.write(f"失败时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
                             f.write(f"\n建议:\n")
                             if "授权" in info:
@@ -3706,8 +3711,10 @@ class FormatConverter:
                     f.write("-" * 50 + "\n\n")
                     
                     for idx, (file_path, file_name, info) in enumerate(files, 1):
+                        # 隐藏代理详细信息，保护用户隐私
+                        masked_info = Forget2FAManager.mask_proxy_in_string(info)
                         f.write(f"{idx}. 文件: {file_name}\n")
-                        f.write(f"   信息: {info}\n")
+                        f.write(f"   信息: {masked_info}\n")
                         f.write(f"   时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
                 
                 print(f"✅ 创建TXT报告: {txt_filename}")
@@ -3882,7 +3889,8 @@ class TwoFactorManager:
                     if proxy_info:
                         proxy_dict = self.create_proxy_dict(proxy_info)
                         if proxy_dict:
-                            proxy_used = f"代理 {proxy_info['host']}:{proxy_info['port']}"
+                            # 隐藏代理详细信息，保护用户隐私
+                            proxy_used = "使用代理"
                 
                 # 创建客户端
                 # Telethon expects session path without .session extension
@@ -4383,8 +4391,10 @@ class TwoFactorManager:
                     f.write("-" * 50 + "\n\n")
                     
                     for idx, (file_path, file_name, info) in enumerate(items, 1):
+                        # 隐藏代理详细信息，保护用户隐私
+                        masked_info = Forget2FAManager.mask_proxy_in_string(info)
                         f.write(f"{idx}. 账号: {file_name}\n")
-                        f.write(f"   详细信息: {info}\n")
+                        f.write(f"   详细信息: {masked_info}\n")
                         f.write(f"   处理时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
                     
                     # 如果是失败列表，添加解决方案
@@ -5802,7 +5812,14 @@ class Forget2FAManager:
             return None
     
     def format_proxy_string(self, proxy_info: Optional[Dict]) -> str:
-        """格式化代理字符串用于显示"""
+        """格式化代理字符串用于显示 - 隐藏详细信息，保护用户隐私"""
+        if not proxy_info:
+            return "本地连接"
+        # 不再暴露具体的代理地址和端口，只显示使用了代理
+        return "使用代理"
+    
+    def format_proxy_string_internal(self, proxy_info: Optional[Dict]) -> str:
+        """格式化代理字符串用于内部日志（仅服务器日志，不暴露给用户）"""
         if not proxy_info:
             return "本地连接"
         proxy_type = proxy_info.get('type', 'http')
@@ -5822,6 +5839,42 @@ class Forget2FAManager:
             return "本地连接"
         # 只显示使用了代理，不暴露具体IP/端口
         return "✅ 使用代理"
+    
+    @staticmethod
+    def mask_proxy_in_string(text: str) -> str:
+        """
+        从任意字符串中移除代理详细信息，保护用户代理隐私
+        用于报告和日志输出
+        """
+        import re
+        if not text:
+            return text
+        
+        # 匹配各种代理格式的正则表达式
+        patterns = [
+            # 代理 host:port 格式
+            r'代理\s+[a-zA-Z0-9\-_.]+\.[a-zA-Z0-9\-_.]+:\d+',
+            # //host:port 格式
+            r'//[a-zA-Z0-9\-_.]+\.[a-zA-Z0-9\-_.]+:\d+',
+            # http://host:port 格式
+            r'https?://[a-zA-Z0-9\-_.]+\.[a-zA-Z0-9\-_.]+:\d+',
+            # socks5://host:port 格式
+            r'socks[45]?://[a-zA-Z0-9\-_.]+\.[a-zA-Z0-9\-_.]+:\d+',
+            # 住宅代理 host:port 格式
+            r'住宅代理\s+[a-zA-Z0-9\-_.]+\.[a-zA-Z0-9\-_.]+:\d+',
+            # HTTP host:port 格式
+            r'HTTP\s+[a-zA-Z0-9\-_.]+\.[a-zA-Z0-9\-_.]+:\d+',
+            # SOCKS host:port 格式
+            r'SOCKS[45]?\s+[a-zA-Z0-9\-_.]+\.[a-zA-Z0-9\-_.]+:\d+',
+            # 一般的 host:port 格式（IP或域名后面跟端口）
+            r'\b[a-zA-Z0-9\-_.]+\.(vip|com|net|org|io|xyz|cn):\d+\b',
+        ]
+        
+        result = text
+        for pattern in patterns:
+            result = re.sub(pattern, '使用代理', result, flags=re.IGNORECASE)
+        
+        return result
     
     async def check_2fa_status(self, client) -> Tuple[bool, str, Optional[Dict]]:
         """
@@ -5990,16 +6043,20 @@ class Forget2FAManager:
                 if not proxy_info:
                     break
                 
-                proxy_str = self.format_proxy_string(proxy_info)
-                if proxy_str in tried_proxies:
+                # 使用内部格式用于去重，但不暴露给用户
+                proxy_str_internal = self.format_proxy_string_internal(proxy_info)
+                if proxy_str_internal in tried_proxies:
                     continue
-                tried_proxies.append(proxy_str)
+                tried_proxies.append(proxy_str_internal)
+                
+                # 用于显示的代理字符串（隐藏详细信息）
+                proxy_str = "使用代理"
                 
                 proxy_dict = self.create_proxy_dict(proxy_info)
                 if not proxy_dict:
                     continue
                 
-                print(f"🌐 [{account_name}] 尝试代理连接 #{attempt + 1}: {proxy_str}")
+                print(f"🌐 [{account_name}] 尝试代理连接 #{attempt + 1}")
                 
                 client = None
                 try:
@@ -6024,18 +6081,18 @@ class Forget2FAManager:
                         await client.disconnect()
                         return None, proxy_str, False
                     
-                    print(f"✅ [{account_name}] 代理连接成功: {proxy_str}")
+                    print(f"✅ [{account_name}] 代理连接成功")
                     return client, proxy_str, True
                     
                 except asyncio.TimeoutError:
-                    print(f"⏱️ [{account_name}] 代理连接超时: {proxy_str}")
+                    print(f"⏱️ [{account_name}] 代理连接超时")
                     if client:
                         try:
                             await client.disconnect()
                         except:
                             pass
                 except Exception as e:
-                    print(f"❌ [{account_name}] 代理连接失败: {proxy_str} - {str(e)[:50]}")
+                    print(f"❌ [{account_name}] 代理连接失败 - {str(e)[:50]}")
                     if client:
                         try:
                             await client.disconnect()
@@ -6093,16 +6150,20 @@ class Forget2FAManager:
                 if not proxy_info:
                     break
                 
-                proxy_str = self.format_proxy_string(proxy_info)
-                if proxy_str in tried_proxies:
+                # 使用内部格式用于去重，但不暴露给用户
+                proxy_str_internal = self.format_proxy_string_internal(proxy_info)
+                if proxy_str_internal in tried_proxies:
                     continue
-                tried_proxies.append(proxy_str)
+                tried_proxies.append(proxy_str_internal)
+                
+                # 用于显示的代理字符串（隐藏详细信息）
+                proxy_str = "使用代理"
                 
                 proxy_dict = self.create_proxy_dict(proxy_info)
                 if not proxy_dict:
                     continue
                 
-                print(f"🌐 [{account_name}] TData代理连接 #{attempt + 1}: {proxy_str}")
+                print(f"🌐 [{account_name}] TData代理连接 #{attempt + 1}")
                 
                 client = None
                 try:
@@ -6138,18 +6199,18 @@ class Forget2FAManager:
                         self._cleanup_temp_session(session_name)
                         return None, proxy_str, False
                     
-                    print(f"✅ [{account_name}] TData代理连接成功: {proxy_str}")
+                    print(f"✅ [{account_name}] TData代理连接成功")
                     return client, proxy_str, True
                     
                 except asyncio.TimeoutError:
-                    print(f"⏱️ [{account_name}] TData代理连接超时: {proxy_str}")
+                    print(f"⏱️ [{account_name}] TData代理连接超时")
                     if client:
                         try:
                             await client.disconnect()
                         except:
                             pass
                 except Exception as e:
-                    print(f"❌ [{account_name}] TData代理连接失败: {proxy_str} - {str(e)[:50]}")
+                    print(f"❌ [{account_name}] TData代理连接失败 - {str(e)[:50]}")
                     if client:
                         try:
                             await client.disconnect()
@@ -6673,11 +6734,12 @@ class RecoveryProtectionManager:
             if not proxy:
                 break
             
-            proxy_str = f"{proxy['type']} {proxy['host']}:{proxy['port']}"
-            if proxy_str in tried_proxies:
+            # 内部使用的代理标识（用于去重）
+            proxy_str_internal = f"{proxy['type']} {proxy['host']}:{proxy['port']}"
+            if proxy_str_internal in tried_proxies:
                 continue
             
-            tried_proxies.append(proxy_str)
+            tried_proxies.append(proxy_str_internal)
             
             try:
                 # 重新创建客户端使用代理
@@ -6688,7 +6750,7 @@ class RecoveryProtectionManager:
                 await client.connect()
                 
                 elapsed = time.time() - start_time
-                return True, f"{proxy_str}(ok {elapsed:.2f}s)", elapsed
+                return True, f"使用代理(ok {elapsed:.2f}s)", elapsed
                 
             except Exception as e:
                 error_msg = str(e).lower()
@@ -6701,7 +6763,7 @@ class RecoveryProtectionManager:
                 else:
                     reason = "connection refused"
                 
-                print(f"⚠️ 代理 {proxy_str} 失败: {reason}")
+                print(f"⚠️ 代理连接失败: {reason}")
                 
                 if attempt == config.RECOVERY_PROXY_RETRIES:
                     # 最后一次尝试本地连接
@@ -8481,15 +8543,20 @@ class EnhancedBot:
         """显示代理详细状态"""
         if self.proxy_manager.proxies:
             status_text = "<b>📡 代理详细状态</b>\n\n"
-            for i, proxy in enumerate(self.proxy_manager.proxies[:10], 1):  # 只显示前10个
-                status_text += f"{i}. {proxy['host']}:{proxy['port']} ({proxy['type']})\n"
+            # 隐藏代理详细地址，只显示数量和类型
+            proxy_count = len(self.proxy_manager.proxies)
+            proxy_types = {}
+            for proxy in self.proxy_manager.proxies:
+                ptype = proxy.get('type', 'http')
+                proxy_types[ptype] = proxy_types.get(ptype, 0) + 1
             
-            if len(self.proxy_manager.proxies) > 10:
-                status_text += f"\n... 还有 {len(self.proxy_manager.proxies) - 10} 个代理"
+            status_text += f"📊 已加载 {proxy_count} 个代理\n\n"
+            for ptype, count in proxy_types.items():
+                status_text += f"• {ptype.upper()}: {count}个\n"
             
             # 添加代理设置信息
             enabled, updated_time, updated_by = self.db.get_proxy_setting_info()
-            status_text += f"\n\n<b>📊 代理开关状态</b>\n"
+            status_text += f"\n<b>📊 代理开关状态</b>\n"
             status_text += f"• 当前状态: {'🟢启用' if enabled else '🔴禁用'}\n"
             status_text += f"• 更新时间: {updated_time}\n"
             if updated_by:
@@ -8898,7 +8965,8 @@ class EnhancedBot:
         # 简单测试：尝试获取一个代理
         proxy = self.proxy_manager.get_next_proxy()
         if proxy:
-            query.answer(f"🧪 测试代理: {proxy['host']}:{proxy['port']} ({proxy['type']})", show_alert=True)
+            # 隐藏代理详细地址
+            query.answer(f"🧪 测试代理: {proxy['type'].upper()}代理", show_alert=True)
         else:
             query.answer("❌ 获取测试代理失败", show_alert=True)
     
