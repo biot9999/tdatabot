@@ -6758,12 +6758,16 @@ class RecoveryProtectionManager:
         passwords = []
         
         # 各种2FA密码文件名模式（不区分大小写匹配）
+        # 注意：包含 'Passwrod' 这个常见拼写错误变体
         password_file_patterns = [
             '2fa.txt', '2FA.TXT', '2FA.txt', '2Fa.txt',
             'password2fa.txt', 'Password2FA.txt', 'Password2FA.TXT', 'PASSWORD2FA.txt',
-            'passwrod2fa.txt', 'Passwrod2FA.txt',  # 包含常见拼写错误
+            'passwrod2fa.txt', 'Passwrod2FA.txt',  # 包含常见拼写错误 (Passwrod)
             'twofa.txt', 'twoFA.txt', 'TwoFA.txt', 'Twofa.txt', 'TWOfa.txt', 'TWOFA.txt'
         ]
+        
+        # 最大密码文件大小限制（防止内存耗尽）
+        MAX_PASSWORD_FILE_SIZE = 10 * 1024  # 10KB
         
         try:
             if not os.path.exists(tdata_path):
@@ -6771,12 +6775,22 @@ class RecoveryProtectionManager:
             
             # 获取目录中的所有文件
             files_in_dir = []
+            search_dirs = []
+            
             if os.path.isdir(tdata_path):
                 files_in_dir = os.listdir(tdata_path)
-                # 也检查父目录
-                parent_dir = os.path.dirname(tdata_path)
-                if parent_dir and os.path.exists(parent_dir):
-                    files_in_dir.extend(os.listdir(parent_dir))
+                search_dirs.append(tdata_path)
+                
+                # 也检查父目录（但验证是否在安全范围内）
+                parent_dir = os.path.dirname(os.path.abspath(tdata_path))
+                # 确保父目录不是根目录或系统目录
+                if parent_dir and os.path.exists(parent_dir) and len(parent_dir) > 3:
+                    try:
+                        parent_files = os.listdir(parent_dir)
+                        files_in_dir.extend(parent_files)
+                        search_dirs.append(parent_dir)
+                    except PermissionError:
+                        pass  # 忽略权限错误
             
             # 创建文件名到实际路径的映射（不区分大小写）
             file_map = {}
@@ -6784,28 +6798,40 @@ class RecoveryProtectionManager:
                 file_map[f.lower()] = f
             
             # 查找匹配的密码文件
+            passwords_from_file = 0
             for pattern in password_file_patterns:
                 pattern_lower = pattern.lower()
                 if pattern_lower in file_map:
                     actual_filename = file_map[pattern_lower]
-                    # 尝试在tdata目录中查找
-                    file_path = os.path.join(tdata_path, actual_filename)
-                    if not os.path.exists(file_path):
-                        # 尝试在父目录中查找
-                        parent_dir = os.path.dirname(tdata_path)
-                        file_path = os.path.join(parent_dir, actual_filename)
                     
-                    if os.path.exists(file_path) and os.path.isfile(file_path):
+                    # 在所有搜索目录中查找
+                    file_path = None
+                    for search_dir in search_dirs:
+                        potential_path = os.path.join(search_dir, actual_filename)
+                        if os.path.exists(potential_path) and os.path.isfile(potential_path):
+                            file_path = potential_path
+                            break
+                    
+                    if file_path:
                         try:
+                            # 检查文件大小
+                            file_size = os.path.getsize(file_path)
+                            if file_size > MAX_PASSWORD_FILE_SIZE:
+                                print(f"⚠️ 密码文件 {actual_filename} 过大 ({file_size} bytes)，跳过")
+                                continue
+                            
                             with open(file_path, 'r', encoding='utf-8') as f:
                                 content = f.read().strip()
                                 if content:
                                     # 支持多个密码由|分隔
+                                    passwords_from_file = 0
                                     for pwd in content.split('|'):
                                         pwd = pwd.strip()
                                         if pwd and pwd not in passwords:
                                             passwords.append(pwd)
-                                    print(f"🔑 从TData文件 {actual_filename} 提取到 {len(passwords)} 个密码")
+                                            passwords_from_file += 1
+                                    if passwords_from_file > 0:
+                                        print(f"🔑 从TData文件 {actual_filename} 提取到 {passwords_from_file} 个密码")
                         except Exception as e:
                             print(f"⚠️ 读取密码文件 {actual_filename} 失败: {e}")
         except Exception as e:
@@ -6834,8 +6860,17 @@ class RecoveryProtectionManager:
             'two_fa', 'two_FA', 'TWO_FA'
         ]
         
+        # 最大JSON文件大小限制（防止内存耗尽）
+        MAX_JSON_FILE_SIZE = 1 * 1024 * 1024  # 1MB
+        
         try:
             if not os.path.exists(json_path):
+                return passwords
+            
+            # 检查文件大小
+            file_size = os.path.getsize(json_path)
+            if file_size > MAX_JSON_FILE_SIZE:
+                print(f"⚠️ JSON文件过大 ({file_size} bytes)，跳过密码提取")
                 return passwords
             
             with open(json_path, 'r', encoding='utf-8') as f:
@@ -6946,7 +6981,7 @@ class RecoveryProtectionManager:
         
         if total_passwords == 0:
             print(f"❌ [{account_name}] 没有可用的密码进行2FA验证")
-            return False, "没有可用的密码", ""
+            return False, "没有可用的密码", "无密码"
         
         print(f"🔐 [{account_name}] 开始2FA密码验证... (共 {total_passwords} 个密码)")
         
@@ -7007,7 +7042,7 @@ class RecoveryProtectionManager:
                 continue
         
         print(f"❌ [{account_name}] 密码验证失败: 已尝试 {total_passwords} 个密码，均不正确")
-        return False, f"所有 {total_passwords} 个密码均验证失败", ""
+        return False, f"所有 {total_passwords} 个密码均验证失败", "全部失败"
     
     async def wait_for_code(self, old_client: TelegramClient, phone: str, timeout: int = 300) -> Optional[str]:
         """等待777000验证码（带进度日志）"""
