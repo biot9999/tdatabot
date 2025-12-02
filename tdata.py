@@ -78,7 +78,8 @@ try:
     from telethon.errors import (
         FloodWaitError, SessionPasswordNeededError, RPCError,
         UserDeactivatedBanError, UserDeactivatedError, AuthKeyUnregisteredError,
-        PhoneNumberBannedError, UserBannedInChannelError
+        PhoneNumberBannedError, UserBannedInChannelError,
+        PasswordHashInvalidError, PhoneCodeInvalidError, AuthRestartError
     )
     from telethon.tl.functions.messages import SendMessageRequest, GetHistoryRequest
     from telethon.tl.functions.account import GetPasswordRequest
@@ -88,6 +89,28 @@ except ImportError:
     print("❌ telethon未安装")
     print("💡 请安装: pip install telethon")
     TELETHON_AVAILABLE = False
+
+# Define fallback exception classes for when imports fail
+try:
+    PasswordHashInvalidError
+except NameError:
+    class PasswordHashInvalidError(Exception):
+        """Fallback class when telethon error not available"""
+        pass
+
+try:
+    PhoneCodeInvalidError
+except NameError:
+    class PhoneCodeInvalidError(Exception):
+        """Fallback class when telethon error not available"""
+        pass
+
+try:
+    AuthRestartError
+except NameError:
+    class AuthRestartError(Exception):
+        """Fallback class when telethon error not available"""
+        pass
 
 try:
     import socks
@@ -187,8 +210,11 @@ class RecoveryAccountContext:
     failure_reason: str = ""
     stage_results: List[RecoveryStageResult] = field(default_factory=list)
     
-    # 新增字段 - 用户提供的密码
-    user_provided_password: str = ""  # 用户提供的新密码（处理时使用，不持久化到报告）
+    # 新增字段 - 用户提供的密码（支持多个密码用|分隔）
+    user_provided_password: str = ""  # 用户提供的密码（处理时使用，不持久化到报告）
+    
+    # 新增字段 - 检测到的旧密码
+    detected_old_passwords: List[str] = field(default_factory=list)  # 从文件中检测到的旧密码列表
     
     # 新增字段 - 设备信息
     old_device_info: Dict[str, Any] = field(default_factory=dict)  # 旧设备信息
@@ -6716,6 +6742,273 @@ class RecoveryProtectionManager:
             return "***"
         return f"{password[:3]}***{password[-3:]}"
     
+    def _extract_old_passwords_from_tdata(self, tdata_path: str) -> List[str]:
+        """从TData目录中提取旧密码
+        
+        查找各种2FA密码文件命名变体：
+        2fa.TXT, 2FA.TXT, Passwrod2FA.txt, Password2FA.txt, password2fa.txt,
+        twoFA.txt, TWOfa.txt, TwoFA.txt, Twofa.txt, 2fa.txt, etc.
+        
+        Args:
+            tdata_path: TData目录路径
+            
+        Returns:
+            找到的密码列表
+        """
+        passwords = []
+        
+        # 各种2FA密码文件名模式（不区分大小写匹配）
+        password_file_patterns = [
+            '2fa.txt', '2FA.TXT', '2FA.txt', '2Fa.txt',
+            'password2fa.txt', 'Password2FA.txt', 'Password2FA.TXT', 'PASSWORD2FA.txt',
+            'passwrod2fa.txt', 'Passwrod2FA.txt',  # 包含常见拼写错误
+            'twofa.txt', 'twoFA.txt', 'TwoFA.txt', 'Twofa.txt', 'TWOfa.txt', 'TWOFA.txt'
+        ]
+        
+        try:
+            if not os.path.exists(tdata_path):
+                return passwords
+            
+            # 获取目录中的所有文件
+            files_in_dir = []
+            if os.path.isdir(tdata_path):
+                files_in_dir = os.listdir(tdata_path)
+                # 也检查父目录
+                parent_dir = os.path.dirname(tdata_path)
+                if parent_dir and os.path.exists(parent_dir):
+                    files_in_dir.extend(os.listdir(parent_dir))
+            
+            # 创建文件名到实际路径的映射（不区分大小写）
+            file_map = {}
+            for f in files_in_dir:
+                file_map[f.lower()] = f
+            
+            # 查找匹配的密码文件
+            for pattern in password_file_patterns:
+                pattern_lower = pattern.lower()
+                if pattern_lower in file_map:
+                    actual_filename = file_map[pattern_lower]
+                    # 尝试在tdata目录中查找
+                    file_path = os.path.join(tdata_path, actual_filename)
+                    if not os.path.exists(file_path):
+                        # 尝试在父目录中查找
+                        parent_dir = os.path.dirname(tdata_path)
+                        file_path = os.path.join(parent_dir, actual_filename)
+                    
+                    if os.path.exists(file_path) and os.path.isfile(file_path):
+                        try:
+                            with open(file_path, 'r', encoding='utf-8') as f:
+                                content = f.read().strip()
+                                if content:
+                                    # 支持多个密码由|分隔
+                                    for pwd in content.split('|'):
+                                        pwd = pwd.strip()
+                                        if pwd and pwd not in passwords:
+                                            passwords.append(pwd)
+                                    print(f"🔑 从TData文件 {actual_filename} 提取到 {len(passwords)} 个密码")
+                        except Exception as e:
+                            print(f"⚠️ 读取密码文件 {actual_filename} 失败: {e}")
+        except Exception as e:
+            print(f"⚠️ 扫描TData密码文件失败: {e}")
+        
+        return passwords
+    
+    def _extract_old_passwords_from_json(self, json_path: str) -> List[str]:
+        """从JSON文件中提取旧密码
+        
+        查找JSON中的密码字段：twoFA, twofa, 2fa, password2fa, password2FA
+        
+        Args:
+            json_path: JSON文件路径
+            
+        Returns:
+            找到的密码列表
+        """
+        passwords = []
+        
+        # JSON中可能的密码字段名
+        password_keys = [
+            'twoFA', 'twofa', '2fa', '2FA',
+            'password2fa', 'password2FA', 'Password2FA', 'PASSWORD2FA',
+            'old_password', 'oldPassword', 'old_pwd',
+            'two_fa', 'two_FA', 'TWO_FA'
+        ]
+        
+        try:
+            if not os.path.exists(json_path):
+                return passwords
+            
+            with open(json_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            # 遍历所有可能的密码字段
+            for key in password_keys:
+                if key in data:
+                    value = data[key]
+                    if isinstance(value, str) and value.strip():
+                        # 支持多个密码由|分隔
+                        for pwd in value.split('|'):
+                            pwd = pwd.strip()
+                            if pwd and pwd not in passwords:
+                                passwords.append(pwd)
+            
+            if passwords:
+                print(f"🔑 从JSON文件提取到 {len(passwords)} 个旧密码")
+                
+        except json.JSONDecodeError:
+            pass  # 忽略JSON解析错误
+        except Exception as e:
+            print(f"⚠️ 读取JSON密码字段失败: {e}")
+        
+        return passwords
+    
+    def _parse_manual_passwords(self, password_input: str) -> List[str]:
+        """解析手动输入的密码（支持|分隔多个密码）
+        
+        Args:
+            password_input: 用户输入的密码字符串，多个密码用|分隔
+            
+        Returns:
+            密码列表
+        """
+        passwords = []
+        if not password_input:
+            return passwords
+        
+        for pwd in password_input.split('|'):
+            pwd = pwd.strip()
+            if pwd and pwd not in passwords:
+                passwords.append(pwd)
+        
+        return passwords
+    
+    def _collect_all_passwords(self, context: RecoveryAccountContext, file_type: str, file_path: str) -> List[Tuple[str, str]]:
+        """收集所有可用的密码（含类型标识）
+        
+        按优先级收集密码：
+        1. 用户手动提供的密码（可能包含多个）
+        2. 从TData目录提取的密码
+        3. 从JSON文件提取的密码
+        
+        Args:
+            context: 账号上下文
+            file_type: 文件类型 (tdata/session)
+            file_path: 文件路径
+            
+        Returns:
+            密码列表，每项为 (密码, 类型描述) 元组
+        """
+        passwords_with_type = []
+        
+        # 1. 用户手动提供的密码（最高优先级）
+        if context.user_provided_password:
+            manual_passwords = self._parse_manual_passwords(context.user_provided_password)
+            for pwd in manual_passwords:
+                passwords_with_type.append((pwd, "用户提供"))
+        
+        # 2. 从TData目录提取密码
+        if file_type == "tdata":
+            tdata_passwords = self._extract_old_passwords_from_tdata(file_path)
+            for pwd in tdata_passwords:
+                if not any(p[0] == pwd for p in passwords_with_type):
+                    passwords_with_type.append((pwd, "TData文件"))
+        
+        # 3. 从JSON文件提取密码
+        json_path = None
+        if file_type == "session":
+            json_path = file_path.replace('.session', '.json')
+        elif context.old_session_path:
+            json_path = context.old_session_path.replace('.session', '.json')
+        
+        if json_path:
+            json_passwords = self._extract_old_passwords_from_json(json_path)
+            for pwd in json_passwords:
+                if not any(p[0] == pwd for p in passwords_with_type):
+                    passwords_with_type.append((pwd, "JSON文件"))
+        
+        return passwords_with_type
+    
+    async def _verify_2fa_password(self, client: TelegramClient, passwords: List[Tuple[str, str]], 
+                                   context: RecoveryAccountContext, timeout: int = 30) -> Tuple[bool, str, str]:
+        """尝试多个密码进行2FA验证
+        
+        Args:
+            client: Telegram客户端
+            passwords: 密码列表，每项为 (密码, 类型描述) 元组
+            context: 账号上下文
+            timeout: 每个密码尝试的超时时间（秒）
+        
+        Returns:
+            (成功标志, 使用的密码/错误信息, 密码类型)
+        """
+        account_name = os.path.basename(context.original_path)
+        total_passwords = len(passwords)
+        
+        if total_passwords == 0:
+            print(f"❌ [{account_name}] 没有可用的密码进行2FA验证")
+            return False, "没有可用的密码", ""
+        
+        print(f"🔐 [{account_name}] 开始2FA密码验证... (共 {total_passwords} 个密码)")
+        
+        for attempt, (password, password_type) in enumerate(passwords, 1):
+            password_masked = self.mask_password(password)
+            print(f"🔑 [{account_name}] 尝试密码 #{attempt}/{total_passwords} (类型: {password_type}, 密码: {password_masked})")
+            
+            attempt_start = time.time()
+            try:
+                # 使用超时控制
+                await asyncio.wait_for(
+                    client.sign_in(password=password),
+                    timeout=timeout
+                )
+                
+                elapsed = time.time() - attempt_start
+                print(f"✅ [{account_name}] 2FA验证成功 (使用密码类型: {password_type}, 耗时: {elapsed:.1f}秒)")
+                return True, password, password_type
+                
+            except asyncio.TimeoutError:
+                elapsed = time.time() - attempt_start
+                print(f"⏰ [{account_name}] 密码验证超时 (已耗时: {elapsed:.1f}秒, 限制: {timeout}秒)")
+                continue
+                
+            except PasswordHashInvalidError:
+                elapsed = time.time() - attempt_start
+                print(f"❌ [{account_name}] 密码错误 (类型: {password_type}, 耗时: {elapsed:.1f}秒)")
+                if attempt < total_passwords:
+                    print(f"🔄 [{account_name}] 尝试下一个密码...")
+                continue
+                
+            except FloodWaitError as e:
+                elapsed = time.time() - attempt_start
+                wait_time = getattr(e, 'seconds', 60)
+                print(f"🚫 [{account_name}] 操作过于频繁，需等待 {wait_time} 秒 (耗时: {elapsed:.1f}秒)")
+                # 对于FloodWait，不再尝试其他密码
+                return False, f"FloodWait: 需等待 {wait_time} 秒", password_type
+                
+            except SessionPasswordNeededError:
+                # 这不应该发生，因为我们已经在处理2FA
+                print(f"⚠️ [{account_name}] 意外的SessionPasswordNeededError")
+                continue
+                
+            except AuthRestartError:
+                print(f"🔄 [{account_name}] 需要重新开始认证流程 (AuthRestartError)")
+                return False, "需要重新开始认证流程", password_type
+                
+            except RPCError as e:
+                elapsed = time.time() - attempt_start
+                error_msg = str(e)
+                print(f"❌ [{account_name}] RPC错误: {error_msg[:50]} (耗时: {elapsed:.1f}秒)")
+                continue
+                
+            except Exception as e:
+                elapsed = time.time() - attempt_start
+                error_msg = str(e)
+                print(f"❌ [{account_name}] 验证异常: {error_msg[:50]} (耗时: {elapsed:.1f}秒)")
+                continue
+        
+        print(f"❌ [{account_name}] 密码验证失败: 已尝试 {total_passwords} 个密码，均不正确")
+        return False, f"所有 {total_passwords} 个密码均验证失败", ""
+    
     async def wait_for_code(self, old_client: TelegramClient, phone: str, timeout: int = 300) -> Optional[str]:
         """等待777000验证码（带进度日志）"""
         start_time = time.time()
@@ -7429,16 +7722,31 @@ class RecoveryProtectionManager:
             self.db.insert_recovery_log(stage_result)
             return None
     
-    async def _stage_sign_in_new(self, phone: str, code: str, context: RecoveryAccountContext) -> Tuple[Optional[TelegramClient], bool]:
-        """阶段5: 新设备登录（带防风控措施）
+    async def _stage_sign_in_new(self, phone: str, code: str, context: RecoveryAccountContext, 
+                                   file_type: str = "session", file_path: str = "") -> Tuple[Optional[TelegramClient], bool]:
+        """阶段5: 新设备登录（带防风控措施和增强错误处理）
         
         使用在request_code阶段创建的临时会话进行登录。
+        
+        增强功能：
+        1. 详细的2FA验证日志
+        2. 密码验证失败时的重试逻辑（支持多密码源）
+        3. 明确的错误类型判断
+        4. 超时控制和耗时统计
+        5. 登录成功后的会话验证
         """
         account_name = os.path.basename(context.original_path)
         stage_start = time.time()
         new_client = None
         
+        # 用于记录各子步骤耗时
+        step_timings = {}
+        
         try:
+            # ===== 步骤1: 准备会话信息 =====
+            step_start = time.time()
+            print(f"📋 [{account_name}] 开始新设备登录流程...")
+            
             # 使用request_code阶段保存的会话路径和设备信息
             if context.new_session_path and context.new_device_info:
                 # 使用已创建的session
@@ -7458,6 +7766,11 @@ class RecoveryProtectionManager:
                 session_path = os.path.join(config.RECOVERY_SAFE_DIR, new_session_name)
                 device_model, system_version, app_version = self._get_random_device_info()
                 phone_code_hash = None
+            
+            step_timings['prepare'] = time.time() - step_start
+            
+            # ===== 步骤2: 创建并连接客户端 =====
+            step_start = time.time()
             
             # 确保所有字符串参数类型正确
             device_model_str = str(device_model) if device_model else "Unknown Device"
@@ -7482,8 +7795,20 @@ class RecoveryProtectionManager:
             # Telethon may incorrectly convert api_hash to int in some versions
             self._fix_client_api_hash(new_client, api_hash_str)
             
-            # 连接
-            await new_client.connect()
+            # 连接（带超时控制）
+            print(f"🔌 [{account_name}] 正在连接Telegram服务器...")
+            try:
+                await asyncio.wait_for(new_client.connect(), timeout=30)
+                print(f"✅ [{account_name}] 服务器连接成功")
+            except asyncio.TimeoutError:
+                elapsed = time.time() - step_start
+                print(f"⏰ [{account_name}] 服务器连接超时 (已耗时: {elapsed:.1f}秒)")
+                raise Exception("服务器连接超时")
+            
+            step_timings['connect'] = time.time() - step_start
+            
+            # ===== 步骤3: 使用验证码登录 =====
+            step_start = time.time()
             
             # 使用验证码登录（包含phone_code_hash如果有的话）
             try:
@@ -7491,108 +7816,206 @@ class RecoveryProtectionManager:
                 phone_str = str(phone)
                 code_str = str(code)
                 
+                print(f"🔑 [{account_name}] 正在使用验证码登录...")
                 if phone_code_hash:
                     print(f"🔐 [{account_name}] 使用phone_code_hash进行登录...")
-                    await new_client.sign_in(phone_str, code_str, phone_code_hash=str(phone_code_hash))
+                    await asyncio.wait_for(
+                        new_client.sign_in(phone_str, code_str, phone_code_hash=str(phone_code_hash)),
+                        timeout=30
+                    )
                 else:
-                    await new_client.sign_in(phone_str, code_str)
+                    await asyncio.wait_for(
+                        new_client.sign_in(phone_str, code_str),
+                        timeout=30
+                    )
+                
+                step_timings['code_login'] = time.time() - step_start
                 
                 # 登录后延迟，模拟真实用户行为（防风控）
                 await asyncio.sleep(config.RECOVERY_DELAY_AFTER_LOGIN)
                 
-                # 验证登录成功
-                me = await new_client.get_me()
-                if not me:
-                    raise Exception("登录成功但无法获取用户信息")
+                # ===== 步骤4: 验证登录成功 =====
+                step_start = time.time()
+                try:
+                    me = await asyncio.wait_for(new_client.get_me(), timeout=15)
+                    if not me:
+                        raise Exception("登录成功但无法获取用户信息")
+                    
+                    print(f"✅ [{account_name}] 新会话登录成功 (UserID: {me.id}, Phone: {me.phone or phone})")
+                    step_timings['verify'] = time.time() - step_start
+                    
+                except asyncio.TimeoutError:
+                    print(f"⏰ [{account_name}] 会话验证超时")
+                    raise Exception("会话验证超时")
+                except Exception as e:
+                    print(f"❌ [{account_name}] 会话验证失败: {str(e)}")
+                    raise Exception(f"会话验证失败: {str(e)}")
                 
                 # 更新上下文的session路径
                 context.new_session_path = session_path + ".session"
+                
+                # 计算总耗时
+                total_elapsed = time.time() - stage_start
+                timing_detail = ", ".join([f"{k}: {v:.1f}s" for k, v in step_timings.items()])
                 
                 stage_result = RecoveryStageResult(
                     account_name=account_name,
                     phone=phone,
                     stage="sign_in",
                     success=True,
-                    detail=f"新设备登录成功 (设备: {device_model})",
-                    elapsed=time.time() - stage_start
+                    detail=f"新设备登录成功 (设备: {device_model}, 总耗时: {total_elapsed:.1f}s, {timing_detail})",
+                    elapsed=total_elapsed
                 )
                 context.stage_results.append(stage_result)
                 self.db.insert_recovery_log(stage_result)
                 
                 return new_client, True
                 
-            except SessionPasswordNeededError:
-                # 账号已有2FA密码 - 需要使用密码登录
-                print(f"🔐 [{account_name}] 账号已设置2FA，尝试使用新密码登录...")
+            except asyncio.TimeoutError:
+                elapsed = time.time() - step_start
+                print(f"⏰ [{account_name}] 验证码登录超时 (已耗时: {elapsed:.1f}秒)")
+                raise Exception("验证码登录超时")
                 
-                # 尝试使用用户提供的密码
-                if context.user_provided_password:
-                    try:
-                        await new_client.sign_in(password=context.user_provided_password)
-                        
-                        # 验证登录成功
-                        me = await new_client.get_me()
-                        if not me:
-                            raise Exception("2FA登录成功但无法获取用户信息")
-                        
-                        # 更新上下文
-                        context.new_session_path = session_path + ".session"
-                        
-                        stage_result = RecoveryStageResult(
-                            account_name=account_name,
-                            phone=phone,
-                            stage="sign_in",
-                            success=True,
-                            detail=f"新设备登录成功(2FA) (设备: {device_model})",
-                            elapsed=time.time() - stage_start
-                        )
-                        context.stage_results.append(stage_result)
-                        self.db.insert_recovery_log(stage_result)
-                        
-                        return new_client, True
-                        
-                    except Exception as pwd_e:
-                        stage_result = RecoveryStageResult(
-                            account_name=account_name,
-                            phone=phone,
-                            stage="sign_in",
-                            success=False,
-                            error=f"2FA密码验证失败: {str(pwd_e)[:100]}",
-                            elapsed=time.time() - stage_start
-                        )
-                        context.stage_results.append(stage_result)
-                        self.db.insert_recovery_log(stage_result)
-                        
-                        if new_client:
-                            await new_client.disconnect()
-                        
-                        return None, False
-                else:
+            except PhoneCodeInvalidError:
+                elapsed = time.time() - step_start
+                print(f"❌ [{account_name}] 验证码错误 (耗时: {elapsed:.1f}秒)")
+                raise Exception("验证码错误")
+                
+            except AuthRestartError:
+                elapsed = time.time() - step_start
+                print(f"🔄 [{account_name}] 需要重新开始认证流程 (耗时: {elapsed:.1f}秒)")
+                raise Exception("需要重新开始认证流程")
+                
+            except SessionPasswordNeededError:
+                # ===== 步骤5: 2FA密码验证 =====
+                step_timings['code_login'] = time.time() - step_start
+                step_start = time.time()
+                
+                print(f"🔐 [{account_name}] 账号已设置2FA，开始密码验证...")
+                
+                # 收集所有可用的密码
+                passwords = self._collect_all_passwords(context, file_type, file_path or context.original_path)
+                
+                if not passwords:
+                    print(f"❌ [{account_name}] 没有可用的密码进行2FA验证")
+                    step_timings['2fa'] = time.time() - step_start
+                    
                     stage_result = RecoveryStageResult(
                         account_name=account_name,
                         phone=phone,
                         stage="sign_in",
                         success=False,
-                        error="账号已设置2FA，但未提供密码",
+                        error="账号已设置2FA，但没有可用的密码",
                         elapsed=time.time() - stage_start
                     )
                     context.stage_results.append(stage_result)
                     self.db.insert_recovery_log(stage_result)
                     
-                    # 清理客户端
                     if new_client:
                         await new_client.disconnect()
                     
                     return None, False
                 
-        except Exception as e:
+                # 使用增强的2FA密码验证方法
+                success, result_info, password_type = await self._verify_2fa_password(
+                    new_client, passwords, context, timeout=30
+                )
+                
+                step_timings['2fa'] = time.time() - step_start
+                
+                if success:
+                    # 验证登录成功
+                    step_start = time.time()
+                    try:
+                        me = await asyncio.wait_for(new_client.get_me(), timeout=15)
+                        if not me:
+                            raise Exception("2FA登录成功但无法获取用户信息")
+                        
+                        print(f"✅ [{account_name}] 新会话登录成功(2FA) (UserID: {me.id}, Phone: {me.phone or phone})")
+                        step_timings['verify'] = time.time() - step_start
+                        
+                    except asyncio.TimeoutError:
+                        print(f"⏰ [{account_name}] 2FA后会话验证超时")
+                        raise Exception("2FA后会话验证超时")
+                    except Exception as e:
+                        print(f"❌ [{account_name}] 2FA后会话验证失败: {str(e)}")
+                        raise Exception(f"2FA后会话验证失败: {str(e)}")
+                    
+                    # 更新上下文
+                    context.new_session_path = session_path + ".session"
+                    
+                    # 计算总耗时
+                    total_elapsed = time.time() - stage_start
+                    timing_detail = ", ".join([f"{k}: {v:.1f}s" for k, v in step_timings.items()])
+                    
+                    stage_result = RecoveryStageResult(
+                        account_name=account_name,
+                        phone=phone,
+                        stage="sign_in",
+                        success=True,
+                        detail=f"新设备登录成功(2FA) (设备: {device_model}, 密码类型: {password_type}, 总耗时: {total_elapsed:.1f}s, {timing_detail})",
+                        elapsed=total_elapsed
+                    )
+                    context.stage_results.append(stage_result)
+                    self.db.insert_recovery_log(stage_result)
+                    
+                    return new_client, True
+                else:
+                    # 2FA验证失败
+                    total_elapsed = time.time() - stage_start
+                    
+                    stage_result = RecoveryStageResult(
+                        account_name=account_name,
+                        phone=phone,
+                        stage="sign_in",
+                        success=False,
+                        error=f"2FA密码验证失败: {result_info}",
+                        elapsed=total_elapsed
+                    )
+                    context.stage_results.append(stage_result)
+                    self.db.insert_recovery_log(stage_result)
+                    
+                    if new_client:
+                        await new_client.disconnect()
+                    
+                    return None, False
+                
+        except FloodWaitError as e:
+            wait_time = getattr(e, 'seconds', 60)
+            elapsed = time.time() - stage_start
+            print(f"🚫 [{account_name}] 操作过于频繁，需等待 {wait_time} 秒 (已耗时: {elapsed:.1f}秒)")
+            
             stage_result = RecoveryStageResult(
                 account_name=account_name,
                 phone=phone,
                 stage="sign_in",
                 success=False,
-                error=str(e)[:200],
-                elapsed=time.time() - stage_start
+                error=f"FloodWait: 需等待 {wait_time} 秒",
+                elapsed=elapsed
+            )
+            context.stage_results.append(stage_result)
+            self.db.insert_recovery_log(stage_result)
+            
+            if new_client:
+                try:
+                    await new_client.disconnect()
+                except:
+                    pass
+            
+            return None, False
+            
+        except Exception as e:
+            elapsed = time.time() - stage_start
+            error_msg = str(e)[:200]
+            print(f"❌ [{account_name}] 登录阶段异常: {error_msg} (耗时: {elapsed:.1f}秒)")
+            
+            stage_result = RecoveryStageResult(
+                account_name=account_name,
+                phone=phone,
+                stage="sign_in",
+                success=False,
+                error=error_msg,
+                elapsed=elapsed
             )
             context.stage_results.append(stage_result)
             self.db.insert_recovery_log(stage_result)
@@ -7988,7 +8411,7 @@ class RecoveryProtectionManager:
                     return context
                 
                 # ===== 阶段5: 新设备登录 =====
-                new_client, sign_in_success = await self._stage_sign_in_new(phone, code, context)
+                new_client, sign_in_success = await self._stage_sign_in_new(phone, code, context, file_type, file_path)
                 if not sign_in_success:
                     context.status = "failed"
                     context.failure_reason = "新设备登录失败"
