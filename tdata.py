@@ -8676,12 +8676,32 @@ class RecoveryProtectionManager:
                             }
                             with open(new_json_path, 'w', encoding='utf-8') as f:
                                 json.dump(json_data, f, ensure_ascii=False, indent=2)
+                        
+                        # ===== 阶段6.5: 从新设备踢出旧设备/其他设备 =====
+                        # 在新设备登录成功后，使用新客户端踢出所有其他设备（包括旧设备）
+                        print(f"🔄 [{account_name}] 从新设备踢出所有其他设备（确保旧设备失效）...")
+                        try:
+                            kick_success, kick_detail = await self.remove_other_devices(new_client)
+                            if kick_success:
+                                print(f"✅ [{account_name}] 成功踢出其他设备: {kick_detail}")
+                                context.old_session_valid = False
+                            else:
+                                print(f"⚠️ [{account_name}] 踢出其他设备部分失败: {kick_detail}")
+                        except Exception as kick_err:
+                            print(f"⚠️ [{account_name}] 踢出其他设备异常: {kick_err}")
+                        
                     except Exception as e:
                         print(f"⚠️ [{account_name}] 验证新设备失败: {e}")
                 
-                # ===== 阶段7: 确保旧设备失效 =====
-                context.old_session_valid = False
-                print(f"✅ [{account_name}] 旧设备应已自动退出")
+                # ===== 阶段7: 验证旧设备已失效 =====
+                print(f"🔍 [{account_name}] 验证旧会话是否已失效...")
+                old_invalid, old_invalid_detail = await self._stage_verify_old_invalid(file_path, context)
+                if old_invalid:
+                    print(f"✅ [{account_name}] 旧会话已确认失效: {old_invalid_detail}")
+                    context.old_session_valid = False
+                else:
+                    print(f"⚠️ [{account_name}] 旧会话可能仍有效: {old_invalid_detail}")
+                    context.old_session_valid = True
                 
                 # 最终状态判断
                 if pwd_success and sign_in_success:
@@ -8800,6 +8820,81 @@ class RecoveryProtectionManager:
         }
         
         return report_data
+    
+    def _categorize_failure_reason(self, failure_reason: str, stage_results: List[RecoveryStageResult]) -> str:
+        """将失败原因分类到5个类别之一
+        
+        Categories:
+        - 未授权封禁: Account is banned, unauthorized, deactivated
+        - 密码错误: 2FA password incorrect
+        - 会话太新: Session is too new for recovery (FRESH_RESET_AUTHORISATION_FORBIDDEN)
+        - 冻结: Account is frozen
+        - 连接错误: Network/connection issues (default fallback)
+        
+        Args:
+            failure_reason: The failure reason string
+            stage_results: List of stage results for additional context
+            
+        Returns:
+            Category name in Chinese
+        """
+        reason_lower = failure_reason.lower() if failure_reason else ""
+        
+        # Also check stage results for more context
+        all_errors = [failure_reason]
+        for sr in stage_results:
+            if sr.error:
+                all_errors.append(sr.error.lower())
+        
+        combined_text = " ".join(str(e).lower() for e in all_errors if e)
+        
+        # 1. 未授权封禁 (Unauthorized/Banned)
+        banned_keywords = [
+            'banned', 'deactivated', 'unauthorized', 'unregistered',
+            'auth key', 'authkey', 'session未授权', '已失效',
+            'user_deactivated', 'phone_number_banned', 'user_banned',
+            'deleted', 'blocked'
+        ]
+        if any(keyword in combined_text for keyword in banned_keywords):
+            return "未授权封禁"
+        
+        # 2. 密码错误 (Password Error) 
+        password_keywords = [
+            'password', '密码错误', '密码验证失败', 'password_hash_invalid',
+            '2fa密码', '2fa验证失败', 'passwordhashinvalid', '没有可用的密码'
+        ]
+        if any(keyword in combined_text for keyword in password_keywords):
+            return "密码错误"
+        
+        # 3. 会话太新 (Session Too New)
+        session_new_keywords = [
+            'fresh_reset', 'session too new', '会话太新', 
+            'authorization_forbidden', 'fresh_change_phone_forbidden',
+            'fresh_change_admins_forbidden'
+        ]
+        if any(keyword in combined_text for keyword in session_new_keywords):
+            return "会话太新"
+        
+        # 4. 冻结 (Frozen)
+        frozen_keywords = [
+            'frozen', 'freeze', '冻结', 'suspended', 'temporarily limited',
+            'account is limited', 'limited until'
+        ]
+        if any(keyword in combined_text for keyword in frozen_keywords):
+            return "冻结"
+        
+        # 5. 连接错误 (Connection Error) - default fallback
+        # Also explicitly check for connection-related issues
+        connection_keywords = [
+            'connection', 'timeout', '超时', 'network', 'refused',
+            'connect', '连接', 'timed out', 'dns', 'socket',
+            'proxy', 'localhost', 'unreachable', 'reset'
+        ]
+        if any(keyword in combined_text for keyword in connection_keywords):
+            return "连接错误"
+        
+        # Default to connection error for any unclassified failures
+        return "连接错误"
     
     def generate_reports(self, report_data: Dict) -> RecoveryReportFiles:
         """生成报告文件，返回 RecoveryReportFiles 命名元组"""
@@ -9062,72 +9157,111 @@ class RecoveryProtectionManager:
         
         # 创建失败账号ZIP（仅在有失败账号时创建）
         # 文件名格式: 授权失败xx个 - 20251202.zip
+        # 失败原因分类到5个文件夹: 未授权封禁, 密码错误, 会话太新, 冻结, 连接错误
         failed_contexts = [ctx for ctx in contexts if ctx.status in ("failed", "abnormal", "timeout")]
         failed_count = len(failed_contexts)
         failed_zip_filename = f"授权失败{failed_count}个 - {date_str}.zip"
         failed_zip_path = os.path.join(config.RECOVERY_REPORTS_DIR, failed_zip_filename)
         
         if failed_contexts:
+            # 按失败原因分类
+            categorized_failures = {
+                "未授权封禁": [],  # Unauthorized/Banned
+                "密码错误": [],    # Password Error
+                "会话太新": [],    # Session Too New
+                "冻结": [],        # Frozen
+                "连接错误": []     # Connection Error (default)
+            }
+            
+            for ctx in failed_contexts:
+                category = self._categorize_failure_reason(ctx.failure_reason, ctx.stage_results)
+                categorized_failures[category].append(ctx)
+            
             with zipfile.ZipFile(failed_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-                for ctx in failed_contexts:
-                    # 确定手机号
-                    phone = ctx.phone if ctx.phone and ctx.phone != "unknown" else "unknown"
-                    phone_clean = phone.lstrip('+').replace(' ', '')
+                # 创建失败原因汇总说明文件
+                summary_txt = f"授权失败汇总报告\n"
+                summary_txt += f"=" * 50 + "\n\n"
+                summary_txt += f"处理时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                summary_txt += f"失败总数: {failed_count}\n\n"
+                summary_txt += "按失败原因分类:\n"
+                summary_txt += "-" * 50 + "\n"
+                for category, ctxs in categorized_failures.items():
+                    if ctxs:
+                        summary_txt += f"• {category}: {len(ctxs)} 个\n"
+                summary_txt += "\n"
+                zf.writestr("失败汇总.txt", summary_txt)
+                
+                # 为每个分类创建文件夹并添加文件
+                for category, ctxs in categorized_failures.items():
+                    if not ctxs:
+                        continue
                     
-                    # 创建失败原因说明文件 {phone}.txt
-                    failure_txt = f"账号: {os.path.basename(ctx.original_path)}\n"
-                    failure_txt += f"手机号: {ctx.phone}\n"
-                    failure_txt += f"最终状态: {ctx.status}\n"
-                    failure_txt += f"失败原因: {ctx.failure_reason}\n"
-                    failure_txt += f"代理使用: {ctx.proxy_used}\n\n"
-                    failure_txt += "处理阶段详情:\n"
-                    failure_txt += "=" * 50 + "\n"
-                    
-                    for stage_result in ctx.stage_results:
-                        failure_txt += f"\n阶段: {stage_result.stage}\n"
-                        failure_txt += f"  成功: {'是' if stage_result.success else '否'}\n"
-                        if stage_result.error:
-                            failure_txt += f"  错误: {stage_result.error}\n"
-                        if stage_result.detail:
-                            failure_txt += f"  详情: {stage_result.detail}\n"
-                        failure_txt += f"  耗时: {stage_result.elapsed:.2f}秒\n"
-                    
-                    # 添加失败原因文件到ZIP，使用 {phone}.txt 命名
-                    failure_filename = f"{phone_clean}.txt"
-                    zf.writestr(failure_filename, failure_txt)
-                    
-                    # 添加旧session或tdata文件
-                    if os.path.exists(ctx.original_path):
-                        original_path = ctx.original_path
-                        is_tdata = os.path.isdir(original_path) or 'tdata' in original_path.lower()
+                    for ctx in ctxs:
+                        # 确定手机号
+                        phone = ctx.phone if ctx.phone and ctx.phone != "unknown" else "unknown"
+                        phone_clean = phone.lstrip('+').replace(' ', '')
                         
-                        if is_tdata:
-                            # tdata格式: {phone}/tdata/D877.../...
-                            tdata_dir = None
-                            if os.path.isdir(original_path):
-                                if os.path.basename(original_path) == 'tdata':
-                                    tdata_dir = original_path
-                                else:
-                                    potential_tdata = os.path.join(original_path, 'tdata')
-                                    if os.path.exists(potential_tdata):
-                                        tdata_dir = potential_tdata
-                                    else:
-                                        tdata_dir = original_path
+                        # 创建失败原因说明文件 {category}/{phone}.txt
+                        failure_txt = f"账号: {os.path.basename(ctx.original_path)}\n"
+                        failure_txt += f"手机号: {ctx.phone}\n"
+                        failure_txt += f"最终状态: {ctx.status}\n"
+                        failure_txt += f"失败分类: {category}\n"
+                        failure_txt += f"失败原因: {ctx.failure_reason}\n"
+                        failure_txt += f"代理使用: {ctx.proxy_used}\n\n"
+                        failure_txt += "处理阶段详情:\n"
+                        failure_txt += "=" * 50 + "\n"
+                        
+                        for stage_result in ctx.stage_results:
+                            failure_txt += f"\n阶段: {stage_result.stage}\n"
+                            failure_txt += f"  成功: {'是' if stage_result.success else '否'}\n"
+                            if stage_result.error:
+                                failure_txt += f"  错误: {stage_result.error}\n"
+                            if stage_result.detail:
+                                failure_txt += f"  详情: {stage_result.detail}\n"
+                            failure_txt += f"  耗时: {stage_result.elapsed:.2f}秒\n"
+                        
+                        # 添加失败原因文件到ZIP，放入分类文件夹
+                        failure_filename = f"{category}/{phone_clean}.txt"
+                        zf.writestr(failure_filename, failure_txt)
+                        
+                        # 添加旧session或tdata文件到对应分类文件夹
+                        if os.path.exists(ctx.original_path):
+                            original_path = ctx.original_path
+                            is_tdata = os.path.isdir(original_path) or 'tdata' in original_path.lower()
                             
-                            if tdata_dir and os.path.exists(tdata_dir):
-                                for root, dirs, files in os.walk(tdata_dir):
-                                    for file in files:
-                                        file_path = os.path.join(root, file)
-                                        rel_path = os.path.relpath(file_path, tdata_dir)
-                                        arcname = os.path.join(phone_clean, 'tdata', rel_path)
-                                        zf.write(file_path, arcname)
-                        else:
-                            # session文件使用 {phone}.session 命名
-                            if original_path.endswith('.session'):
-                                new_filename = f"{phone_clean}.session"
-                                zf.write(original_path, new_filename)
+                            if is_tdata:
+                                # tdata格式: {category}/{phone}/tdata/D877.../...
+                                tdata_dir = None
+                                if os.path.isdir(original_path):
+                                    if os.path.basename(original_path) == 'tdata':
+                                        tdata_dir = original_path
+                                    else:
+                                        potential_tdata = os.path.join(original_path, 'tdata')
+                                        if os.path.exists(potential_tdata):
+                                            tdata_dir = potential_tdata
+                                        else:
+                                            tdata_dir = original_path
+                                
+                                if tdata_dir and os.path.exists(tdata_dir):
+                                    for root, dirs, files in os.walk(tdata_dir):
+                                        for file in files:
+                                            file_path = os.path.join(root, file)
+                                            rel_path = os.path.relpath(file_path, tdata_dir)
+                                            arcname = os.path.join(category, phone_clean, 'tdata', rel_path)
+                                            zf.write(file_path, arcname)
                             else:
-                                zf.write(original_path, os.path.basename(original_path))
+                                # session文件: {category}/{phone}.session
+                                if original_path.endswith('.session'):
+                                    new_filename = f"{category}/{phone_clean}.session"
+                                    zf.write(original_path, new_filename)
+                                    
+                                    # 也添加JSON文件（如果存在）
+                                    json_path = original_path.replace('.session', '.json')
+                                    if os.path.exists(json_path):
+                                        json_filename = f"{category}/{phone_clean}.json"
+                                        zf.write(json_path, json_filename)
+                                else:
+                                    zf.write(original_path, f"{category}/{os.path.basename(original_path)}")
         else:
             # 不创建空的失败ZIP
             failed_zip_path = ""
