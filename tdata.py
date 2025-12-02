@@ -8075,6 +8075,176 @@ class RecoveryProtectionManager:
             
             return None, False
     
+    async def _stage_change_pwd_on_old_session(self, old_client: TelegramClient, phone: str, 
+                                                context: RecoveryAccountContext, file_type: str, 
+                                                file_path: str) -> bool:
+        """阶段2.5: 在旧会话上修改2FA密码
+        
+        在旧会话上使用旧密码验证，然后设置新密码。
+        这样可以确保旧会话有权限修改密码和踢出其他设备。
+        
+        Args:
+            old_client: 旧会话客户端
+            phone: 手机号
+            context: 账号上下文
+            file_type: 文件类型
+            file_path: 文件路径
+            
+        Returns:
+            是否成功
+        """
+        account_name = os.path.basename(context.original_path)
+        stage_start = time.time()
+        
+        try:
+            # 获取要设置的新密码
+            if context.user_provided_password:
+                new_password = context.user_provided_password
+                print(f"🔐 [{account_name}] 准备设置用户提供的新密码")
+            else:
+                password_prefix = os.getenv("RECOVERY_PASSWORD_PREFIX", "")
+                new_password = password_prefix + self.generate_strong_password()
+                print(f"🔐 [{account_name}] 准备设置自动生成的新密码")
+            
+            # 脱敏保存
+            context.new_password_masked = self.mask_password(new_password)
+            
+            # 收集旧密码（用于验证）
+            old_passwords = self._collect_all_passwords(context, file_type, file_path)
+            
+            # 检查账号是否有2FA
+            from telethon.tl.functions.account import GetPasswordRequest
+            try:
+                password_info = await old_client(GetPasswordRequest())
+                has_2fa = password_info.has_password
+            except Exception as e:
+                print(f"⚠️ [{account_name}] 获取密码信息失败: {e}")
+                has_2fa = False
+            
+            if has_2fa:
+                # 账号有2FA，需要使用旧密码来修改
+                if not old_passwords:
+                    print(f"❌ [{account_name}] 账号有2FA但没有可用的旧密码")
+                    stage_result = RecoveryStageResult(
+                        account_name=account_name,
+                        phone=phone,
+                        stage="change_pwd_old",
+                        success=False,
+                        error="账号有2FA但没有可用的旧密码",
+                        elapsed=time.time() - stage_start
+                    )
+                    context.stage_results.append(stage_result)
+                    self.db.insert_recovery_log(stage_result)
+                    return False
+                
+                # 尝试每个旧密码
+                print(f"🔐 [{account_name}] 账号有2FA，尝试使用旧密码修改...")
+                pwd_changed = False
+                last_error = ""
+                
+                for idx, (old_pwd, pwd_type) in enumerate(old_passwords, 1):
+                    try:
+                        print(f"🔑 [{account_name}] 尝试旧密码 #{idx}/{len(old_passwords)} (类型: {pwd_type})")
+                        await old_client.edit_2fa(
+                            current_password=old_pwd,
+                            new_password=new_password,
+                            hint=f"Recovery {datetime.now().strftime('%Y%m%d')}"
+                        )
+                        print(f"✅ [{account_name}] 使用旧密码修改成功 (类型: {pwd_type})")
+                        pwd_changed = True
+                        break
+                    except Exception as e:
+                        last_error = str(e)
+                        print(f"❌ [{account_name}] 旧密码验证失败: {last_error[:50]}")
+                        continue
+                
+                if not pwd_changed:
+                    print(f"❌ [{account_name}] 所有旧密码均验证失败")
+                    stage_result = RecoveryStageResult(
+                        account_name=account_name,
+                        phone=phone,
+                        stage="change_pwd_old",
+                        success=False,
+                        error=f"所有旧密码均验证失败: {last_error[:100]}",
+                        elapsed=time.time() - stage_start
+                    )
+                    context.stage_results.append(stage_result)
+                    self.db.insert_recovery_log(stage_result)
+                    return False
+            else:
+                # 账号没有2FA，直接设置新密码
+                print(f"🔐 [{account_name}] 账号没有2FA，直接设置新密码...")
+                try:
+                    await old_client.edit_2fa(
+                        new_password=new_password,
+                        hint=f"Recovery {datetime.now().strftime('%Y%m%d')}"
+                    )
+                    print(f"✅ [{account_name}] 新密码设置成功")
+                except Exception as e:
+                    print(f"❌ [{account_name}] 设置新密码失败: {e}")
+                    stage_result = RecoveryStageResult(
+                        account_name=account_name,
+                        phone=phone,
+                        stage="change_pwd_old",
+                        success=False,
+                        error=str(e)[:200],
+                        elapsed=time.time() - stage_start
+                    )
+                    context.stage_results.append(stage_result)
+                    self.db.insert_recovery_log(stage_result)
+                    return False
+            
+            # 保存新密码到JSON文件（用于后续新设备登录）
+            json_path = context.old_session_path.replace('.session', '.json')
+            try:
+                # 读取现有JSON
+                if os.path.exists(json_path):
+                    with open(json_path, 'r', encoding='utf-8') as f:
+                        json_data = json.load(f)
+                else:
+                    json_data = {}
+                
+                # 更新密码字段
+                json_data['phone'] = phone
+                json_data['password'] = new_password
+                json_data['twoFA'] = new_password  # 兼容多种字段名
+                json_data['2fa'] = new_password
+                json_data['password_hint'] = f"Recovery {datetime.now().strftime('%Y%m%d')}"
+                json_data['updated_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                
+                with open(json_path, 'w', encoding='utf-8') as f:
+                    json.dump(json_data, f, ensure_ascii=False, indent=2)
+                print(f"💾 [{account_name}] 新密码已保存到JSON文件")
+            except Exception as e:
+                print(f"⚠️ [{account_name}] 保存密码到JSON失败: {e}")
+            
+            stage_result = RecoveryStageResult(
+                account_name=account_name,
+                phone=phone,
+                stage="change_pwd_old",
+                success=True,
+                detail=f"2FA密码已修改: {context.new_password_masked}",
+                elapsed=time.time() - stage_start
+            )
+            context.stage_results.append(stage_result)
+            self.db.insert_recovery_log(stage_result)
+            
+            return True
+            
+        except Exception as e:
+            print(f"❌ [{account_name}] 修改密码异常: {e}")
+            stage_result = RecoveryStageResult(
+                account_name=account_name,
+                phone=phone,
+                stage="change_pwd_old",
+                success=False,
+                error=str(e)[:200],
+                elapsed=time.time() - stage_start
+            )
+            context.stage_results.append(stage_result)
+            self.db.insert_recovery_log(stage_result)
+            return False
+
     async def _stage_rotate_pwd(self, new_client: TelegramClient, session_path: str, phone: str, context: RecoveryAccountContext) -> bool:
         """阶段6: 设置/修改2FA密码（带防风控延迟）
         
@@ -8449,7 +8619,24 @@ class RecoveryProtectionManager:
                     self.db.insert_recovery_log(stage_result)
                     return context
                 
-                # ===== 阶段3+4: 请求并等待验证码 =====
+                # ===== 阶段2.5: 在旧会话上修改2FA密码 =====
+                # 使用旧密码验证并设置新密码
+                print(f"🔐 [{account_name}] 在旧会话上修改2FA密码...")
+                pwd_success = await self._stage_change_pwd_on_old_session(old_client, phone, context, file_type, file_path)
+                if not pwd_success:
+                    context.status = "failed"
+                    context.failure_reason = "修改2FA密码失败"
+                    return context
+                
+                # ===== 阶段3: 从旧会话踢出其他设备 =====
+                print(f"🔄 [{account_name}] 从旧会话踢出其他设备...")
+                devices_success, devices_detail = await self._stage_kick_devices(old_client, context)
+                if not devices_success:
+                    print(f"⚠️ [{account_name}] 踢出设备失败: {devices_detail}，继续执行...")
+                else:
+                    print(f"✅ [{account_name}] 踢出设备成功: {devices_detail}")
+                
+                # ===== 阶段4: 请求并等待验证码 =====
                 code = await self._stage_request_and_wait_code(old_client, phone, context)
                 if not code:
                     context.status = "timeout"
@@ -8457,66 +8644,55 @@ class RecoveryProtectionManager:
                     return context
                 
                 # ===== 阶段5: 新设备登录 =====
+                # 注意：此时应使用新密码（刚才设置的）进行2FA验证
+                # 需要临时更新context中的旧密码为新密码
+                original_old_pwd = context.user_provided_old_password
+                context.user_provided_old_password = context.user_provided_password or context.new_password_masked.replace('***', '')
+                
                 new_client, sign_in_success = await self._stage_sign_in_new(phone, code, context, file_type, file_path)
+                
+                # 恢复原始值
+                context.user_provided_old_password = original_old_pwd
+                
                 if not sign_in_success:
                     context.status = "failed"
                     context.failure_reason = "新设备登录失败"
                     return context
                 
-                # ===== 阶段6: 设置/修改2FA密码 =====
-                # 防御性检查：确保 new_client 存在
-                if not new_client:
-                    print(f"⚠️ [{account_name}] new_client 不存在，跳过 2FA 密码设置")
-                    stage_result = record_stage_result(
-                        context, "rotate_pwd", False,
-                        error="previous_stage_failed",
-                        detail="新设备登录失败，跳过密码设置"
-                    )
-                    self.db.insert_recovery_log(stage_result)
-                    pwd_success = False
-                else:
-                    pwd_success = await self._stage_rotate_pwd(new_client, context.new_session_path, phone, context)
-                    if not pwd_success:
-                        context.status = "partial"
-                        context.failure_reason = "2FA密码设置失败"
-                        # 继续执行后续流程
+                # ===== 阶段6: 验证新设备登录成功 =====
+                if new_client:
+                    try:
+                        me = await new_client.get_me()
+                        print(f"✅ [{account_name}] 新设备登录验证成功 (UserID: {me.id})")
+                        
+                        # 保存新会话信息
+                        if context.new_session_path:
+                            new_json_path = context.new_session_path.replace('.session', '.json')
+                            json_data = {
+                                'phone': phone,
+                                'password': context.user_provided_password or "",
+                                'user_id': me.id,
+                                'updated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                            }
+                            with open(new_json_path, 'w', encoding='utf-8') as f:
+                                json.dump(json_data, f, ensure_ascii=False, indent=2)
+                    except Exception as e:
+                        print(f"⚠️ [{account_name}] 验证新设备失败: {e}")
                 
-                # ===== 阶段7: 从新会话踢出其他设备（包括旧设备）=====
-                # 在密码修改成功后执行踢出操作，此时新设备已有足够权限
-                devices_success = False
-                if new_client and pwd_success:
-                    print(f"🔄 [{account_name}] 从新会话踢出其他设备（包括旧设备）...")
-                    devices_success, devices_detail = await self._stage_kick_devices(new_client, context)
-                    if not devices_success:
-                        print(f"⚠️ [{account_name}] 踢出设备失败: {devices_detail}")
-                    else:
-                        print(f"✅ [{account_name}] 踢出设备成功: {devices_detail}")
-                        # 标记旧会话已失效
-                        context.old_session_valid = False
-                elif not new_client:
-                    print(f"⚠️ [{account_name}] new_client 不存在，跳过踢出设备")
-                    devices_success = False
-                elif not pwd_success:
-                    print(f"⚠️ [{account_name}] 密码设置失败，跳过踢出设备")
-                    devices_success = False
+                # ===== 阶段7: 确保旧设备失效 =====
+                context.old_session_valid = False
+                print(f"✅ [{account_name}] 旧设备应已自动退出")
                 
                 # 最终状态判断
-                if pwd_success and devices_success:
-                    # 所有阶段成功
+                if pwd_success and sign_in_success:
                     context.status = "success"
                     context.failure_reason = ""
-                elif pwd_success and not devices_success:
-                    # 密码设置成功但设备踢出失败
-                    context.status = "partial"
-                    context.failure_reason = "踢出其他设备失败"
-                elif not pwd_success and devices_success:
-                    # 密码设置失败但设备踢出成功（不太可能）
-                    context.status = "partial"
-                    context.failure_reason = "2FA密码设置失败"
+                    if not devices_success:
+                        context.status = "partial"
+                        context.failure_reason = "踢出其他设备失败，但密码已修改且新设备已登录"
                 else:
-                    # 都失败
                     context.status = "partial"
-                    context.failure_reason = "2FA密码设置和踢出设备均失败"
+                    context.failure_reason = "部分步骤失败"
                 
             except Exception as e:
                 context.status = "failed"
