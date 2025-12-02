@@ -10656,6 +10656,8 @@ class EnhancedBot:
                     try:
                         print(f"📤 正在发送: {status}_{count}个.zip")
                         
+                        # 检查实际的代理模式状态
+                        actual_proxy_mode = self.proxy_manager.is_proxy_mode_active(self.db)
                         with open(file_path, 'rb') as f:
                             context.bot.send_document(
                                 chat_id=update.effective_chat.id,
@@ -10663,7 +10665,7 @@ class EnhancedBot:
                                 filename=f"{status}_{count}个.zip",
                                 caption=f"📋 <b>{status}</b> - {count}个账号\n\n"
                                        f"⏰ 检测时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                                       f"🔧 检测模式: {'代理模式' if config.USE_PROXY else '本地模式'}",
+                                       f"🔧 检测模式: {'代理模式' if actual_proxy_mode else '本地模式'}",
                                 parse_mode='HTML'
                             )
                         
@@ -10694,12 +10696,14 @@ class EnhancedBot:
             
             # 发送完成总结
             if sent_count > 0:
+                # 检查实际的代理模式状态
+                actual_proxy_mode = self.proxy_manager.is_proxy_mode_active(self.db)
                 summary_text = f"""
 🎉 <b>所有文件发送完成！</b>
 
 📋 <b>发送总结</b>
 • 成功发送: {sent_count} 个文件
-• 检测模式: {'📡代理模式' if config.USE_PROXY else '🏠本地模式'}
+• 检测模式: {'📡代理模式' if actual_proxy_mode else '🏠本地模式'}
 • 检测时间: {int(total_time)}秒
 
 感谢使用增强版机器人！如需再次检测，请点击 /start
