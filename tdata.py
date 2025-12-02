@@ -8922,27 +8922,64 @@ class RecoveryProtectionManager:
                 base_name = os.path.basename(ctx.original_path)
                 target_path = os.path.join(target_dir, base_name)
                 
-                # 复制旧session文件
+                # 复制旧session文件（检查源和目标是否相同）
                 if os.path.exists(ctx.original_path):
-                    shutil.copy2(ctx.original_path, target_path)
+                    src_abs = os.path.abspath(ctx.original_path)
+                    dst_abs = os.path.abspath(target_path)
+                    if src_abs != dst_abs:
+                        shutil.copy2(ctx.original_path, target_path)
                 
-                # 复制相关的JSON文件
+                # 复制相关的JSON文件（检查源和目标是否相同）
                 json_path = ctx.original_path.replace('.session', '.json')
                 if os.path.exists(json_path):
                     json_target = target_path.replace('.session', '.json')
-                    shutil.copy2(json_path, json_target)
+                    json_src_abs = os.path.abspath(json_path)
+                    json_dst_abs = os.path.abspath(json_target)
+                    if json_src_abs != json_dst_abs:
+                        shutil.copy2(json_path, json_target)
                 
                 # 如果有新session文件，也复制到目标目录
                 if ctx.new_session_path and os.path.exists(ctx.new_session_path):
                     new_base_name = os.path.basename(ctx.new_session_path)
                     new_target_path = os.path.join(target_dir, new_base_name)
-                    shutil.copy2(ctx.new_session_path, new_target_path)
                     
-                    # 复制新session的JSON文件
-                    new_json_path = ctx.new_session_path.replace('.session', '.json')
-                    if os.path.exists(new_json_path):
-                        new_json_target = new_target_path.replace('.session', '.json')
-                        shutil.copy2(new_json_path, new_json_target)
+                    # 检查源文件和目标文件是否相同（避免 "same file" 错误）
+                    src_abs = os.path.abspath(ctx.new_session_path)
+                    dst_abs = os.path.abspath(new_target_path)
+                    
+                    if src_abs != dst_abs:
+                        shutil.copy2(ctx.new_session_path, new_target_path)
+                        
+                        # 复制新session的JSON文件
+                        new_json_path = ctx.new_session_path.replace('.session', '.json')
+                        if os.path.exists(new_json_path):
+                            new_json_target = new_target_path.replace('.session', '.json')
+                            new_json_src_abs = os.path.abspath(new_json_path)
+                            new_json_dst_abs = os.path.abspath(new_json_target)
+                            if new_json_src_abs != new_json_dst_abs:
+                                shutil.copy2(new_json_path, new_json_target)
+                    else:
+                        # 文件已在目标目录，检查是否需要重命名（从临时名称到规范名称）
+                        # 临时文件名格式: temp_code_request_{phone}_{timestamp}.session
+                        # 规范文件名格式: {phone}.session
+                        phone = ctx.phone if ctx.phone and ctx.phone != "unknown" else None
+                        if phone and 'temp_code_request_' in new_base_name:
+                            # 构建规范文件名
+                            phone_clean = phone.lstrip('+').replace(' ', '')
+                            final_session_name = f"{phone_clean}.session"
+                            final_session_path = os.path.join(target_dir, final_session_name)
+                            
+                            # 检查规范名称文件是否已存在
+                            if not os.path.exists(final_session_path):
+                                try:
+                                    shutil.copy2(ctx.new_session_path, final_session_path)
+                                    # 复制JSON文件
+                                    new_json_path = ctx.new_session_path.replace('.session', '.json')
+                                    if os.path.exists(new_json_path):
+                                        final_json_path = final_session_path.replace('.session', '.json')
+                                        shutil.copy2(new_json_path, final_json_path)
+                                except Exception as rename_err:
+                                    print(f"⚠️ 规范化文件名失败 {new_base_name}: {rename_err}")
                 
             except Exception as e:
                 print(f"⚠️ 移动文件失败 {ctx.original_path}: {e}")
@@ -9225,37 +9262,31 @@ class EnhancedBot:
         self.dp.add_handler(MessageHandler(Filters.photo, self.handle_photo))
         self.dp.add_handler(MessageHandler(Filters.text & ~Filters.command, self.handle_text))
     
-    def safe_send_message(self, update, text, parse_mode=None, reply_markup=None):
-        """安全发送消息"""
-        try:
-            # 检查 update.message 是否存在
-            if update.message:
-                return update.message.reply_text(
-                    text=text,
-                    parse_mode=parse_mode,
-                    reply_markup=reply_markup
-                )
-            # 如果 update.message 不存在（例如来自回调查询），使用 bot.send_message
-            elif update.effective_chat:
-                return self.updater.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text=text,
-                    parse_mode=parse_mode,
-                    reply_markup=reply_markup
-                )
-            else:
-                print("❌ 无法发送消息: update 对象缺少 message 和 effective_chat")
-                return None
-        except RetryAfter as e:
-            print(f"⚠️ 频率限制，等待 {e.retry_after} 秒")
-            time.sleep(e.retry_after + 1)
+    def safe_send_message(self, update, text, parse_mode=None, reply_markup=None, max_retries=3):
+        """安全发送消息（带网络错误重试机制）
+        
+        Args:
+            update: Telegram update 对象
+            text: 要发送的消息文本
+            parse_mode: 解析模式（如 'HTML'）
+            reply_markup: 回复键盘标记
+            max_retries: 最大重试次数（默认3次）
+            
+        Returns:
+            发送的消息对象，失败时返回 None
+        """
+        last_error = None
+        
+        for attempt in range(max_retries):
             try:
+                # 检查 update.message 是否存在
                 if update.message:
                     return update.message.reply_text(
                         text=text,
                         parse_mode=parse_mode,
                         reply_markup=reply_markup
                     )
+                # 如果 update.message 不存在（例如来自回调查询），使用 bot.send_message
                 elif update.effective_chat:
                     return self.updater.bot.send_message(
                         chat_id=update.effective_chat.id,
@@ -9263,39 +9294,120 @@ class EnhancedBot:
                         parse_mode=parse_mode,
                         reply_markup=reply_markup
                     )
-            except:
-                return None
-        except Exception as e:
-            print(f"❌ 发送消息失败: {e}")
-            return None
+                else:
+                    print("❌ 无法发送消息: update 对象缺少 message 和 effective_chat")
+                    return None
+                    
+            except RetryAfter as e:
+                print(f"⚠️ 频率限制，等待 {e.retry_after} 秒")
+                time.sleep(e.retry_after + 1)
+                last_error = e
+                continue
+                
+            except (NetworkError, TimedOut) as e:
+                # 网络错误，使用指数退避重试
+                last_error = e
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt  # 指数退避: 1, 2, 4 秒
+                    print(f"⚠️ 网络错误，{wait_time}秒后重试 ({attempt + 1}/{max_retries}): {e}")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    print(f"❌ 发送消息失败（已重试{max_retries}次）: {e}")
+                    return None
+                    
+            except Exception as e:
+                # 检查是否是网络相关的错误（urllib3, ConnectionError等）
+                error_str = str(e).lower()
+                if any(keyword in error_str for keyword in ['connection', 'timeout', 'reset', 'refused', 'aborted', 'urllib3', 'httperror']):
+                    last_error = e
+                    if attempt < max_retries - 1:
+                        wait_time = 2 ** attempt
+                        print(f"⚠️ 连接错误，{wait_time}秒后重试 ({attempt + 1}/{max_retries}): {e}")
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        print(f"❌ 发送消息失败（已重试{max_retries}次）: {e}")
+                        return None
+                else:
+                    # 非网络错误，直接返回
+                    print(f"❌ 发送消息失败: {e}")
+                    return None
+        
+        # 所有重试都失败
+        if last_error:
+            print(f"❌ 发送消息失败（已重试{max_retries}次）: {last_error}")
+        return None
     
-    def safe_edit_message(self, query, text, parse_mode=None, reply_markup=None):
-        """安全编辑消息"""
-        try:
-            return query.edit_message_text(
-                text=text,
-                parse_mode=parse_mode,
-                reply_markup=reply_markup
-            )
-        except RetryAfter as e:
-            print(f"⚠️ 频率限制，等待 {e.retry_after} 秒")
-            time.sleep(e.retry_after + 1)
+    def safe_edit_message(self, query, text, parse_mode=None, reply_markup=None, max_retries=3):
+        """安全编辑消息（带网络错误重试机制）
+        
+        Args:
+            query: Telegram callback query 对象
+            text: 要编辑的消息文本
+            parse_mode: 解析模式（如 'HTML'）
+            reply_markup: 回复键盘标记
+            max_retries: 最大重试次数（默认3次）
+            
+        Returns:
+            编辑后的消息对象，失败时返回 None
+        """
+        last_error = None
+        
+        for attempt in range(max_retries):
             try:
                 return query.edit_message_text(
                     text=text,
                     parse_mode=parse_mode,
                     reply_markup=reply_markup
                 )
-            except:
+                
+            except RetryAfter as e:
+                print(f"⚠️ 频率限制，等待 {e.retry_after} 秒")
+                time.sleep(e.retry_after + 1)
+                last_error = e
+                continue
+                
+            except BadRequest as e:
+                if "message is not modified" in str(e).lower():
+                    return None
+                print(f"❌ 编辑消息失败: {e}")
                 return None
-        except BadRequest as e:
-            if "message is not modified" in str(e).lower():
-                return None
-            print(f"❌ 编辑消息失败: {e}")
-            return None
-        except Exception as e:
-            print(f"❌ 编辑消息失败: {e}")
-            return None
+                
+            except (NetworkError, TimedOut) as e:
+                # 网络错误，使用指数退避重试
+                last_error = e
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt  # 指数退避: 1, 2, 4 秒
+                    print(f"⚠️ 网络错误，{wait_time}秒后重试 ({attempt + 1}/{max_retries}): {e}")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    print(f"❌ 编辑消息失败（已重试{max_retries}次）: {e}")
+                    return None
+                    
+            except Exception as e:
+                # 检查是否是网络相关的错误（urllib3, ConnectionError等）
+                error_str = str(e).lower()
+                if any(keyword in error_str for keyword in ['connection', 'timeout', 'reset', 'refused', 'aborted', 'urllib3', 'httperror']):
+                    last_error = e
+                    if attempt < max_retries - 1:
+                        wait_time = 2 ** attempt
+                        print(f"⚠️ 连接错误，{wait_time}秒后重试 ({attempt + 1}/{max_retries}): {e}")
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        print(f"❌ 编辑消息失败（已重试{max_retries}次）: {e}")
+                        return None
+                else:
+                    # 非网络错误，直接返回
+                    print(f"❌ 编辑消息失败: {e}")
+                    return None
+        
+        # 所有重试都失败
+        if last_error:
+            print(f"❌ 编辑消息失败（已重试{max_retries}次）: {last_error}")
+        return None
     
     def sanitize_filename(self, filename: str) -> str:
         """清理文件名，移除非法字符并限制长度"""
