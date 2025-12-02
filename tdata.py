@@ -210,10 +210,11 @@ class RecoveryAccountContext:
     failure_reason: str = ""
     stage_results: List[RecoveryStageResult] = field(default_factory=list)
     
-    # 新增字段 - 用户提供的密码（支持多个密码用|分隔）
-    user_provided_password: str = ""  # 用户提供的密码（处理时使用，不持久化到报告）
+    # 新增字段 - 用户提供的新密码（登录成功后设置的密码）
+    # 注意：这是要设置的"新"密码，不是用于2FA登录验证的"旧"密码
+    user_provided_password: str = ""  # 用户提供的新密码（处理时使用，不持久化到报告）
     
-    # 新增字段 - 检测到的旧密码
+    # 新增字段 - 检测到的旧密码（用于2FA登录验证）
     detected_old_passwords: List[str] = field(default_factory=list)  # 从文件中检测到的旧密码列表
     
     # 新增字段 - 设备信息
@@ -6918,12 +6919,14 @@ class RecoveryProtectionManager:
         return passwords
     
     def _collect_all_passwords(self, context: RecoveryAccountContext, file_type: str, file_path: str) -> List[Tuple[str, str]]:
-        """收集所有可用的密码（含类型标识）
+        """收集所有可用的旧密码（含类型标识）
+        
+        用于2FA登录验证时尝试的旧密码。
+        注意：user_provided_password 是用户想要设置的新密码，不是旧密码，不应包含在这里。
         
         按优先级收集密码：
-        1. 用户手动提供的密码（可能包含多个）
-        2. 从TData目录提取的密码
-        3. 从JSON文件提取的密码
+        1. 从TData目录提取的密码（2fa.txt等文件）
+        2. 从JSON文件提取的密码（twoFA、2fa等字段）
         
         Args:
             context: 账号上下文
@@ -6935,20 +6938,17 @@ class RecoveryProtectionManager:
         """
         passwords_with_type = []
         
-        # 1. 用户手动提供的密码（最高优先级）
-        if context.user_provided_password:
-            manual_passwords = self._parse_manual_passwords(context.user_provided_password)
-            for pwd in manual_passwords:
-                passwords_with_type.append((pwd, "用户提供"))
+        # 注意：user_provided_password 是新密码（用于登录后设置），不是旧密码（用于2FA验证）
+        # 因此不应将其添加到旧密码列表中
         
-        # 2. 从TData目录提取密码
+        # 1. 从TData目录提取旧密码
         if file_type == "tdata":
             tdata_passwords = self._extract_old_passwords_from_tdata(file_path)
             for pwd in tdata_passwords:
                 if not any(p[0] == pwd for p in passwords_with_type):
                     passwords_with_type.append((pwd, "TData文件"))
         
-        # 3. 从JSON文件提取密码
+        # 2. 从JSON文件提取旧密码
         json_path = None
         if file_type == "session":
             json_path = file_path.replace('.session', '.json')
