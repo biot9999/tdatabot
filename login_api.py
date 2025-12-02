@@ -121,12 +121,13 @@ class LoginApiService:
             phone = self._extract_phone_from_path(session_path)
         
         # 创建账号上下文，确保类型正确
+        # Note: int(api_id) and str(api_hash) are defensive conversions to prevent TypeError in Telethon
         account = AccountContext(
             token=token,
             phone=phone,
             session_path=session_path,
-            api_id=int(api_id),
-            api_hash=str(api_hash)
+            api_id=int(api_id) if api_id is not None else 0,
+            api_hash=str(api_hash) if api_hash is not None else ""
         )
         
         self.accounts[token] = account

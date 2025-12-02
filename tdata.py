@@ -708,7 +708,7 @@ class Config:
         self.TOKEN = os.getenv("TOKEN") or os.getenv("BOT_TOKEN")
         self.API_ID = int(os.getenv("API_ID", "0"))
         # Ensure API_HASH is always a string to prevent TypeError in Telethon
-        self.API_HASH = str(os.getenv("API_HASH", "") or "")
+        self.API_HASH = str(os.getenv("API_HASH", ""))
         
         admin_ids = os.getenv("ADMIN_IDS", "")
         self.ADMIN_IDS = []
