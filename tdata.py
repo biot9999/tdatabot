@@ -707,7 +707,8 @@ class Config:
     def __init__(self):
         self.TOKEN = os.getenv("TOKEN") or os.getenv("BOT_TOKEN")
         self.API_ID = int(os.getenv("API_ID", "0"))
-        self.API_HASH = os.getenv("API_HASH", "")
+        # Ensure API_HASH is always a string to prevent TypeError in Telethon
+        self.API_HASH = str(os.getenv("API_HASH", "") or "")
         
         admin_ids = os.getenv("ADMIN_IDS", "")
         self.ADMIN_IDS = []
@@ -1257,8 +1258,8 @@ class SpamBotChecker:
             session_base = session_path.replace('.session', '') if session_path.endswith('.session') else session_path
             client = TelegramClient(
                 session_base,
-                config.API_ID,
-                config.API_HASH,
+                int(config.API_ID),
+                str(config.API_HASH),
                 timeout=client_timeout,
                 connection_retries=2,  # 增加连接重试次数
                 retry_delay=1,
@@ -3931,8 +3932,8 @@ class TwoFactorManager:
                 session_base = session_path.replace('.session', '') if session_path.endswith('.session') else session_path
                 client = TelegramClient(
                     session_base,
-                    config.API_ID,
-                    config.API_HASH,
+                    int(config.API_ID),
+                    str(config.API_HASH),
                     timeout=30,
                     connection_retries=2,
                     retry_delay=1,
@@ -4226,8 +4227,8 @@ class TwoFactorManager:
                     status, info, name = await converter.convert_tdata_to_session(
                         file_path, 
                         file_name,
-                        config.API_ID,
-                        config.API_HASH
+                        int(config.API_ID),
+                        str(config.API_HASH)
                     )
                     
                     if status != "转换成功":
@@ -4692,7 +4693,7 @@ class APIFormatConverter:
         try:
             # Telethon expects session path without .session extension
             session_base = session_file.replace('.session', '') if session_file.endswith('.session') else session_file
-            client = TelegramClient(session_base, config.API_ID, config.API_HASH)
+            client = TelegramClient(session_base, int(config.API_ID), str(config.API_HASH))
             await client.connect()
             
             if not await client.is_user_authorized():
@@ -4895,7 +4896,7 @@ class APIFormatConverter:
             if session_path and os.path.exists(session_path):
                 # Telethon expects session path without .session extension
                 session_base = session_path.replace('.session', '') if session_path.endswith('.session') else session_path
-                client = TelegramClient(session_base, config.API_ID, config.API_HASH)
+                client = TelegramClient(session_base, int(config.API_ID), str(config.API_HASH))
             elif tdata_path and os.path.exists(tdata_path) and OPENTELE_AVAILABLE:
                 tdesk = TDesktop(tdata_path)
                 if not tdesk.isLoaded():
@@ -6099,8 +6100,8 @@ class Forget2FAManager:
                     
                     client = TelegramClient(
                         session_base,
-                        config.API_ID,
-                        config.API_HASH,
+                        int(config.API_ID),
+                        str(config.API_HASH),
                         timeout=timeout,
                         connection_retries=1,
                         retry_delay=1,
@@ -6138,8 +6139,8 @@ class Forget2FAManager:
         try:
             client = TelegramClient(
                 session_base,
-                config.API_ID,
-                config.API_HASH,
+                int(config.API_ID),
+                str(config.API_HASH),
                 timeout=15,
                 connection_retries=2,
                 retry_delay=1,
@@ -7046,8 +7047,8 @@ class RecoveryProtectionManager:
             
             old_client = TelegramClient(
                 session_base,
-                config.API_ID,
-                config.API_HASH,
+                int(config.API_ID),
+                str(config.API_HASH),
                 timeout=10
             )
             
@@ -7389,8 +7390,8 @@ class RecoveryProtectionManager:
             # 创建/重连客户端
             new_client = TelegramClient(
                 session_path,
-                config.API_ID,
-                config.API_HASH,
+                int(config.API_ID),
+                str(config.API_HASH),
                 device_model=device_model,
                 system_version=system_version,
                 app_version=app_version,
@@ -7712,7 +7713,7 @@ class RecoveryProtectionManager:
                             converter = FormatConverter(self.db)
                             tdata_name = os.path.basename(file_path)
                             status, message, _ = await converter.convert_tdata_to_session(
-                                file_path, tdata_name, config.API_ID, config.API_HASH
+                                file_path, tdata_name, int(config.API_ID), str(config.API_HASH)
                             )
                             
                             if status != "转换成功":
@@ -7842,7 +7843,7 @@ class RecoveryProtectionManager:
                     
                     # 创建旧客户端
                     session_name = file_path.replace('.session', '')
-                    old_client = TelegramClient(session_name, config.API_ID, config.API_HASH)
+                    old_client = TelegramClient(session_name, int(config.API_ID), str(config.API_HASH))
                     
                     # 使用代理重试连接
                     success, proxy_info, elapsed = await self.connect_with_proxy_retry(old_client, phone)
@@ -11486,8 +11487,8 @@ class EnhancedBot:
             results = await self.converter.batch_convert_with_progress(
                 files, 
                 conversion_type,
-                config.API_ID,
-                config.API_HASH,
+                int(config.API_ID),
+                str(config.API_HASH),
                 conversion_callback
             )
             

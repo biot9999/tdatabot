@@ -120,13 +120,13 @@ class LoginApiService:
         if not phone:
             phone = self._extract_phone_from_path(session_path)
         
-        # 创建账号上下文
+        # 创建账号上下文，确保类型正确
         account = AccountContext(
             token=token,
             phone=phone,
             session_path=session_path,
-            api_id=api_id,
-            api_hash=api_hash
+            api_id=int(api_id),
+            api_hash=str(api_hash)
         )
         
         self.accounts[token] = account
@@ -163,8 +163,8 @@ class LoginApiService:
             # 创建客户端
             account.client = TelegramClient(
                 account.session_path,
-                account.api_id,
-                account.api_hash
+                int(account.api_id),
+                str(account.api_hash)
             )
             
             await account.client.connect()
