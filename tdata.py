@@ -8973,11 +8973,14 @@ class RecoveryProtectionManager:
                             if not os.path.exists(final_session_path):
                                 try:
                                     shutil.copy2(ctx.new_session_path, final_session_path)
-                                    # 复制JSON文件
+                                    # 复制JSON文件（检查源和目标是否相同）
                                     new_json_path = ctx.new_session_path.replace('.session', '.json')
                                     if os.path.exists(new_json_path):
                                         final_json_path = final_session_path.replace('.session', '.json')
-                                        shutil.copy2(new_json_path, final_json_path)
+                                        json_src_abs = os.path.abspath(new_json_path)
+                                        json_dst_abs = os.path.abspath(final_json_path)
+                                        if json_src_abs != json_dst_abs:
+                                            shutil.copy2(new_json_path, final_json_path)
                                 except Exception as rename_err:
                                     print(f"⚠️ 规范化文件名失败 {new_base_name}: {rename_err}")
                 
