@@ -8093,16 +8093,47 @@ class RecoveryProtectionManager:
                     
                     success_txt += f"• {phone} - 密码: {ctx.new_password_masked}\n"
                     
-                    # 添加新session文件，使用 {phone}.session 命名
-                    if ctx.new_session_path and os.path.exists(ctx.new_session_path):
-                        session_filename = f"{phone_clean}.session"
-                        zf.write(ctx.new_session_path, session_filename)
+                    # 检查原始文件类型
+                    original_path = ctx.original_path
+                    is_tdata = os.path.isdir(original_path) or 'tdata' in original_path.lower()
+                    
+                    if is_tdata:
+                        # tdata格式: {phone}/tdata/D877.../...
+                        # 查找tdata目录
+                        tdata_dir = None
+                        if os.path.isdir(original_path):
+                            # 检查是否是tdata目录本身
+                            if os.path.basename(original_path) == 'tdata':
+                                tdata_dir = original_path
+                            else:
+                                # 检查子目录中是否有tdata
+                                potential_tdata = os.path.join(original_path, 'tdata')
+                                if os.path.exists(potential_tdata):
+                                    tdata_dir = potential_tdata
+                                else:
+                                    tdata_dir = original_path
                         
-                        # 添加新session的JSON文件，使用 {phone}.json 命名
-                        new_json_path = ctx.new_session_path.replace('.session', '.json')
-                        if os.path.exists(new_json_path):
-                            json_filename = f"{phone_clean}.json"
-                            zf.write(new_json_path, json_filename)
+                        if tdata_dir and os.path.exists(tdata_dir):
+                            # 递归添加tdata目录内容
+                            for root, dirs, files in os.walk(tdata_dir):
+                                for file in files:
+                                    file_path = os.path.join(root, file)
+                                    # 计算相对于tdata目录的路径
+                                    rel_path = os.path.relpath(file_path, tdata_dir)
+                                    # 构建ZIP内路径: {phone}/tdata/{rel_path}
+                                    arcname = os.path.join(phone_clean, 'tdata', rel_path)
+                                    zf.write(file_path, arcname)
+                    else:
+                        # session格式: 添加新session文件
+                        if ctx.new_session_path and os.path.exists(ctx.new_session_path):
+                            session_filename = f"{phone_clean}.session"
+                            zf.write(ctx.new_session_path, session_filename)
+                            
+                            # 添加新session的JSON文件
+                            new_json_path = ctx.new_session_path.replace('.session', '.json')
+                            if os.path.exists(new_json_path):
+                                json_filename = f"{phone_clean}.json"
+                                zf.write(new_json_path, json_filename)
                 
                 # 写入 success.txt
                 zf.writestr("success.txt", success_txt)
@@ -8146,16 +8177,38 @@ class RecoveryProtectionManager:
                     failure_filename = f"{phone_clean}.txt"
                     zf.writestr(failure_filename, failure_txt)
                     
-                    # 添加旧session或tdata文件，使用 {phone}.session 或保持tdata格式
+                    # 添加旧session或tdata文件
                     if os.path.exists(ctx.original_path):
-                        original_filename = os.path.basename(ctx.original_path)
-                        if original_filename.endswith('.session'):
-                            # session文件使用 {phone}.session 命名
-                            new_filename = f"{phone_clean}.session"
-                            zf.write(ctx.original_path, new_filename)
+                        original_path = ctx.original_path
+                        is_tdata = os.path.isdir(original_path) or 'tdata' in original_path.lower()
+                        
+                        if is_tdata:
+                            # tdata格式: {phone}/tdata/D877.../...
+                            tdata_dir = None
+                            if os.path.isdir(original_path):
+                                if os.path.basename(original_path) == 'tdata':
+                                    tdata_dir = original_path
+                                else:
+                                    potential_tdata = os.path.join(original_path, 'tdata')
+                                    if os.path.exists(potential_tdata):
+                                        tdata_dir = potential_tdata
+                                    else:
+                                        tdata_dir = original_path
+                            
+                            if tdata_dir and os.path.exists(tdata_dir):
+                                for root, dirs, files in os.walk(tdata_dir):
+                                    for file in files:
+                                        file_path = os.path.join(root, file)
+                                        rel_path = os.path.relpath(file_path, tdata_dir)
+                                        arcname = os.path.join(phone_clean, 'tdata', rel_path)
+                                        zf.write(file_path, arcname)
                         else:
-                            # tdata文件保持原格式
-                            zf.write(ctx.original_path, original_filename)
+                            # session文件使用 {phone}.session 命名
+                            if original_path.endswith('.session'):
+                                new_filename = f"{phone_clean}.session"
+                                zf.write(original_path, new_filename)
+                            else:
+                                zf.write(original_path, os.path.basename(original_path))
         else:
             # 不创建空的失败ZIP
             failed_zip_path = ""
