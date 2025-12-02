@@ -759,6 +759,12 @@ class Config:
         self.RESULTS_DIR = os.path.join(self.SCRIPT_DIR, "results")
         self.UPLOADS_DIR = os.path.join(self.SCRIPT_DIR, "uploads")
         
+        # Session文件目录结构
+        # sessions: 存放用户上传的session文件
+        # sessions/sessions_bak: 存放临时处理文件
+        self.SESSIONS_DIR = os.path.join(self.SCRIPT_DIR, "sessions")
+        self.SESSIONS_BAK_DIR = os.path.join(self.SESSIONS_DIR, "sessions_bak")
+        
         # 防止找回目录结构
         self.RECOVERY_DIR = os.path.join(self.RESULTS_DIR, "recovery")
         self.RECOVERY_SAFE_DIR = os.path.join(self.RECOVERY_DIR, "safe_sessions")
@@ -771,6 +777,8 @@ class Config:
         # 创建目录
         os.makedirs(self.RESULTS_DIR, exist_ok=True)
         os.makedirs(self.UPLOADS_DIR, exist_ok=True)
+        os.makedirs(self.SESSIONS_DIR, exist_ok=True)
+        os.makedirs(self.SESSIONS_BAK_DIR, exist_ok=True)
         os.makedirs(self.RECOVERY_SAFE_DIR, exist_ok=True)
         os.makedirs(self.RECOVERY_ABNORMAL_DIR, exist_ok=True)
         os.makedirs(self.RECOVERY_TIMEOUT_DIR, exist_ok=True)
@@ -780,6 +788,8 @@ class Config:
         
         print(f"📁 上传目录: {self.UPLOADS_DIR}")
         print(f"📁 结果目录: {self.RESULTS_DIR}")
+        print(f"📁 Session目录: {self.SESSIONS_DIR}")
+        print(f"📁 临时文件目录: {self.SESSIONS_BAK_DIR}")
         print(f"🛡️ 防止找回目录: {self.RECOVERY_DIR}")
         print(f"📡 系统配置: USE_PROXY={'true' if self.USE_PROXY else 'false'}")
         print(f"💡 注意: 实际代理模式需要配置文件+数据库开关+有效代理文件同时满足")
@@ -2748,7 +2758,10 @@ class FileProcessor:
             if not tdesk.isLoaded():
                 return "连接错误", "TData未授权或无效", tdata_name
             
-            session_name = f"temp_{int(time.time()*1000)}"
+            # 临时session文件保存在sessions/temp目录
+            os.makedirs(config.SESSIONS_BAK_DIR, exist_ok=True)
+            temp_session_name = f"temp_{int(time.time()*1000)}"
+            session_name = os.path.join(config.SESSIONS_BAK_DIR, temp_session_name)
             client = await tdesk.ToTelethon(session=session_name, flag=UseCurrentSession, api=API.TelegramDesktop)
             
             # 2. 快速连接测试
@@ -2852,13 +2865,13 @@ class FileProcessor:
                     await client.disconnect()
                 except:
                     pass
-            # 清理临时session文件
+            # 清理临时session文件（session_name现在包含完整路径）
             if session_name:
                 try:
                     session_file = f"{session_name}.session"
                     if os.path.exists(session_file):
                         os.remove(session_file)
-                    session_journal = f"{session_file}-journal"
+                    session_journal = f"{session_name}.session-journal"
                     if os.path.exists(session_journal):
                         os.remove(session_journal)
                 except:
@@ -2975,11 +2988,9 @@ class FormatConverter:
         生成失败转换的session和JSON文件
         用于所有转换失败的情况
         """
-        # 创建sessions目录用于存储所有转换的文件
-        sessions_dir = os.path.join(os.getcwd(), "sessions")
-        if not os.path.exists(sessions_dir):
-            os.makedirs(sessions_dir)
-            print(f"📁 创建sessions目录: {sessions_dir}")
+        # 使用config中定义的sessions目录
+        sessions_dir = config.SESSIONS_DIR
+        os.makedirs(sessions_dir, exist_ok=True)
         
         phone = tdata_name
         
@@ -3251,14 +3262,19 @@ class FormatConverter:
                     return "转换错误", error_msg, tdata_name
                 
                 # 生成唯一的session名称以避免冲突
+                # 临时session文件保存在sessions/temp目录
                 unique_session_name = f"{tdata_name}_{int(time.time()*1000)}"
+                temp_session_path = os.path.join(config.SESSIONS_BAK_DIR, unique_session_name)
                 session_file = f"{unique_session_name}.session"
+                
+                # 确保sessions/temp目录存在
+                os.makedirs(config.SESSIONS_BAK_DIR, exist_ok=True)
                 
                 # 转换为Telethon Session (带超时)
                 try:
                     client = await asyncio.wait_for(
                         tdesk.ToTelethon(
-                            session=unique_session_name,
+                            session=temp_session_path,
                             flag=UseCurrentSession,
                             api=API.TelegramDesktop
                         ),
@@ -3303,15 +3319,14 @@ class FormatConverter:
                 # 确保连接关闭
                 await client.disconnect()
                 
-                # 创建sessions目录用于存储所有转换的session文件
-                sessions_dir = os.path.join(os.getcwd(), "sessions")
-                if not os.path.exists(sessions_dir):
-                    os.makedirs(sessions_dir)
-                    print(f"📁 创建sessions目录: {sessions_dir}")
+                # 使用config中定义的sessions目录
+                sessions_dir = config.SESSIONS_DIR
+                os.makedirs(sessions_dir, exist_ok=True)
                 
                 # 重命名session文件
-                # ToTelethon在当前工作目录创建session文件，而不是在tdata_path目录
-                temp_session_path = os.path.join(os.getcwd(), session_file)
+                # ToTelethon creates session file at the path specified (temp_session_path)
+                # 临时session文件保存在sessions_bak目录
+                temp_session_path = os.path.join(config.SESSIONS_BAK_DIR, session_file)
                 final_session_path = os.path.join(sessions_dir, final_session_file)
                 
                 # 确保session文件总是被创建
@@ -3351,11 +3366,10 @@ class FormatConverter:
                 error_msg = str(e)
                 print(f"❌ 转换错误 {tdata_name}: {error_msg}")
                 
-                # 清理临时文件
+                # 清理临时文件（sessions_bak目录）
                 if session_file:
                     try:
-                        # ToTelethon在当前工作目录创建session文件
-                        temp_session_path = os.path.join(os.getcwd(), session_file)
+                        temp_session_path = os.path.join(config.SESSIONS_BAK_DIR, session_file)
                         if os.path.exists(temp_session_path):
                             os.remove(temp_session_path)
                         temp_journal = temp_session_path + "-journal"
@@ -3424,11 +3438,9 @@ class FormatConverter:
             # 转换为TData
             tdesk = await client.ToTDesktop(flag=UseCurrentSession)
             
-            # 创建sessions目录用于存储所有转换的文件
-            sessions_dir = os.path.join(os.getcwd(), "sessions")
-            if not os.path.exists(sessions_dir):
-                os.makedirs(sessions_dir)
-                print(f"📁 创建sessions目录: {sessions_dir}")
+            # 使用config中定义的sessions目录
+            sessions_dir = config.SESSIONS_DIR
+            os.makedirs(sessions_dir, exist_ok=True)
             
             # 保存TData - 修改为: sessions/手机号/tdata/ 结构
             phone_dir = os.path.join(sessions_dir, phone)
@@ -3556,7 +3568,7 @@ class FormatConverter:
                     if status == "转换成功":
                         if conversion_type == "tdata_to_session":
                             # Tdata转Session: 复制生成的session文件和JSON文件
-                            sessions_dir = os.path.join(os.getcwd(), "sessions")
+                            sessions_dir = config.SESSIONS_DIR
                             
                             # 从info中提取手机号
                             phone = "未知"
@@ -3587,7 +3599,7 @@ class FormatConverter:
                     
                         else:  # session_to_tdata - 修复路径问题
                             # 转换后的文件实际保存在sessions目录下，不是source_dir
-                            sessions_dir = os.path.join(os.getcwd(), "sessions")
+                            sessions_dir = config.SESSIONS_DIR
                             
                             # 从info中提取手机号
                             phone = "未知"
@@ -4182,7 +4194,7 @@ class TwoFactorManager:
                         return
                     
                     # 转换成功，使用生成的 session 文件
-                    sessions_dir = os.path.join(os.getcwd(), "sessions")
+                    sessions_dir = config.SESSIONS_DIR
                     phone = file_name  # TData 的名称通常是手机号
                     session_path = os.path.join(sessions_dir, f"{phone}.session")
                     
@@ -4660,7 +4672,10 @@ class APIFormatConverter:
             tdesk = TDesktop(tdata_path)
             if not tdesk.isLoaded():
                 return {"error": "TData未授权或无效"}
-            temp_session = "temp_api_%d" % int(time.time())
+            # 临时session文件保存在sessions/temp目录
+            os.makedirs(config.SESSIONS_BAK_DIR, exist_ok=True)
+            temp_session_name = "temp_api_%d" % int(time.time())
+            temp_session = os.path.join(config.SESSIONS_BAK_DIR, temp_session_name)
             client = await tdesk.ToTelethon(session=temp_session, flag=UseCurrentSession)
             await client.connect()
             me = await client.get_me()
@@ -4693,7 +4708,7 @@ class APIFormatConverter:
     ) -> List[dict]:
         api_accounts = []
         password_detector = PasswordDetector()
-        sessions_dir = os.path.join(os.getcwd(), "sessions")
+        sessions_dir = config.SESSIONS_DIR
         os.makedirs(sessions_dir, exist_ok=True)
 
         for file_path, file_name in files:
@@ -4842,7 +4857,9 @@ class APIFormatConverter:
                 if not tdesk.isLoaded():
                     print("⚠️ TData 无法加载: %s" % phone)
                     return
-                temp_session_name = "watch_%s_%d" % (phone, int(time.time()))
+                # 临时session文件保存在sessions/temp目录
+                os.makedirs(config.SESSIONS_BAK_DIR, exist_ok=True)
+                temp_session_name = os.path.join(config.SESSIONS_BAK_DIR, "watch_%s_%d" % (phone, int(time.time())))
                 client = await tdesk.ToTelethon(session=temp_session_name, flag=UseCurrentSession, api=API.TelegramDesktop)
             else:
                 print("⚠️ 无可用会话（缺少 session 或 tdata），放弃监听: %s" % phone)
@@ -6096,8 +6113,9 @@ class Forget2FAManager:
                         print(f"❌ [{account_name}] TData未授权或无效")
                         return None, proxy_str, False
                     
-                    # 创建临时session名称
-                    session_name = f"temp_forget2fa_{int(time.time()*1000)}"
+                    # 创建临时session名称（保存在sessions/temp目录）
+                    os.makedirs(config.SESSIONS_BAK_DIR, exist_ok=True)
+                    session_name = os.path.join(config.SESSIONS_BAK_DIR, f"temp_forget2fa_{int(time.time()*1000)}")
                     
                     # 住宅代理使用更长超时
                     timeout = config.RESIDENTIAL_PROXY_TIMEOUT if proxy_info.get('is_residential', False) else self.proxy_timeout
@@ -7193,7 +7211,7 @@ class RecoveryProtectionManager:
                                 phone = normalize_phone(match.group(1))
                             
                             # 查找转换后的session文件
-                            sessions_dir = os.path.join(os.getcwd(), "sessions")
+                            sessions_dir = config.SESSIONS_DIR
                             if not os.path.exists(sessions_dir):
                                 raise Exception("sessions目录不存在")
                             
@@ -14936,13 +14954,18 @@ def create_sample_proxy_file():
 # ================================
 
 def setup_session_directory():
-    """确保sessions目录存在并移动任何残留的session文件和JSON文件"""
+    """确保sessions目录和sessions/sessions_bak目录存在，并移动任何残留的session文件和JSON文件"""
     sessions_dir = os.path.join(os.getcwd(), "sessions")
+    sessions_bak_dir = os.path.join(sessions_dir, "sessions_bak")
     
-    # 创建sessions目录
+    # 创建sessions目录（用户上传的session文件）和sessions/sessions_bak目录（临时处理文件）
     if not os.path.exists(sessions_dir):
         os.makedirs(sessions_dir)
         print(f"📁 创建sessions目录: {sessions_dir}")
+    
+    if not os.path.exists(sessions_bak_dir):
+        os.makedirs(sessions_bak_dir)
+        print(f"📁 创建sessions/sessions_bak目录: {sessions_bak_dir}")
     
     # 移动根目录中的session文件和JSON文件到sessions目录
     moved_count = 0
