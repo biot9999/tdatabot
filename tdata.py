@@ -8438,6 +8438,16 @@ class RecoveryProtectionManager:
                     self.db.insert_recovery_log(stage_result)
                     return context
                 
+                # ===== 阶段2.5: 从旧会话踢出其他设备 =====
+                # 注意：必须在旧会话中踢出设备，因为新会话太新无法执行此操作
+                print(f"🔄 [{account_name}] 从旧会话踢出其他设备...")
+                devices_success, devices_detail = await self._stage_kick_devices(old_client, context)
+                if not devices_success:
+                    print(f"⚠️ [{account_name}] 踢出设备失败: {devices_detail}，继续执行后续流程...")
+                    # 不返回，继续执行后续流程（设备踢出失败不影响主流程）
+                else:
+                    print(f"✅ [{account_name}] 踢出设备成功: {devices_detail}")
+                
                 # ===== 阶段3+4: 请求并等待验证码 =====
                 code = await self._stage_request_and_wait_code(old_client, phone, context)
                 if not code:
@@ -8468,33 +8478,26 @@ class RecoveryProtectionManager:
                     if not pwd_success:
                         context.status = "partial"
                         context.failure_reason = "2FA密码设置失败"
-                        # 继续尝试删除其他设备
+                        # 继续执行后续流程
                 
-                # ===== 阶段7: 删除其他设备 =====
-                # 防御性检查：确保 new_client 存在
-                if not new_client:
-                    print(f"⚠️ [{account_name}] new_client 不存在，跳过删除设备")
-                    stage_result = record_stage_result(
-                        context, "remove_devices", False,
-                        error="previous_stage_failed",
-                        detail="新设备登录失败，跳过设备删除"
-                    )
-                    self.db.insert_recovery_log(stage_result)
-                    devices_success = False
-                else:
-                    devices_success = await self._stage_remove_devices(new_client, context)
+                # 设备踢出已在阶段2.5从旧会话完成，这里不再需要
+                # devices_success 变量已在阶段2.5设置
                 
                 # 最终状态判断
                 if not devices_success and pwd_success:
                     context.status = "partial"
-                    context.failure_reason = "删除其他设备失败"
+                    context.failure_reason = "从旧会话踢出其他设备失败"
                 elif not devices_success and not pwd_success:
                     context.status = "partial"
-                    context.failure_reason = "2FA密码设置和删除设备均失败"
+                    context.failure_reason = "2FA密码设置和踢出设备均失败"
                 elif pwd_success and devices_success:
                     # 所有阶段成功
                     context.status = "success"
                     context.failure_reason = ""
+                elif pwd_success and not devices_success:
+                    # 密码设置成功但设备踢出失败，仍标记为部分成功
+                    context.status = "partial"
+                    context.failure_reason = "从旧会话踢出其他设备失败"
                 
             except Exception as e:
                 context.status = "failed"
