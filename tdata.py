@@ -9169,6 +9169,25 @@ class RecoveryProtectionManager:
 class EnhancedBot:
     """增强版机器人"""
     
+    # 网络错误关键词，用于判断异常是否是网络相关的
+    NETWORK_ERROR_KEYWORDS = ['connection', 'timeout', 'reset', 'refused', 'aborted', 'urllib3', 'httperror']
+    
+    # 消息发送重试相关常量
+    MESSAGE_RETRY_MAX = 3       # 默认最大重试次数
+    MESSAGE_RETRY_BACKOFF = 2   # 指数退避基数
+    
+    def _is_network_error(self, error: Exception) -> bool:
+        """判断异常是否是网络相关的错误
+        
+        Args:
+            error: 要检查的异常
+            
+        Returns:
+            如果是网络相关错误返回 True，否则返回 False
+        """
+        error_str = str(error).lower()
+        return any(keyword in error_str for keyword in self.NETWORK_ERROR_KEYWORDS)
+    
     def __init__(self):
         print("🤖 初始化增强版机器人...")
         
@@ -9262,7 +9281,7 @@ class EnhancedBot:
         self.dp.add_handler(MessageHandler(Filters.photo, self.handle_photo))
         self.dp.add_handler(MessageHandler(Filters.text & ~Filters.command, self.handle_text))
     
-    def safe_send_message(self, update, text, parse_mode=None, reply_markup=None, max_retries=3):
+    def safe_send_message(self, update, text, parse_mode=None, reply_markup=None, max_retries=None):
         """安全发送消息（带网络错误重试机制）
         
         Args:
@@ -9270,11 +9289,14 @@ class EnhancedBot:
             text: 要发送的消息文本
             parse_mode: 解析模式（如 'HTML'）
             reply_markup: 回复键盘标记
-            max_retries: 最大重试次数（默认3次）
+            max_retries: 最大重试次数（默认使用 MESSAGE_RETRY_MAX）
             
         Returns:
             发送的消息对象，失败时返回 None
         """
+        if max_retries is None:
+            max_retries = self.MESSAGE_RETRY_MAX
+            
         last_error = None
         
         for attempt in range(max_retries):
@@ -9308,7 +9330,7 @@ class EnhancedBot:
                 # 网络错误，使用指数退避重试
                 last_error = e
                 if attempt < max_retries - 1:
-                    wait_time = 2 ** attempt  # 指数退避: 1, 2, 4 秒
+                    wait_time = self.MESSAGE_RETRY_BACKOFF ** attempt
                     print(f"⚠️ 网络错误，{wait_time}秒后重试 ({attempt + 1}/{max_retries}): {e}")
                     time.sleep(wait_time)
                     continue
@@ -9318,11 +9340,10 @@ class EnhancedBot:
                     
             except Exception as e:
                 # 检查是否是网络相关的错误（urllib3, ConnectionError等）
-                error_str = str(e).lower()
-                if any(keyword in error_str for keyword in ['connection', 'timeout', 'reset', 'refused', 'aborted', 'urllib3', 'httperror']):
+                if self._is_network_error(e):
                     last_error = e
                     if attempt < max_retries - 1:
-                        wait_time = 2 ** attempt
+                        wait_time = self.MESSAGE_RETRY_BACKOFF ** attempt
                         print(f"⚠️ 连接错误，{wait_time}秒后重试 ({attempt + 1}/{max_retries}): {e}")
                         time.sleep(wait_time)
                         continue
@@ -9339,7 +9360,7 @@ class EnhancedBot:
             print(f"❌ 发送消息失败（已重试{max_retries}次）: {last_error}")
         return None
     
-    def safe_edit_message(self, query, text, parse_mode=None, reply_markup=None, max_retries=3):
+    def safe_edit_message(self, query, text, parse_mode=None, reply_markup=None, max_retries=None):
         """安全编辑消息（带网络错误重试机制）
         
         Args:
@@ -9347,11 +9368,14 @@ class EnhancedBot:
             text: 要编辑的消息文本
             parse_mode: 解析模式（如 'HTML'）
             reply_markup: 回复键盘标记
-            max_retries: 最大重试次数（默认3次）
+            max_retries: 最大重试次数（默认使用 MESSAGE_RETRY_MAX）
             
         Returns:
             编辑后的消息对象，失败时返回 None
         """
+        if max_retries is None:
+            max_retries = self.MESSAGE_RETRY_MAX
+            
         last_error = None
         
         for attempt in range(max_retries):
@@ -9378,7 +9402,7 @@ class EnhancedBot:
                 # 网络错误，使用指数退避重试
                 last_error = e
                 if attempt < max_retries - 1:
-                    wait_time = 2 ** attempt  # 指数退避: 1, 2, 4 秒
+                    wait_time = self.MESSAGE_RETRY_BACKOFF ** attempt
                     print(f"⚠️ 网络错误，{wait_time}秒后重试 ({attempt + 1}/{max_retries}): {e}")
                     time.sleep(wait_time)
                     continue
@@ -9388,11 +9412,10 @@ class EnhancedBot:
                     
             except Exception as e:
                 # 检查是否是网络相关的错误（urllib3, ConnectionError等）
-                error_str = str(e).lower()
-                if any(keyword in error_str for keyword in ['connection', 'timeout', 'reset', 'refused', 'aborted', 'urllib3', 'httperror']):
+                if self._is_network_error(e):
                     last_error = e
                     if attempt < max_retries - 1:
-                        wait_time = 2 ** attempt
+                        wait_time = self.MESSAGE_RETRY_BACKOFF ** attempt
                         print(f"⚠️ 连接错误，{wait_time}秒后重试 ({attempt + 1}/{max_retries}): {e}")
                         time.sleep(wait_time)
                         continue
