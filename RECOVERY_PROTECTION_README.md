@@ -8,17 +8,19 @@
 
 ### 1. 自动化处理流程
 
-完整的9个处理阶段：
+完整的处理阶段：
 
-1. **预处理** - 格式识别与转换（TData → Session）
-2. **旧会话加载** - 验证session文件有效性
-3. **旧会话连接** - 使用代理重试机制连接
-4. **验证码请求** - 向新设备发送验证码
-5. **验证码获取** - 监听777000获取验证码
-6. **新设备登录** - 使用验证码登录新session
-7. **二级密码旋转** - 修改或设置2FA密码
-8. **清理旧设备** - 删除其他授权设备
-9. **结果归档** - 保存新session并分类旧session
+1. **密码输入** - 用户先发送新密码（或输入 `auto` 自动生成）
+2. **文件上传** - 上传 session 或 tdata 文件（ZIP压缩包）
+3. **格式识别** - 自动识别文件格式并转换（TData → Session）
+4. **账号连接** - 使用代理连接账号获取完整信息
+5. **密码修改** - 使用用户提供的密码修改2FA（change_password阶段）
+6. **设备清理** - 踢出所有其他设备（kick_devices阶段）
+7. **验证码请求** - 请求登录验证码
+8. **验证码获取** - 监听777000自动获取验证码
+9. **新设备登录** - 使用验证码和新密码登录新设备
+10. **验证失效** - 验证旧session是否已失效（verify_old_invalid阶段）
+11. **结果打包** - 打包成功/失败的结果文件
 
 ### 2. 智能分类系统
 
@@ -65,7 +67,7 @@ CREATE TABLE recovery_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     account_name TEXT,
     phone TEXT,
-    stage TEXT,              -- load/connect_old/connect_new/request_code/wait_code/sign_in/rotate_pwd/remove_devices/archive
+    stage TEXT,              -- load/connect_old/change_password/kick_devices/request_code/wait_code/sign_in_new/verify_old_invalid/package_result
     success INTEGER,
     error TEXT,
     detail TEXT,
@@ -97,9 +99,12 @@ CREATE TABLE recovery_summary (
 ### 通过机器人界面
 
 1. 启动机器人，点击主菜单的 **🛡️ 防止找回** 按钮
-2. 上传包含session或TData文件的ZIP压缩包
-3. 等待处理完成（可查看实时进度）
-4. 下载生成的报告和结果文件
+2. **发送新密码**（用于修改账号密码）
+   - 直接输入您想设置的密码
+   - 或发送 `auto` 使用自动生成的强密码
+3. 上传包含session或TData文件的ZIP压缩包
+4. 等待处理完成（可查看实时进度）
+5. 下载生成的报告和结果文件
 
 ### 进度显示
 
@@ -144,10 +149,11 @@ account2.session,+9876543210,timeout,等待验证码超时,Local(1.2s),,305.2s
 主要方法：
 
 ```python
-# 批量运行防止找回
+# 批量运行防止找回（支持用户自定义密码）
 async def run_batch(
     files: List[Tuple[str, str]], 
-    progress_callback=None
+    progress_callback=None,
+    user_password: str = ""  # 用户提供的新密码，为空则自动生成
 ) -> Dict
 
 # 生成报告文件
@@ -170,6 +176,47 @@ async def wait_for_code(
 async def remove_other_devices(
     client: TelegramClient
 ) -> Tuple[bool, str]
+
+# 修改密码（新增）
+async def _stage_change_password(
+    client: TelegramClient,
+    context: RecoveryAccountContext
+) -> Tuple[bool, str]
+
+# 踢出其他设备（新增）
+async def _stage_kick_devices(
+    client: TelegramClient,
+    context: RecoveryAccountContext
+) -> Tuple[bool, str]
+
+# 验证旧会话失效（新增）
+async def _stage_verify_old_invalid(
+    old_session_path: str,
+    context: RecoveryAccountContext
+) -> Tuple[bool, str]
+```
+
+### RecoveryAccountContext 数据类
+
+```python
+@dataclass
+class RecoveryAccountContext:
+    original_path: str           # 原始文件路径
+    old_session_path: str        # 旧session路径
+    new_session_path: str        # 新session路径
+    phone: str                   # 手机号
+    proxy_used: str = ""         # 使用的代理
+    new_password_masked: str = "" # 脱敏后的密码
+    status: str = "pending"      # 状态: success/failed/abnormal/timeout/partial
+    failure_reason: str = ""     # 失败原因
+    
+    # 新增字段
+    user_provided_password: str = ""  # 用户提供的新密码
+    old_device_info: Dict = {}        # 旧设备信息
+    new_device_info: Dict = {}        # 新设备信息
+    verification_code: str = ""       # 获取到的验证码
+    code_wait_time: float = 0.0       # 等待验证码的时间
+    old_session_valid: bool = True    # 旧会话是否仍有效
 ```
 
 ## 安全特性
@@ -179,6 +226,7 @@ async def remove_other_devices(
 - 确保包含大小写字母、数字和特殊字符
 - 脱敏显示（仅显示前3位和后3位）
 - 完整密码不存储到数据库
+- 支持用户自定义密码
 
 ### 2. 代理支持
 - 自动代理重试机制
