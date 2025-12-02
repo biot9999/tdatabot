@@ -7186,10 +7186,14 @@ class RecoveryProtectionManager:
                 temp_session_name = f"temp_code_request_{phone_normalized.lstrip('+')}_{timestamp}"
                 temp_session_path = os.path.join(config.RECOVERY_SAFE_DIR, temp_session_name)
                 
+                # 确保API_ID和API_HASH类型正确
+                api_id = int(config.API_ID)
+                api_hash = str(config.API_HASH)
+                
                 temp_client = TelegramClient(
                     temp_session_path,
-                    config.API_ID,
-                    config.API_HASH,
+                    api_id,
+                    api_hash,
                     device_model=device_model,
                     system_version=system_version,
                     app_version=app_version,
@@ -12553,7 +12557,12 @@ class EnhancedBot:
             counters = report_data['counters']
             
             # 生成报告
-            txt_path, csv_path, success_zip_path, failed_zip_path, all_zip_path = self.recovery_manager.generate_reports(report_data)
+            report_files = self.recovery_manager.generate_reports(report_data)
+            txt_path = report_files.summary_txt
+            csv_path = report_files.detail_csv
+            success_zip_path = report_files.success_zip
+            failed_zip_path = report_files.failed_zip
+            all_zip_path = report_files.all_archives_zip
             
             # 发送结果
             elapsed = time.time() - start_time
