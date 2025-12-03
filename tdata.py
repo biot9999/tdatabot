@@ -7795,8 +7795,8 @@ class RecoveryProtectionManager:
                 return True, "旧会话已失效"
                 
             except Exception as e:
-                # 其他异常可能也表示失效
-                context.old_session_valid = False
+                # 其他异常 - 无法确定旧会话状态，保守起见视为仍有效
+                context.old_session_valid = True
                 try:
                     await old_client.disconnect()
                 except Exception:
@@ -7805,28 +7805,30 @@ class RecoveryProtectionManager:
                     account_name=account_name,
                     phone=context.phone,
                     stage="verify_old_invalid",
-                    success=True,
-                    detail=f"旧会话可能已失效: {str(e)[:50]}",
+                    success=False,
+                    error=f"无法确认旧会话状态: {str(e)[:50]}",
+                    detail="无法验证旧会话是否失效",
                     elapsed=time.time() - stage_start
                 )
                 context.stage_results.append(stage_result)
                 self.db.insert_recovery_log(stage_result)
-                return True, "旧会话可能已失效"
+                return False, f"无法确认旧会话状态: {str(e)[:50]}"
                 
         except Exception as e:
-            # 无法验证，假设失效
-            context.old_session_valid = False
+            # 无法验证 - 保守起见视为仍有效（不能假设成功）
+            context.old_session_valid = True
             stage_result = RecoveryStageResult(
                 account_name=account_name,
                 phone=context.phone,
                 stage="verify_old_invalid",
-                success=True,
-                detail=f"无法验证旧会话状态: {str(e)[:50]}",
+                success=False,
+                error=f"验证失败: {str(e)[:50]}",
+                detail="无法验证旧会话状态",
                 elapsed=time.time() - stage_start
             )
             context.stage_results.append(stage_result)
             self.db.insert_recovery_log(stage_result)
-            return True, "无法验证（假设已失效）"
+            return False, f"验证失败: {str(e)[:50]}"
     
     async def _stage_request_and_wait_code(self, old_client: TelegramClient, phone: str, context: RecoveryAccountContext) -> Optional[str]:
         """阶段3+4: 请求并等待验证码（带详细日志和重试机制）
