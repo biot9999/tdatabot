@@ -7795,8 +7795,8 @@ class RecoveryProtectionManager:
                 return True, "旧会话已失效"
                 
             except Exception as e:
-                # 其他异常可能也表示失效
-                context.old_session_valid = False
+                # 其他异常 - 无法确定旧会话状态，保守起见视为仍有效
+                context.old_session_valid = True
                 try:
                     await old_client.disconnect()
                 except Exception:
@@ -7805,28 +7805,30 @@ class RecoveryProtectionManager:
                     account_name=account_name,
                     phone=context.phone,
                     stage="verify_old_invalid",
-                    success=True,
-                    detail=f"旧会话可能已失效: {str(e)[:50]}",
+                    success=False,
+                    error=f"无法确认旧会话状态: {str(e)[:50]}",
+                    detail="无法验证旧会话是否失效",
                     elapsed=time.time() - stage_start
                 )
                 context.stage_results.append(stage_result)
                 self.db.insert_recovery_log(stage_result)
-                return True, "旧会话可能已失效"
+                return False, f"无法确认旧会话状态: {str(e)[:50]}"
                 
         except Exception as e:
-            # 无法验证，假设失效
-            context.old_session_valid = False
+            # 无法验证 - 保守起见视为仍有效（不能假设成功）
+            context.old_session_valid = True
             stage_result = RecoveryStageResult(
                 account_name=account_name,
                 phone=context.phone,
                 stage="verify_old_invalid",
-                success=True,
-                detail=f"无法验证旧会话状态: {str(e)[:50]}",
+                success=False,
+                error=f"验证失败: {str(e)[:50]}",
+                detail="无法验证旧会话状态",
                 elapsed=time.time() - stage_start
             )
             context.stage_results.append(stage_result)
             self.db.insert_recovery_log(stage_result)
-            return True, "无法验证（假设已失效）"
+            return False, f"验证失败: {str(e)[:50]}"
     
     async def _stage_request_and_wait_code(self, old_client: TelegramClient, phone: str, context: RecoveryAccountContext) -> Optional[str]:
         """阶段3+4: 请求并等待验证码（带详细日志和重试机制）
@@ -7864,6 +7866,12 @@ class RecoveryProtectionManager:
         
         # 获取随机设备信息
         device_model, system_version, app_version = self._get_random_device_info()
+        
+        # 始终显示设备参数（无论DEBUG_RECOVERY是否开启）
+        print(f"📱 [{account_name}] 新设备参数:")
+        print(f"   • 设备型号: {device_model}")
+        print(f"   • 系统版本: {system_version}")
+        print(f"   • 应用版本: {app_version}")
         
         for retry in range(config.RECOVERY_CODE_REQUEST_RETRIES + 1):
             try:
@@ -9052,15 +9060,20 @@ class RecoveryProtectionManager:
                     context.old_session_valid = True
                 
                 # 最终状态判断
-                if pwd_success and sign_in_success:
+                # 成功条件：密码修改成功 + 新设备登录成功 + 旧设备确认失效
+                # 如果旧设备踢出失败或会话终止失败，均视为授权失败
+                if not pwd_success or not sign_in_success:
+                    # 密码修改失败或新设备登录失败
+                    context.status = "failed"
+                    context.failure_reason = "密码修改或新设备登录失败"
+                elif context.old_session_valid:
+                    # 旧设备仍有效 - 归类为失败（授权失败）
+                    context.status = "failed"
+                    context.failure_reason = "旧设备踢出失败: 旧会话仍然有效"
+                else:
+                    # 只有确认旧设备失效才算完全成功
                     context.status = "success"
                     context.failure_reason = ""
-                    if not devices_success:
-                        context.status = "partial"
-                        context.failure_reason = "踢出其他设备失败，但密码已修改且新设备已登录"
-                else:
-                    context.status = "partial"
-                    context.failure_reason = "部分步骤失败"
                 
             except Exception as e:
                 context.status = "failed"
@@ -9217,18 +9230,23 @@ class RecoveryProtectionManager:
             return "密码错误"
         
         # 3. 会话太新 (Session Too New)
+        # 包括 "session is too new and cannot be used to reset other authorisations"
         session_new_keywords = [
             'fresh_reset', 'session too new', '会话太新', 
             'authorization_forbidden', 'fresh_change_phone_forbidden',
-            'fresh_change_admins_forbidden'
+            'fresh_change_admins_forbidden',
+            'too new and cannot be used to reset',
+            'cannot be used to reset other authorisations'
         ]
         if any(keyword in combined_text for keyword in session_new_keywords):
             return "会话太新"
         
         # 4. 冻结 (Frozen)
+        # 包括 FROZEN_METHOD_INVALID 错误
         frozen_keywords = [
             'frozen', 'freeze', '冻结', 'suspended', 'temporarily limited',
-            'account is limited', 'limited until'
+            'account is limited', 'limited until',
+            'frozen_method_invalid', 'frozen method invalid'
         ]
         if any(keyword in combined_text for keyword in frozen_keywords):
             return "冻结"
@@ -9285,8 +9303,7 @@ class RecoveryProtectionManager:
             f.write(f"成功: {counters['success']} ({counters['success']/counters['total']*100:.1f}%)\n")
             f.write(f"失败: {counters['failed']} ({counters['failed']/counters['total']*100:.1f}%)\n")
             f.write(f"异常: {counters['abnormal']} ({counters['abnormal']/counters['total']*100:.1f}%)\n")
-            f.write(f"超时: {counters['code_timeout']} ({counters['code_timeout']/counters['total']*100:.1f}%)\n")
-            f.write(f"部分: {counters['partial']} ({counters['partial']/counters['total']*100:.1f}%)\n\n")
+            f.write(f"超时: {counters['code_timeout']} ({counters['code_timeout']/counters['total']*100:.1f}%)\n\n")
             
             # 阶段统计
             if stage_stats:
@@ -9308,43 +9325,6 @@ class RecoveryProtectionManager:
                     f.write(f"{count:3d}x - {error_key}\n")
                 f.write("\n")
         
-        # CSV详细报告（账号级别）
-        csv_path = os.path.join(config.RECOVERY_REPORTS_DIR, f"batch_{batch_id}_detail.csv")
-        with open(csv_path, 'w', encoding='utf-8', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(['账号', '手机号', '状态', '失败原因', '代理', '密码(脱敏)', '总耗时'])
-            
-            for ctx in contexts:
-                total_time = sum(s.elapsed for s in ctx.stage_results)
-                writer.writerow([
-                    os.path.basename(ctx.original_path),
-                    ctx.phone,
-                    ctx.status,
-                    ctx.failure_reason,
-                    ctx.proxy_used,
-                    ctx.new_password_masked,
-                    f"{total_time:.2f}s"
-                ])
-        
-        # CSV阶段级别报告（新增）
-        csv_stages_path = os.path.join(config.RECOVERY_REPORTS_DIR, f"batch_{batch_id}_stages.csv")
-        with open(csv_stages_path, 'w', encoding='utf-8', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(['账号', '手机号', '阶段', '成功', '错误', '详细信息', '耗时(ms)'])
-            
-            for ctx in contexts:
-                account_name = os.path.basename(ctx.original_path)
-                for stage_result in ctx.stage_results:
-                    writer.writerow([
-                        account_name,
-                        stage_result.phone,
-                        stage_result.stage,
-                        '是' if stage_result.success else '否',
-                        stage_result.error[:100] if stage_result.error else '',
-                        stage_result.detail[:200] if stage_result.detail else '',
-                        f"{stage_result.elapsed * 1000:.0f}"  # 转换为毫秒
-                    ])
-        
         # 移动文件到对应目录并复制新session文件
         for ctx in contexts:
             if not ctx.original_path or not os.path.exists(ctx.original_path):
@@ -9357,9 +9337,8 @@ class RecoveryProtectionManager:
                 target_dir = config.RECOVERY_ABNORMAL_DIR
             elif ctx.status == "timeout":
                 target_dir = config.RECOVERY_TIMEOUT_DIR
-            elif ctx.status == "partial":
-                target_dir = config.RECOVERY_PARTIAL_DIR
             else:
+                # 所有其他状态（包括failed）都归入失败目录
                 target_dir = config.RECOVERY_FAILED_DIR
             
             # 移动旧session文件及相关JSON文件
@@ -9455,7 +9434,16 @@ class RecoveryProtectionManager:
                     phone = ctx.phone if ctx.phone and ctx.phone != "unknown" else "unknown"
                     phone_clean = phone.lstrip('+').replace(' ', '')
                     
-                    success_txt += f"• {phone} - 密码: {ctx.new_password_masked}\n"
+                    success_txt += f"\n• {phone}\n"
+                    success_txt += f"  密码: {ctx.new_password_masked}\n"
+                    success_txt += f"  代理: {ctx.proxy_used or '本地连接'}\n"
+                    
+                    # 显示设备参数
+                    if ctx.new_device_info:
+                        device_info = ctx.new_device_info
+                        success_txt += f"  设备型号: {device_info.get('device_model', '未知')}\n"
+                        success_txt += f"  系统版本: {device_info.get('system_version', '未知')}\n"
+                        success_txt += f"  应用版本: {device_info.get('app_version', '未知')}\n"
                     
                     # 检查原始文件类型
                     original_path = ctx.original_path
@@ -9567,8 +9555,16 @@ class RecoveryProtectionManager:
                         failure_txt += f"最终状态: {ctx.status}\n"
                         failure_txt += f"失败分类: {category}\n"
                         failure_txt += f"失败原因: {ctx.failure_reason}\n"
-                        failure_txt += f"代理使用: {ctx.proxy_used}\n\n"
-                        failure_txt += "处理阶段详情:\n"
+                        failure_txt += f"代理使用: {ctx.proxy_used or '本地连接'}\n"
+                        
+                        # 显示设备参数
+                        if ctx.new_device_info:
+                            device_info = ctx.new_device_info
+                            failure_txt += f"设备型号: {device_info.get('device_model', '未知')}\n"
+                            failure_txt += f"系统版本: {device_info.get('system_version', '未知')}\n"
+                            failure_txt += f"应用版本: {device_info.get('app_version', '未知')}\n"
+                        
+                        failure_txt += "\n处理阶段详情:\n"
                         failure_txt += "=" * 50 + "\n"
                         
                         for stage_result in ctx.stage_results:
@@ -9629,18 +9625,15 @@ class RecoveryProtectionManager:
         # 创建完整归档ZIP（包含所有分类）
         all_zip_path = os.path.join(config.RECOVERY_REPORTS_DIR, f"batch_{batch_id}_all_archives.zip")
         with zipfile.ZipFile(all_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-            # 添加报告文件
+            # 添加报告文件（仅TXT汇总报告）
             zf.write(txt_path, os.path.basename(txt_path))
-            zf.write(csv_path, os.path.basename(csv_path))
-            zf.write(csv_stages_path, os.path.basename(csv_stages_path))
             
             # 添加各分类目录（如果有文件）
             for dir_name, dir_path in [
                 ('safe_sessions', config.RECOVERY_SAFE_DIR),
                 ('abnormal', config.RECOVERY_ABNORMAL_DIR),
                 ('code_timeout', config.RECOVERY_TIMEOUT_DIR),
-                ('failed', config.RECOVERY_FAILED_DIR),
-                ('partial', config.RECOVERY_PARTIAL_DIR)
+                ('failed', config.RECOVERY_FAILED_DIR)
             ]:
                 if os.path.exists(dir_path):
                     for root, dirs, files in os.walk(dir_path):
@@ -9651,8 +9644,8 @@ class RecoveryProtectionManager:
         
         return RecoveryReportFiles(
             summary_txt=txt_path,
-            detail_csv=csv_path,
-            stages_csv=csv_stages_path,
+            detail_csv=None,  # CSV报告已取消
+            stages_csv=None,  # CSV报告已取消
             success_zip=success_zip_path,
             failed_zip=failed_zip_path,
             all_archives_zip=all_zip_path
@@ -11094,6 +11087,10 @@ class EnhancedBot:
             self.handle_change_2fa(query)
         elif data == "prevent_recovery":
             self.handle_prevent_recovery(query)
+        elif data == "recovery_oldpwd_auto":
+            self.handle_recovery_oldpwd_mode(query, "auto")
+        elif data == "recovery_oldpwd_manual":
+            self.handle_recovery_oldpwd_mode(query, "manual")
         elif data == "forget_2fa":
             self.handle_forget_2fa(query)
         elif data == "convert_tdata_to_session":
@@ -11452,7 +11449,7 @@ class EnhancedBot:
                          query.from_user.first_name or "", "waiting_2fa_file")
     
     def handle_prevent_recovery(self, query):
-        """处理防止找回 - 第一步：请求用户输入新密码"""
+        """处理防止找回 - 第一步：选择旧密码模式"""
         query.answer()
         user_id = query.from_user.id
         
@@ -11479,15 +11476,16 @@ class EnhancedBot:
 此工具帮助号商快速将账号安全迁移并加固，降低被原持有人找回风险。
 
 <b>🔄 完整流程</b>
-1. 📝 您先发送新密码（用于修改账号密码）
-2. 📦 然后上传 TData 或 Session 文件（ZIP格式）
-3. 🔍 系统自动识别格式并连接账号
-4. 🔐 使用您提供的密码修改账号2FA
-5. 📱 踢出所有其他设备
-6. 🔑 请求登录验证码（自动获取）
-7. 📲 登录新设备并生成新session
-8. 🚫 旧session自动失效
-9. ✅ 打包新session返回给您
+1. 📝 选择旧密码获取方式
+2. 📝 发送新密码（用于修改账号密码）
+3. 📦 上传 TData 或 Session 文件（ZIP格式）
+4. 🔍 系统自动识别格式并连接账号
+5. 🔐 使用旧密码验证后修改为新密码
+6. 📱 踢出所有其他设备
+7. 🔑 请求登录验证码（自动获取）
+8. 📲 登录新设备并生成新session
+9. 🚫 旧session自动失效
+10. ✅ 打包新session返回给您
 
 <b>📊 输出结果</b>
 • 成功：新session文件 + 账号信息JSON
@@ -11499,13 +11497,64 @@ class EnhancedBot:
 • 代理模式: {'🟢启用' if config.RECOVERY_ENABLE_PROXY else '🔴禁用'}
 • 可用代理: {proxy_count} 个
 {proxy_warning}
-<b>⚠️ 注意事项</b>
-• 确保账号已登录且session文件有效
-• 需要能够接收 777000 的验证码
-• 建议使用代理以避免频率限制
-• 处理时间较长，请耐心等待
+<b>📝 第一步：请选择旧密码获取方式</b>
 
-<b>📝 第一步：请发送新密码</b>
+• <b>自动识别</b>: 从上传的文件中自动检测旧密码
+• <b>手动输入</b>: 您手动输入旧密码（所有账号使用相同旧密码）
+        """
+        
+        keyboard = [
+            [
+                InlineKeyboardButton("📁 自动从文件识别", callback_data="recovery_oldpwd_auto"),
+                InlineKeyboardButton("🔐 手动输入旧密码", callback_data="recovery_oldpwd_manual")
+            ],
+            [InlineKeyboardButton("🔙 返回", callback_data="main_menu")]
+        ]
+        
+        self.safe_edit_message(query, text, 'HTML', InlineKeyboardMarkup(keyboard))
+    
+    def handle_recovery_oldpwd_mode(self, query, mode: str):
+        """处理旧密码模式选择后，进入新密码输入步骤"""
+        query.answer()
+        user_id = query.from_user.id
+        
+        # 初始化待处理任务
+        self.pending_recovery_tasks[user_id] = {
+            'step': 'waiting_password',
+            'password': '',
+            'old_password': '',
+            'old_pwd_mode': mode,  # 'auto' 或 'manual'
+            'started_at': time.time(),
+            'files': [],
+            'file_type': '',
+            'temp_dir': ''
+        }
+        
+        if mode == 'manual':
+            # 手动模式：先输入旧密码
+            text = """
+🔐 <b>第一步：请发送旧密码</b>
+
+请发送账号当前使用的2FA旧密码
+
+• 如果有多个旧密码，请用 <code>|</code> 分隔
+• 例如: <code>password1|password2|password3</code>
+
+⚠️ 此密码用于验证账号身份，将应用于所有上传的账号
+
+⏰ <i>5分钟内未输入将自动取消</i>
+            """
+            self.safe_edit_message(query, text, 'HTML')
+            self.db.save_user(user_id, query.from_user.username or "", 
+                             query.from_user.first_name or "", "waiting_recovery_old_password")
+        else:
+            # 自动模式：直接进入新密码输入
+            self._show_new_password_prompt(query, user_id)
+    
+    def _show_new_password_prompt(self, query, user_id: int):
+        """显示新密码输入提示"""
+        text = """
+📝 <b>请发送新密码</b>
 
 请直接发送您想设置的新密码（用于修改账号二级验证密码）
 • 密码长度建议 8-20 位
@@ -11517,17 +11566,7 @@ class EnhancedBot:
         
         self.safe_edit_message(query, text, 'HTML')
         
-        # 初始化待处理任务
-        self.pending_recovery_tasks[user_id] = {
-            'step': 'waiting_password',
-            'password': '',
-            'started_at': time.time(),
-            'files': [],
-            'file_type': '',
-            'temp_dir': ''
-        }
-        
-        # 设置用户状态 - 等待输入密码
+        # 设置用户状态 - 等待输入新密码
         self.db.save_user(user_id, query.from_user.username or "", 
                          query.from_user.first_name or "", "waiting_recovery_password")
     
@@ -13454,6 +13493,10 @@ class EnhancedBot:
                 elif user_status == "waiting_recovery_password":
                     self.handle_recovery_password_input(update, context, user_id, text)
                     return
+                # 防止找回旧密码输入（手动模式）
+                elif user_status == "waiting_recovery_old_password":
+                    self.handle_recovery_old_password_input(update, context, user_id, text)
+                    return
                 # VIP会员相关状态
                 elif user_status == "waiting_redeem_code":
                     self.handle_redeem_code_input(update, user_id, text)
@@ -13764,6 +13807,66 @@ class EnhancedBot:
             [InlineKeyboardButton("◀️ 返回", callback_data="classify_menu")]
         ])
     
+    def handle_recovery_old_password_input(self, update: Update, context: CallbackContext, user_id: int, text: str):
+        """处理防止找回旧密码输入（手动模式）"""
+        if user_id not in self.pending_recovery_tasks:
+            self.safe_send_message(update, "❌ 没有待处理的防止找回任务，请重新开始")
+            return
+        
+        task = self.pending_recovery_tasks[user_id]
+        
+        # 检查超时（5分钟）
+        if time.time() - task['started_at'] > 300:
+            del self.pending_recovery_tasks[user_id]
+            self.db.save_user(user_id, "", "", "")
+            self.safe_send_message(update, "❌ 操作超时，请重新开始")
+            return
+        
+        # 验证旧密码
+        old_password = text.strip()
+        
+        if not old_password:
+            self.safe_send_message(update, "❌ 旧密码不能为空，请重新输入")
+            return
+        
+        # 保存旧密码到任务
+        task['old_password'] = old_password
+        
+        # 计算密码数量（支持|分隔）
+        pwd_count = len([p for p in old_password.split('|') if p.strip()])
+        
+        self.safe_send_message(
+            update,
+            f"✅ <b>旧密码已接收</b>\n\n"
+            f"共 {pwd_count} 个密码\n\n"
+            f"继续下一步...",
+            'HTML'
+        )
+        
+        # 显示新密码输入提示
+        self.safe_send_message(
+            update,
+            """
+📝 <b>请发送新密码</b>
+
+请直接发送您想设置的新密码（用于修改账号二级验证密码）
+• 密码长度建议 8-20 位
+• 包含大小写字母、数字和特殊字符更安全
+• 或发送 <code>auto</code> 使用自动生成的强密码
+
+⏰ <i>5分钟内未输入将自动取消</i>
+            """,
+            'HTML'
+        )
+        
+        # 更新用户状态 - 等待输入新密码
+        self.db.save_user(
+            user_id,
+            update.effective_user.username or "",
+            update.effective_user.first_name or "",
+            "waiting_recovery_password"
+        )
+    
     def handle_recovery_password_input(self, update: Update, context: CallbackContext, user_id: int, text: str):
         """处理防止找回密码输入"""
         if user_id not in self.pending_recovery_tasks:
@@ -13843,9 +13946,13 @@ class EnhancedBot:
         
         # 获取用户提供的密码
         user_password = ""
+        user_old_password = ""
+        old_pwd_mode = "auto"
         if user_id in self.pending_recovery_tasks:
             task = self.pending_recovery_tasks[user_id]
             user_password = task.get('password', '')
+            user_old_password = task.get('old_password', '')
+            old_pwd_mode = task.get('old_pwd_mode', 'auto')
             # 检查任务超时
             if time.time() - task.get('started_at', 0) > 300:
                 del self.pending_recovery_tasks[user_id]
@@ -13882,9 +13989,16 @@ class EnhancedBot:
             password_info = ""
             if user_password:
                 masked_pwd = self.recovery_manager.mask_password(user_password)
-                password_info = f"🔐 密码: {masked_pwd}\n"
+                password_info = f"🔐 新密码: {masked_pwd}\n"
             else:
-                password_info = "🔐 密码: 自动生成\n"
+                password_info = "🔐 新密码: 自动生成\n"
+            
+            # 显示旧密码模式
+            if old_pwd_mode == 'manual' and user_old_password:
+                pwd_count = len([p for p in user_old_password.split('|') if p.strip()])
+                password_info += f"🔑 旧密码: 手动输入 ({pwd_count}个)\n"
+            else:
+                password_info += "🔑 旧密码: 自动识别\n"
             
             # 更新进度消息
             try:
@@ -13924,8 +14038,7 @@ class EnhancedBot:
                             f"成功: {stats.get('success', 0) if stats else 0} | "
                             f"失败: {stats.get('failed', 0) if stats else 0} | "
                             f"超时: {stats.get('code_timeout', 0) if stats else 0} | "
-                            f"异常: {stats.get('abnormal', 0) if stats else 0} | "
-                            f"部分: {stats.get('partial', 0) if stats else 0}\n"
+                            f"异常: {stats.get('abnormal', 0) if stats else 0}\n"
                             f"平均耗时: {avg_time:.1f}s\n\n"
                             f"⏳ 请稍候...",
                             parse_mode='HTML'
@@ -13934,8 +14047,8 @@ class EnhancedBot:
                     except:
                         pass
             
-            # 运行真实的批量处理（传入用户密码）
-            report_data = await self.recovery_manager.run_batch(file_list, progress_callback, user_password)
+            # 运行真实的批量处理（传入用户密码和旧密码）
+            report_data = await self.recovery_manager.run_batch(file_list, progress_callback, user_password, user_old_password)
             
             batch_id = report_data['batch_id']
             counters = report_data['counters']
@@ -13960,7 +14073,6 @@ class EnhancedBot:
 • 失败: {counters['failed']}
 • 异常: {counters['abnormal']}
 • 超时: {counters['code_timeout']}
-• 部分: {counters['partial']}
 
 ⏱️ <b>耗时</b>
 • 总耗时: {elapsed:.1f}秒
@@ -13988,17 +14100,7 @@ class EnhancedBot:
             except Exception as e:
                 print(f"发送TXT报告失败: {e}")
             
-            try:
-                if os.path.exists(csv_path):
-                    with open(csv_path, 'rb') as f:
-                        context.bot.send_document(
-                            chat_id=user_id,
-                            document=f,
-                            filename=os.path.basename(csv_path),
-                            caption=f"📊 防止找回详细报告 (批次 {batch_id})"
-                        )
-            except Exception as e:
-                print(f"发送CSV报告失败: {e}")
+            # CSV报告已取消，不再发送
             
             # 发送成功账号ZIP（仅在存在时发送）
             try:
@@ -14026,19 +14128,6 @@ class EnhancedBot:
                         )
             except Exception as e:
                 print(f"发送失败ZIP失败: {e}")
-            
-            # 发送完整归档ZIP（可选，只在有部分成功时发送）
-            try:
-                if os.path.exists(all_zip_path) and counters['partial'] > 0:
-                    with open(all_zip_path, 'rb') as f:
-                        context.bot.send_document(
-                            chat_id=user_id,
-                            document=f,
-                            filename=os.path.basename(all_zip_path),
-                            caption=f"📦 完整归档 (批次 {batch_id}) - 包含所有分类"
-                        )
-            except Exception as e:
-                print(f"发送完整归档ZIP失败: {e}")
             
         except Exception as e:
             print(f"防止找回处理异常: {e}")
