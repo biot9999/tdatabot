@@ -7865,6 +7865,12 @@ class RecoveryProtectionManager:
         # 获取随机设备信息
         device_model, system_version, app_version = self._get_random_device_info()
         
+        # 始终显示设备参数（无论DEBUG_RECOVERY是否开启）
+        print(f"📱 [{account_name}] 新设备参数:")
+        print(f"   • 设备型号: {device_model}")
+        print(f"   • 系统版本: {system_version}")
+        print(f"   • 应用版本: {app_version}")
+        
         for retry in range(config.RECOVERY_CODE_REQUEST_RETRIES + 1):
             try:
                 if config.DEBUG_RECOVERY:
@@ -9054,21 +9060,18 @@ class RecoveryProtectionManager:
                 # 最终状态判断
                 # 成功条件：密码修改成功 + 新设备登录成功 + 旧设备确认失效
                 # 如果旧设备踢出失败或会话终止失败，均视为授权失败
-                if pwd_success and sign_in_success and not context.old_session_valid:
-                    # 只有确认旧设备失效才算完全成功
-                    context.status = "success"
-                    context.failure_reason = ""
-                elif pwd_success and sign_in_success and context.old_session_valid:
+                if not pwd_success or not sign_in_success:
+                    # 密码修改失败或新设备登录失败
+                    context.status = "failed"
+                    context.failure_reason = "密码修改或新设备登录失败"
+                elif context.old_session_valid:
                     # 旧设备仍有效 - 归类为失败（授权失败）
                     context.status = "failed"
                     context.failure_reason = "旧设备踢出失败: 旧会话仍然有效"
-                elif not devices_success:
-                    # 踢出设备失败 - 归类为失败（授权失败）
-                    context.status = "failed"
-                    context.failure_reason = "踢出其他设备失败"
                 else:
-                    context.status = "failed"
-                    context.failure_reason = "部分步骤失败"
+                    # 只有确认旧设备失效才算完全成功
+                    context.status = "success"
+                    context.failure_reason = ""
                 
             except Exception as e:
                 context.status = "failed"
@@ -9231,8 +9234,7 @@ class RecoveryProtectionManager:
             'authorization_forbidden', 'fresh_change_phone_forbidden',
             'fresh_change_admins_forbidden',
             'too new and cannot be used to reset',
-            'cannot be used to reset other authorisations',
-            '旧设备踢出失败', '旧会话仍然有效'
+            'cannot be used to reset other authorisations'
         ]
         if any(keyword in combined_text for keyword in session_new_keywords):
             return "会话太新"
@@ -9299,8 +9301,7 @@ class RecoveryProtectionManager:
             f.write(f"成功: {counters['success']} ({counters['success']/counters['total']*100:.1f}%)\n")
             f.write(f"失败: {counters['failed']} ({counters['failed']/counters['total']*100:.1f}%)\n")
             f.write(f"异常: {counters['abnormal']} ({counters['abnormal']/counters['total']*100:.1f}%)\n")
-            f.write(f"超时: {counters['code_timeout']} ({counters['code_timeout']/counters['total']*100:.1f}%)\n")
-            f.write(f"部分: {counters['partial']} ({counters['partial']/counters['total']*100:.1f}%)\n\n")
+            f.write(f"超时: {counters['code_timeout']} ({counters['code_timeout']/counters['total']*100:.1f}%)\n\n")
             
             # 阶段统计
             if stage_stats:
@@ -9322,10 +9323,6 @@ class RecoveryProtectionManager:
                     f.write(f"{count:3d}x - {error_key}\n")
                 f.write("\n")
         
-        # CSV报告已取消，设置为空路径
-        csv_path = ""
-        csv_stages_path = ""
-        
         # 移动文件到对应目录并复制新session文件
         for ctx in contexts:
             if not ctx.original_path or not os.path.exists(ctx.original_path):
@@ -9338,9 +9335,8 @@ class RecoveryProtectionManager:
                 target_dir = config.RECOVERY_ABNORMAL_DIR
             elif ctx.status == "timeout":
                 target_dir = config.RECOVERY_TIMEOUT_DIR
-            elif ctx.status == "partial":
-                target_dir = config.RECOVERY_PARTIAL_DIR
             else:
+                # 所有其他状态（包括failed）都归入失败目录
                 target_dir = config.RECOVERY_FAILED_DIR
             
             # 移动旧session文件及相关JSON文件
@@ -9436,7 +9432,16 @@ class RecoveryProtectionManager:
                     phone = ctx.phone if ctx.phone and ctx.phone != "unknown" else "unknown"
                     phone_clean = phone.lstrip('+').replace(' ', '')
                     
-                    success_txt += f"• {phone} - 密码: {ctx.new_password_masked}\n"
+                    success_txt += f"\n• {phone}\n"
+                    success_txt += f"  密码: {ctx.new_password_masked}\n"
+                    success_txt += f"  代理: {ctx.proxy_used or '本地连接'}\n"
+                    
+                    # 显示设备参数
+                    if ctx.new_device_info:
+                        device_info = ctx.new_device_info
+                        success_txt += f"  设备型号: {device_info.get('device_model', '未知')}\n"
+                        success_txt += f"  系统版本: {device_info.get('system_version', '未知')}\n"
+                        success_txt += f"  应用版本: {device_info.get('app_version', '未知')}\n"
                     
                     # 检查原始文件类型
                     original_path = ctx.original_path
@@ -9548,8 +9553,16 @@ class RecoveryProtectionManager:
                         failure_txt += f"最终状态: {ctx.status}\n"
                         failure_txt += f"失败分类: {category}\n"
                         failure_txt += f"失败原因: {ctx.failure_reason}\n"
-                        failure_txt += f"代理使用: {ctx.proxy_used}\n\n"
-                        failure_txt += "处理阶段详情:\n"
+                        failure_txt += f"代理使用: {ctx.proxy_used or '本地连接'}\n"
+                        
+                        # 显示设备参数
+                        if ctx.new_device_info:
+                            device_info = ctx.new_device_info
+                            failure_txt += f"设备型号: {device_info.get('device_model', '未知')}\n"
+                            failure_txt += f"系统版本: {device_info.get('system_version', '未知')}\n"
+                            failure_txt += f"应用版本: {device_info.get('app_version', '未知')}\n"
+                        
+                        failure_txt += "\n处理阶段详情:\n"
                         failure_txt += "=" * 50 + "\n"
                         
                         for stage_result in ctx.stage_results:
@@ -9618,8 +9631,7 @@ class RecoveryProtectionManager:
                 ('safe_sessions', config.RECOVERY_SAFE_DIR),
                 ('abnormal', config.RECOVERY_ABNORMAL_DIR),
                 ('code_timeout', config.RECOVERY_TIMEOUT_DIR),
-                ('failed', config.RECOVERY_FAILED_DIR),
-                ('partial', config.RECOVERY_PARTIAL_DIR)
+                ('failed', config.RECOVERY_FAILED_DIR)
             ]:
                 if os.path.exists(dir_path):
                     for root, dirs, files in os.walk(dir_path):
@@ -9630,8 +9642,8 @@ class RecoveryProtectionManager:
         
         return RecoveryReportFiles(
             summary_txt=txt_path,
-            detail_csv=csv_path,
-            stages_csv=csv_stages_path,
+            detail_csv="",
+            stages_csv="",
             success_zip=success_zip_path,
             failed_zip=failed_zip_path,
             all_archives_zip=all_zip_path
@@ -13939,7 +13951,6 @@ class EnhancedBot:
 • 失败: {counters['failed']}
 • 异常: {counters['abnormal']}
 • 超时: {counters['code_timeout']}
-• 部分: {counters['partial']}
 
 ⏱️ <b>耗时</b>
 • 总耗时: {elapsed:.1f}秒
@@ -13995,19 +14006,6 @@ class EnhancedBot:
                         )
             except Exception as e:
                 print(f"发送失败ZIP失败: {e}")
-            
-            # 发送完整归档ZIP（可选，只在有部分成功时发送）
-            try:
-                if os.path.exists(all_zip_path) and counters['partial'] > 0:
-                    with open(all_zip_path, 'rb') as f:
-                        context.bot.send_document(
-                            chat_id=user_id,
-                            document=f,
-                            filename=os.path.basename(all_zip_path),
-                            caption=f"📦 完整归档 (批次 {batch_id}) - 包含所有分类"
-                        )
-            except Exception as e:
-                print(f"发送完整归档ZIP失败: {e}")
             
         except Exception as e:
             print(f"防止找回处理异常: {e}")
