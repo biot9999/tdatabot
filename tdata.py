@@ -9642,8 +9642,8 @@ class RecoveryProtectionManager:
         
         return RecoveryReportFiles(
             summary_txt=txt_path,
-            detail_csv="",
-            stages_csv="",
+            detail_csv=None,  # CSV报告已取消
+            stages_csv=None,  # CSV报告已取消
             success_zip=success_zip_path,
             failed_zip=failed_zip_path,
             all_archives_zip=all_zip_path
