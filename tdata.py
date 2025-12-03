@@ -825,6 +825,14 @@ class Config:
         self.ALLOW_PORT_SHIFT = os.getenv("ALLOW_PORT_SHIFT", "true").lower() == "true"
         self.DEBUG_RECOVERY = os.getenv("DEBUG_RECOVERY", "true").lower() == "true"
         
+        # 忘记2FA批量处理速度优化配置
+        self.FORGET2FA_CONCURRENT = int(os.getenv("FORGET2FA_CONCURRENT", "50"))  # 并发数从30提升到50
+        self.FORGET2FA_MIN_DELAY = float(os.getenv("FORGET2FA_MIN_DELAY", "0.3"))  # 批次间最小延迟（秒）
+        self.FORGET2FA_MAX_DELAY = float(os.getenv("FORGET2FA_MAX_DELAY", "0.8"))  # 批次间最大延迟（秒）
+        self.FORGET2FA_NOTIFY_WAIT = float(os.getenv("FORGET2FA_NOTIFY_WAIT", "0.5"))  # 等待通知到达的时间（秒）
+        self.FORGET2FA_MAX_PROXY_RETRIES = int(os.getenv("FORGET2FA_MAX_PROXY_RETRIES", "2"))  # 代理重试次数从3减到2
+        self.FORGET2FA_PROXY_TIMEOUT = int(os.getenv("FORGET2FA_PROXY_TIMEOUT", "15"))  # 代理超时时间（秒）
+        
         # 获取当前脚本目录
         self.SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
         
@@ -925,6 +933,13 @@ RECOVERY_STAGE_TIMEOUT=300
 WEB_SERVER_PORT=8080
 ALLOW_PORT_SHIFT=true
 DEBUG_RECOVERY=true
+# 忘记2FA批量处理速度优化配置
+FORGET2FA_CONCURRENT=50
+FORGET2FA_MIN_DELAY=0.3
+FORGET2FA_MAX_DELAY=0.8
+FORGET2FA_NOTIFY_WAIT=0.5
+FORGET2FA_MAX_PROXY_RETRIES=2
+FORGET2FA_PROXY_TIMEOUT=15
 """
             with open(".env", "w", encoding="utf-8") as f:
                 f.write(env_content)
@@ -5822,33 +5837,41 @@ def record_stage_result(context: 'RecoveryAccountContext', stage: str, success: 
 # ================================
 
 class Forget2FAManager:
-    """忘记2FA管理器 - 官方密码重置流程"""
+    """忘记2FA管理器 - 官方密码重置流程（优化版 - 提升批量处理速度）"""
     
-    # 配置常量 - 可根据需要调整
-    DEFAULT_CONCURRENT_LIMIT = 30      # 默认并发数限制（同时处理30个账号）
-    DEFAULT_MAX_PROXY_RETRIES = 3      # 默认代理重试次数
-    DEFAULT_PROXY_TIMEOUT = 30         # 默认代理超时时间（秒）
-    DEFAULT_MIN_DELAY = 1              # 账号间最小延迟（秒）- 高并发模式下减少延迟
-    DEFAULT_MAX_DELAY = 3              # 账号间最大延迟（秒）- 高并发模式下减少延迟
+    # 配置常量 - 从环境变量或配置读取，可根据需要调整
+    # 速度优化：提高并发数，减少延迟
+    DEFAULT_CONCURRENT_LIMIT = 50      # 默认并发数限制（从30提升到50）
+    DEFAULT_MAX_PROXY_RETRIES = 2      # 默认代理重试次数（从3减到2）
+    DEFAULT_PROXY_TIMEOUT = 15         # 默认代理超时时间（秒，从30减到15）
+    DEFAULT_MIN_DELAY = 0.3            # 批次间最小延迟（秒，从1减到0.3）
+    DEFAULT_MAX_DELAY = 0.8            # 批次间最大延迟（秒，从3减到0.8）
+    DEFAULT_NOTIFY_WAIT = 0.5          # 等待通知到达的时间（秒，从2减到0.5）
     
     def __init__(self, proxy_manager: ProxyManager, db: Database,
                  concurrent_limit: int = None,
                  max_proxy_retries: int = None,
                  proxy_timeout: int = None,
                  min_delay: float = None,
-                 max_delay: float = None):
+                 max_delay: float = None,
+                 notify_wait: float = None):
         self.proxy_manager = proxy_manager
         self.db = db
         
-        # 使用传入参数或默认值
-        self.concurrent_limit = concurrent_limit or self.DEFAULT_CONCURRENT_LIMIT
-        self.max_proxy_retries = max_proxy_retries or self.DEFAULT_MAX_PROXY_RETRIES
-        self.proxy_timeout = proxy_timeout or self.DEFAULT_PROXY_TIMEOUT
-        self.min_delay = min_delay or self.DEFAULT_MIN_DELAY
-        self.max_delay = max_delay or self.DEFAULT_MAX_DELAY
+        # 使用环境变量配置或传入参数或默认值
+        # 使用显式None检查以支持0值作为有效配置
+        self.concurrent_limit = concurrent_limit if concurrent_limit is not None else (getattr(config, 'FORGET2FA_CONCURRENT', None) or self.DEFAULT_CONCURRENT_LIMIT)
+        self.max_proxy_retries = max_proxy_retries if max_proxy_retries is not None else (getattr(config, 'FORGET2FA_MAX_PROXY_RETRIES', None) or self.DEFAULT_MAX_PROXY_RETRIES)
+        self.proxy_timeout = proxy_timeout if proxy_timeout is not None else (getattr(config, 'FORGET2FA_PROXY_TIMEOUT', None) or self.DEFAULT_PROXY_TIMEOUT)
+        self.min_delay = min_delay if min_delay is not None else (getattr(config, 'FORGET2FA_MIN_DELAY', None) or self.DEFAULT_MIN_DELAY)
+        self.max_delay = max_delay if max_delay is not None else (getattr(config, 'FORGET2FA_MAX_DELAY', None) or self.DEFAULT_MAX_DELAY)
+        self.notify_wait = notify_wait if notify_wait is not None else (getattr(config, 'FORGET2FA_NOTIFY_WAIT', None) or self.DEFAULT_NOTIFY_WAIT)
         
         # 创建信号量控制并发
         self.semaphore = asyncio.Semaphore(self.concurrent_limit)
+        
+        # 打印优化后的配置
+        print(f"⚡ 忘记2FA管理器初始化: 并发={self.concurrent_limit}, 延迟={self.min_delay}-{self.max_delay}s, 通知等待={self.notify_wait}s")
     
     def create_proxy_dict(self, proxy_info: Dict) -> Optional[Dict]:
         """创建代理字典"""
@@ -6412,7 +6435,8 @@ class Forget2FAManager:
                     print(f"✅ [{file_name}] {reset_msg}")
                     
                     # 5. 删除来自777000的重置通知消息
-                    await asyncio.sleep(2)  # 等待2秒确保通知已到达
+                    # 使用可配置的等待时间（默认0.5秒，从原来的2秒减少以提升速度）
+                    await asyncio.sleep(self.notify_wait)
                     await self.delete_reset_notification(client, file_name)
                 else:
                     # 检查是否已在冷却期
