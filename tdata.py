@@ -162,18 +162,21 @@ except ImportError:
 class RecoveryStageResult:
     """防止找回单阶段结果
     
-    支持的阶段:
+    新流程阶段 (按执行顺序):
     - load: 加载文件
     - connect_old: 连接旧会话
-    - get_account_info: 获取账号信息
-    - change_password: 修改密码
-    - kick_devices: 踢出其他设备
-    - terminate_old_sessions: 终止所有旧会话
+    - change_pwd_old: 在旧设备上修改密码 (旧设备无"too new"限制)
+    - kick_devices_old: 从旧设备踢出所有其他设备 (旧设备无"too new"限制，可调用ResetAuthorizationsRequest)
     - request_code: 请求验证码
     - wait_code: 等待验证码
-    - sign_in_new: 登录新设备
+    - sign_in_new: 新设备登录
+    - logout_old: 旧设备登出
     - verify_old_invalid: 验证旧会话失效
-    - package_result: 打包结果
+    
+    废弃阶段 (保留向后兼容):
+    - terminate_old_sessions: (废弃)从新设备终止旧会话，可能触发"session too new"错误
+    - change_password: (废弃)使用change_pwd_old替代
+    - kick_devices: (废弃)使用kick_devices_old替代
     - rotate_pwd: (旧)设置2FA密码
     - remove_devices: (旧)删除设备
     - sign_in: (旧)登录新设备
@@ -7713,6 +7716,253 @@ class RecoveryProtectionManager:
             self.db.insert_recovery_log(stage_result)
             return False, error_msg
     
+    async def _stage_kick_devices_from_old(self, old_client: TelegramClient, context: RecoveryAccountContext) -> Tuple[bool, str]:
+        """阶段: 从旧设备踢出所有其他设备（绕过"session too new"限制）
+        
+        核心创新点：老设备没有"session too new"限制！
+        1. 使用旧设备调用 ResetAuthorizationsRequest 终止所有其他会话
+        2. 这包括了可能存在的其他登录设备
+        3. 新设备稍后登录时不会受到限制
+        
+        Why it works: 
+        - 旧设备（已存在一段时间）没有 FRESH_RESET_AUTHORISATION_FORBIDDEN 限制
+        - 新设备只需要登录，不需要调用敏感的授权重置API
+        
+        Returns:
+            (是否成功, 错误信息或成功详情)
+        """
+        account_name = os.path.basename(context.original_path)
+        stage_start = time.time()
+        
+        try:
+            print(f"🔄 [{account_name}] 从旧设备踢出所有其他会话（绕过'too new'限制）...")
+            
+            if not TELETHON_AVAILABLE:
+                error_msg = "Telethon 未安装，无法踢出设备"
+                stage_result = RecoveryStageResult(
+                    account_name=account_name,
+                    phone=context.phone,
+                    stage="kick_devices_old",
+                    success=False,
+                    error=error_msg,
+                    elapsed=time.time() - stage_start
+                )
+                context.stage_results.append(stage_result)
+                self.db.insert_recovery_log(stage_result)
+                return False, error_msg
+            
+            # 调用 ResetAuthorizationsRequest 终止所有其他会话
+            # 这是关键：从旧设备调用可以绕过"session too new"限制
+            try:
+                await asyncio.wait_for(
+                    old_client(ResetAuthorizationsRequest()),
+                    timeout=30
+                )
+                
+                detail = "已从旧设备终止所有其他会话（绕过'too new'限制）"
+                print(f"✅ [{account_name}] {detail}")
+                
+                stage_result = RecoveryStageResult(
+                    account_name=account_name,
+                    phone=context.phone,
+                    stage="kick_devices_old",
+                    success=True,
+                    detail=detail,
+                    elapsed=time.time() - stage_start
+                )
+                context.stage_results.append(stage_result)
+                self.db.insert_recovery_log(stage_result)
+                
+                return True, detail
+                
+            except RPCError as rpc_err:
+                error_str = str(rpc_err).lower()
+                # 检查是否是 "session too new" 错误 - 这不应该发生在旧设备上
+                if 'fresh' in error_str or 'too new' in error_str:
+                    error_msg = f"意外的'session too new'错误: {str(rpc_err)[:100]}"
+                    print(f"⚠️ [{account_name}] {error_msg}")
+                else:
+                    error_msg = f"RPC错误: {str(rpc_err)[:100]}"
+                    print(f"⚠️ [{account_name}] {error_msg}")
+                
+                # 如果ResetAuthorizationsRequest失败，尝试逐个删除设备
+                print(f"🔄 [{account_name}] 尝试逐个删除其他设备...")
+                fallback_success, fallback_detail = await self.remove_other_devices(old_client)
+                
+                if fallback_success:
+                    detail = f"ResetAuthorizationsRequest失败，但逐个删除成功: {fallback_detail}"
+                    print(f"✅ [{account_name}] {detail}")
+                    
+                    stage_result = RecoveryStageResult(
+                        account_name=account_name,
+                        phone=context.phone,
+                        stage="kick_devices_old",
+                        success=True,
+                        detail=detail,
+                        elapsed=time.time() - stage_start
+                    )
+                    context.stage_results.append(stage_result)
+                    self.db.insert_recovery_log(stage_result)
+                    return True, detail
+                else:
+                    error_msg = f"两种方法均失败: {error_msg}; 逐个删除: {fallback_detail}"
+                    
+                stage_result = RecoveryStageResult(
+                    account_name=account_name,
+                    phone=context.phone,
+                    stage="kick_devices_old",
+                    success=False,
+                    error=error_msg,
+                    elapsed=time.time() - stage_start
+                )
+                context.stage_results.append(stage_result)
+                self.db.insert_recovery_log(stage_result)
+                return False, error_msg
+                    
+        except asyncio.TimeoutError:
+            error_msg = "踢出设备超时"
+            print(f"⏰ [{account_name}] {error_msg}")
+            stage_result = RecoveryStageResult(
+                account_name=account_name,
+                phone=context.phone,
+                stage="kick_devices_old",
+                success=False,
+                error=error_msg,
+                elapsed=time.time() - stage_start
+            )
+            context.stage_results.append(stage_result)
+            self.db.insert_recovery_log(stage_result)
+            return False, error_msg
+            
+        except Exception as e:
+            error_msg = f"踢出设备异常: {str(e)[:100]}"
+            print(f"❌ [{account_name}] {error_msg}")
+            stage_result = RecoveryStageResult(
+                account_name=account_name,
+                phone=context.phone,
+                stage="kick_devices_old",
+                success=False,
+                error=error_msg,
+                elapsed=time.time() - stage_start
+            )
+            context.stage_results.append(stage_result)
+            self.db.insert_recovery_log(stage_result)
+            return False, error_msg
+    
+    async def _stage_logout_old(self, old_client: TelegramClient, context: RecoveryAccountContext) -> Tuple[bool, str]:
+        """阶段: 旧设备登出
+        
+        在新设备成功登录后，让旧设备主动登出。
+        这是最后一步，确保旧会话完全失效。
+        
+        Returns:
+            (是否成功, 错误信息或成功详情)
+        """
+        account_name = os.path.basename(context.original_path)
+        stage_start = time.time()
+        
+        try:
+            print(f"🚪 [{account_name}] 旧设备登出...")
+            
+            if not old_client or not old_client.is_connected():
+                detail = "旧客户端已断开，无需登出"
+                print(f"ℹ️ [{account_name}] {detail}")
+                
+                stage_result = RecoveryStageResult(
+                    account_name=account_name,
+                    phone=context.phone,
+                    stage="logout_old",
+                    success=True,
+                    detail=detail,
+                    elapsed=time.time() - stage_start
+                )
+                context.stage_results.append(stage_result)
+                self.db.insert_recovery_log(stage_result)
+                return True, detail
+            
+            # 调用 log_out 方法
+            try:
+                await asyncio.wait_for(old_client.log_out(), timeout=15)
+                detail = "旧设备已成功登出"
+                print(f"✅ [{account_name}] {detail}")
+                
+                stage_result = RecoveryStageResult(
+                    account_name=account_name,
+                    phone=context.phone,
+                    stage="logout_old",
+                    success=True,
+                    detail=detail,
+                    elapsed=time.time() - stage_start
+                )
+                context.stage_results.append(stage_result)
+                self.db.insert_recovery_log(stage_result)
+                return True, detail
+                
+            except Exception as logout_err:
+                # 登出失败不一定是致命错误，可能连接已断开
+                error_str = str(logout_err).lower()
+                if 'auth key' in error_str or 'unregistered' in error_str:
+                    # 会话已失效，这是好事
+                    detail = f"旧会话已失效（登出时确认）: {str(logout_err)[:50]}"
+                    print(f"✅ [{account_name}] {detail}")
+                    
+                    stage_result = RecoveryStageResult(
+                        account_name=account_name,
+                        phone=context.phone,
+                        stage="logout_old",
+                        success=True,
+                        detail=detail,
+                        elapsed=time.time() - stage_start
+                    )
+                    context.stage_results.append(stage_result)
+                    self.db.insert_recovery_log(stage_result)
+                    return True, detail
+                else:
+                    error_msg = f"登出异常: {str(logout_err)[:100]}"
+                    print(f"⚠️ [{account_name}] {error_msg}")
+                    
+                    stage_result = RecoveryStageResult(
+                        account_name=account_name,
+                        phone=context.phone,
+                        stage="logout_old",
+                        success=False,
+                        error=error_msg,
+                        elapsed=time.time() - stage_start
+                    )
+                    context.stage_results.append(stage_result)
+                    self.db.insert_recovery_log(stage_result)
+                    return False, error_msg
+                    
+        except asyncio.TimeoutError:
+            error_msg = "登出超时"
+            print(f"⏰ [{account_name}] {error_msg}")
+            stage_result = RecoveryStageResult(
+                account_name=account_name,
+                phone=context.phone,
+                stage="logout_old",
+                success=False,
+                error=error_msg,
+                elapsed=time.time() - stage_start
+            )
+            context.stage_results.append(stage_result)
+            self.db.insert_recovery_log(stage_result)
+            return False, error_msg
+            
+        except Exception as e:
+            error_msg = f"登出异常: {str(e)[:100]}"
+            print(f"❌ [{account_name}] {error_msg}")
+            stage_result = RecoveryStageResult(
+                account_name=account_name,
+                phone=context.phone,
+                stage="logout_old",
+                success=False,
+                error=error_msg,
+                elapsed=time.time() - stage_start
+            )
+            context.stage_results.append(stage_result)
+            self.db.insert_recovery_log(stage_result)
+            return False, error_msg
+
     async def _stage_verify_old_invalid(self, old_session_path: str, context: RecoveryAccountContext) -> Tuple[bool, str]:
         """阶段: 验证旧会话是否已失效
         
@@ -8968,9 +9218,10 @@ class RecoveryProtectionManager:
                     context.failure_reason = "修改2FA密码失败"
                     return context
                 
-                # ===== 阶段3: 从旧会话踢出其他设备 =====
-                print(f"🔄 [{account_name}] 从旧会话踢出其他设备...")
-                devices_success, devices_detail = await self._stage_kick_devices(old_client, context)
+                # ===== 阶段3: 从旧会话踢出其他设备 (核心创新：旧设备无"too new"限制) =====
+                # 使用旧设备调用 ResetAuthorizationsRequest，绕过"session too new"错误
+                print(f"🔄 [{account_name}] 从旧会话踢出所有其他设备（绕过'too new'限制）...")
+                devices_success, devices_detail = await self._stage_kick_devices_from_old(old_client, context)
                 if not devices_success:
                     print(f"⚠️ [{account_name}] 踢出设备失败: {devices_detail}，继续执行...")
                 else:
@@ -9017,39 +9268,24 @@ class RecoveryProtectionManager:
                             with open(new_json_path, 'w', encoding='utf-8') as f:
                                 json.dump(json_data, f, ensure_ascii=False, indent=2)
                         
-                        # ===== 阶段6.5: 从新设备踢出旧设备/其他设备 =====
-                        # 在新设备登录成功后，使用新客户端踢出所有其他设备（包括旧设备）
-                        print(f"🔄 [{account_name}] 从新设备踢出所有其他设备（确保旧设备失效）...")
-                        try:
-                            kick_success, kick_detail = await self.remove_other_devices(new_client)
-                            if kick_success:
-                                print(f"✅ [{account_name}] 成功踢出其他设备: {kick_detail}")
-                                context.old_session_valid = False
-                            else:
-                                print(f"⚠️ [{account_name}] 踢出其他设备部分失败: {kick_detail}")
-                                # Still mark as invalid since we attempted and password was changed
-                                context.old_session_valid = False
-                        except Exception as kick_err:
-                            print(f"⚠️ [{account_name}] 踢出其他设备异常: {kick_err}")
-                            # Still mark as invalid since password was changed
-                            context.old_session_valid = False
-                        
-                        # ===== 阶段6.6: 终止所有其他会话 =====
-                        # 调用 ResetAuthorizationsRequest 确保旧会话完全失效
-                        print(f"🔒 [{account_name}] 调用终止所有其他会话...")
-                        try:
-                            terminate_success, terminate_detail = await self._stage_terminate_old_sessions(new_client, context)
-                            if terminate_success:
-                                print(f"✅ [{account_name}] 已终止所有其他会话: {terminate_detail}")
-                            else:
-                                print(f"⚠️ [{account_name}] 终止其他会话失败: {terminate_detail}")
-                        except Exception as terminate_err:
-                            print(f"⚠️ [{account_name}] 终止其他会话异常: {terminate_err}")
+                        # 注意：我们不再从新设备调用 remove_other_devices 或 ResetAuthorizationsRequest
+                        # 因为新设备可能触发 "session too new" 错误
+                        # 旧设备已经在阶段3中踢出了所有其他设备
                         
                     except Exception as e:
                         print(f"⚠️ [{account_name}] 验证新设备失败: {e}")
                 
-                # ===== 阶段7: 验证旧设备已失效 =====
+                # ===== 阶段7: 旧设备登出 =====
+                print(f"🚪 [{account_name}] 旧设备登出...")
+                logout_success, logout_detail = await self._stage_logout_old(old_client, context)
+                if logout_success:
+                    print(f"✅ [{account_name}] 旧设备已登出: {logout_detail}")
+                    context.old_session_valid = False
+                else:
+                    print(f"⚠️ [{account_name}] 旧设备登出失败: {logout_detail}")
+                    # 登出失败不一定意味着旧会话有效（可能已被踢出）
+                
+                # ===== 阶段8: 验证旧设备已失效 =====
                 print(f"🔍 [{account_name}] 验证旧会话是否已失效...")
                 old_invalid, old_invalid_detail = await self._stage_verify_old_invalid(file_path, context)
                 if old_invalid:
