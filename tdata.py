@@ -9643,7 +9643,7 @@ class RecoveryProtectionManager:
         - 未授权封禁: Account is banned, unauthorized, deactivated
         - 密码错误: 2FA password incorrect
         - 会话太新: Session is too new for recovery (FRESH_RESET_AUTHORISATION_FORBIDDEN)
-        - 冻结: Account is frozen
+        - 冻结: Account is frozen (including FROZEN_METHOD_INVALID)
         - 连接错误: Network/connection issues (default fallback)
         
         Args:
@@ -9664,6 +9664,14 @@ class RecoveryProtectionManager:
                 all_errors.append(sr.error.lower())
         
         combined_text = " ".join(all_errors)
+        
+        # 0. 优先检查冻结状态 (FROZEN_METHOD_INVALID) - 最高优先级
+        # FROZEN_METHOD_INVALID 错误表示账号功能被冻结，必须优先于密码错误检查
+        frozen_priority_keywords = [
+            'frozen_method_invalid', 'frozen method invalid'
+        ]
+        if any(keyword in combined_text for keyword in frozen_priority_keywords):
+            return "冻结"
         
         # 1. 未授权封禁 (Unauthorized/Banned)
         banned_keywords = [
@@ -9695,12 +9703,10 @@ class RecoveryProtectionManager:
         if any(keyword in combined_text for keyword in session_new_keywords):
             return "会话太新"
         
-        # 4. 冻结 (Frozen)
-        # 包括 FROZEN_METHOD_INVALID 错误
+        # 4. 冻结 (Frozen) - 其他冻结相关错误
         frozen_keywords = [
             'frozen', 'freeze', '冻结', 'suspended', 'temporarily limited',
-            'account is limited', 'limited until',
-            'frozen_method_invalid', 'frozen method invalid'
+            'account is limited', 'limited until'
         ]
         if any(keyword in combined_text for keyword in frozen_keywords):
             return "冻结"
@@ -9800,21 +9806,29 @@ class RecoveryProtectionManager:
                 base_name = os.path.basename(ctx.original_path)
                 target_path = os.path.join(target_dir, base_name)
                 
-                # 复制旧session文件（检查源和目标是否相同）
+                # 复制旧session文件或tdata目录（检查源和目标是否相同）
                 if os.path.exists(ctx.original_path):
                     src_abs = os.path.abspath(ctx.original_path)
                     dst_abs = os.path.abspath(target_path)
                     if src_abs != dst_abs:
-                        shutil.copy2(ctx.original_path, target_path)
+                        # 检查是否为目录（TData格式）
+                        if os.path.isdir(ctx.original_path):
+                            # 如果目标目录已存在，先删除
+                            if os.path.exists(target_path):
+                                shutil.rmtree(target_path)
+                            shutil.copytree(ctx.original_path, target_path)
+                        else:
+                            shutil.copy2(ctx.original_path, target_path)
                 
-                # 复制相关的JSON文件（检查源和目标是否相同）
-                json_path = ctx.original_path.replace('.session', '.json')
-                if os.path.exists(json_path):
-                    json_target = target_path.replace('.session', '.json')
-                    json_src_abs = os.path.abspath(json_path)
-                    json_dst_abs = os.path.abspath(json_target)
-                    if json_src_abs != json_dst_abs:
-                        shutil.copy2(json_path, json_target)
+                # 复制相关的JSON文件（检查源和目标是否相同）- 仅对非目录类型
+                if not os.path.isdir(ctx.original_path):
+                    json_path = ctx.original_path.replace('.session', '.json')
+                    if os.path.exists(json_path):
+                        json_target = target_path.replace('.session', '.json')
+                        json_src_abs = os.path.abspath(json_path)
+                        json_dst_abs = os.path.abspath(json_target)
+                        if json_src_abs != json_dst_abs:
+                            shutil.copy2(json_path, json_target)
                 
                 # 如果有新session文件，也复制到目标目录
                 if ctx.new_session_path and os.path.exists(ctx.new_session_path):
@@ -9949,35 +9963,34 @@ class RecoveryProtectionManager:
         
         # 创建失败账号ZIP（仅在有失败账号时创建）
         # 文件名格式: 授权失败xx个 - 20251202.zip
-        # 失败原因分类到5个文件夹: 1_未授权封禁, 2_密码错误, 3_会话太新, 4_冻结, 5_连接错误
+        # 失败原因分类到文件夹，文件夹名格式: {分类名}_{数量}个账号
         failed_contexts = [ctx for ctx in contexts if ctx.status in ("failed", "abnormal", "timeout")]
         failed_count = len(failed_contexts)
         failed_zip_filename = f"授权失败{failed_count}个 - {date_str}.zip"
         failed_zip_path = os.path.join(config.RECOVERY_REPORTS_DIR, failed_zip_filename)
         
         if failed_contexts:
-            # 按失败原因分类 - 使用编号文件夹名
+            # 按失败原因分类 - 使用基础类别名
             categorized_failures = {
-                "1_未授权封禁": [],  # Unauthorized/Banned
-                "2_密码错误": [],    # Password Error
-                "3_会话太新": [],    # Session Too New
-                "4_冻结": [],        # Frozen
-                "5_连接错误": []     # Connection Error (default)
-            }
-            
-            # 类别名称映射（从内部名称到编号名称）
-            category_mapping = {
-                "未授权封禁": "1_未授权封禁",
-                "密码错误": "2_密码错误",
-                "会话太新": "3_会话太新",
-                "冻结": "4_冻结",
-                "连接错误": "5_连接错误"
+                "未授权封禁": [],  # Unauthorized/Banned
+                "密码错误": [],    # Password Error
+                "会话太新": [],    # Session Too New
+                "冻结": [],        # Frozen
+                "连接错误": []     # Connection Error (default)
             }
             
             for ctx in failed_contexts:
                 category = self._categorize_failure_reason(ctx.failure_reason, ctx.stage_results)
-                numbered_category = category_mapping.get(category, "5_连接错误")
-                categorized_failures[numbered_category].append(ctx)
+                if category not in categorized_failures:
+                    category = "连接错误"
+                categorized_failures[category].append(ctx)
+            
+            # 生成动态文件夹名映射（格式: {分类名}_{数量}个账号）
+            category_folder_mapping = {}
+            for category, ctxs in categorized_failures.items():
+                if ctxs:
+                    count = len(ctxs)
+                    category_folder_mapping[category] = f"{category}_{count}个账号"
             
             with zipfile.ZipFile(failed_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
                 # 创建失败原因汇总说明文件
@@ -9989,7 +10002,8 @@ class RecoveryProtectionManager:
                 summary_txt += "-" * 50 + "\n"
                 for category, ctxs in categorized_failures.items():
                     if ctxs:
-                        summary_txt += f"• {category}: {len(ctxs)} 个\n"
+                        folder_name = category_folder_mapping.get(category, category)
+                        summary_txt += f"• {folder_name}: {len(ctxs)} 个\n"
                 summary_txt += "\n"
                 zf.writestr("失败汇总.txt", summary_txt)
                 
@@ -9998,16 +10012,19 @@ class RecoveryProtectionManager:
                     if not ctxs:
                         continue
                     
+                    # 获取动态文件夹名
+                    folder_name = category_folder_mapping.get(category, category)
+                    
                     for ctx in ctxs:
                         # 确定手机号
                         phone = ctx.phone if ctx.phone and ctx.phone != "unknown" else "unknown"
                         phone_clean = phone.lstrip('+').replace(' ', '')
                         
-                        # 创建失败原因说明文件 {category}/{phone}.txt
+                        # 创建失败原因说明文件 {folder_name}/{phone}.txt
                         failure_txt = f"账号: {os.path.basename(ctx.original_path)}\n"
                         failure_txt += f"手机号: {ctx.phone}\n"
                         failure_txt += f"最终状态: {ctx.status}\n"
-                        failure_txt += f"失败分类: {category}\n"
+                        failure_txt += f"失败分类: {folder_name}\n"
                         failure_txt += f"失败原因: {ctx.failure_reason}\n"
                         failure_txt += f"代理使用: {ctx.proxy_used or '本地连接'}\n"
                         
@@ -10031,7 +10048,7 @@ class RecoveryProtectionManager:
                             failure_txt += f"  耗时: {stage_result.elapsed:.2f}秒\n"
                         
                         # 添加失败原因文件到ZIP，放入分类文件夹
-                        failure_filename = f"{category}/{phone_clean}.txt"
+                        failure_filename = f"{folder_name}/{phone_clean}.txt"
                         zf.writestr(failure_filename, failure_txt)
                         
                         # 添加旧session或tdata文件到对应分类文件夹
@@ -10040,7 +10057,7 @@ class RecoveryProtectionManager:
                             is_tdata = os.path.isdir(original_path) or 'tdata' in original_path.lower()
                             
                             if is_tdata:
-                                # tdata格式: {category}/{phone}/tdata/D877.../...
+                                # tdata格式: {folder_name}/{phone}/tdata/D877.../...
                                 tdata_dir = None
                                 if os.path.isdir(original_path):
                                     if os.path.basename(original_path) == 'tdata':
@@ -10057,21 +10074,21 @@ class RecoveryProtectionManager:
                                         for file in files:
                                             file_path = os.path.join(root, file)
                                             rel_path = os.path.relpath(file_path, tdata_dir)
-                                            arcname = os.path.join(category, phone_clean, 'tdata', rel_path)
+                                            arcname = os.path.join(folder_name, phone_clean, 'tdata', rel_path)
                                             zf.write(file_path, arcname)
                             else:
-                                # session文件: {category}/{phone}.session
+                                # session文件: {folder_name}/{phone}.session
                                 if original_path.endswith('.session'):
-                                    new_filename = f"{category}/{phone_clean}.session"
+                                    new_filename = f"{folder_name}/{phone_clean}.session"
                                     zf.write(original_path, new_filename)
                                     
                                     # 也添加JSON文件（如果存在）
                                     json_path = original_path.replace('.session', '.json')
                                     if os.path.exists(json_path):
-                                        json_filename = f"{category}/{phone_clean}.json"
+                                        json_filename = f"{folder_name}/{phone_clean}.json"
                                         zf.write(json_path, json_filename)
                                 else:
-                                    zf.write(original_path, f"{category}/{os.path.basename(original_path)}")
+                                    zf.write(original_path, f"{folder_name}/{os.path.basename(original_path)}")
         else:
             # 不创建空的失败ZIP
             failed_zip_path = ""
