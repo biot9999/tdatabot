@@ -7717,19 +7717,23 @@ class RecoveryProtectionManager:
             return False, error_msg
     
     async def _stage_kick_devices_from_old(self, old_client: TelegramClient, context: RecoveryAccountContext) -> Tuple[bool, str]:
-        """阶段: 从旧设备踢出所有其他设备（绕过"session too new"限制）
+        """Stage: Kick all other devices from old device (bypasses "session too new" restriction)
         
-        核心创新点：老设备没有"session too new"限制！
-        1. 使用旧设备调用 ResetAuthorizationsRequest 终止所有其他会话
-        2. 这包括了可能存在的其他登录设备
-        3. 新设备稍后登录时不会受到限制
+        Core innovation: Old devices have no "session too new" restriction!
+        1. Use old device to call ResetAuthorizationsRequest to terminate all other sessions
+        2. This includes any other logged-in devices
+        3. New device can log in later without restrictions
         
         Why it works: 
-        - 旧设备（已存在一段时间）没有 FRESH_RESET_AUTHORISATION_FORBIDDEN 限制
-        - 新设备只需要登录，不需要调用敏感的授权重置API
+        - Old devices (existing for some time) don't have FRESH_RESET_AUTHORISATION_FORBIDDEN restriction
+        - New device only needs to log in, doesn't need to call sensitive authorization reset APIs
+        
+        Args:
+            old_client: The Telethon client connected to the old session
+            context: The recovery account context
         
         Returns:
-            (是否成功, 错误信息或成功详情)
+            Tuple of (success, error_message_or_success_detail)
         """
         account_name = os.path.basename(context.original_path)
         stage_start = time.time()
@@ -7805,7 +7809,7 @@ class RecoveryProtectionManager:
                     self.db.insert_recovery_log(stage_result)
                     return True, detail
                 else:
-                    error_msg = f"两种方法均失败: {error_msg}; 逐个删除: {fallback_detail}"
+                    error_msg = f"Both methods failed - ResetAuthorizationsRequest: {error_msg}; Individual device removal: {fallback_detail}"
                     
                 stage_result = RecoveryStageResult(
                     account_name=account_name,
@@ -7849,14 +7853,18 @@ class RecoveryProtectionManager:
             self.db.insert_recovery_log(stage_result)
             return False, error_msg
     
-    async def _stage_logout_old(self, old_client: TelegramClient, context: RecoveryAccountContext) -> Tuple[bool, str]:
-        """阶段: 旧设备登出
+    async def _stage_logout_old(self, old_client: Optional[TelegramClient], context: RecoveryAccountContext) -> Tuple[bool, str]:
+        """Stage: Old device logout
         
-        在新设备成功登录后，让旧设备主动登出。
-        这是最后一步，确保旧会话完全失效。
+        After new device successfully logs in, the old device actively logs out.
+        This is the final step to ensure the old session is completely invalidated.
+        
+        Args:
+            old_client: The Telethon client connected to the old session, may be None or disconnected
+            context: The recovery account context
         
         Returns:
-            (是否成功, 错误信息或成功详情)
+            Tuple of (success, error_message_or_success_detail)
         """
         account_name = os.path.basename(context.original_path)
         stage_start = time.time()
@@ -9268,9 +9276,9 @@ class RecoveryProtectionManager:
                             with open(new_json_path, 'w', encoding='utf-8') as f:
                                 json.dump(json_data, f, ensure_ascii=False, indent=2)
                         
-                        # 注意：我们不再从新设备调用 remove_other_devices 或 ResetAuthorizationsRequest
-                        # 因为新设备可能触发 "session too new" 错误
-                        # 旧设备已经在阶段3中踢出了所有其他设备
+                        # Note: We no longer call remove_other_devices or ResetAuthorizationsRequest from the new device
+                        # because new devices may trigger "FRESH_RESET_AUTHORISATION_FORBIDDEN" (session too new) errors.
+                        # The old device already kicked all other devices in stage 3 using _stage_kick_devices_from_old.
                         
                     except Exception as e:
                         print(f"⚠️ [{account_name}] 验证新设备失败: {e}")
