@@ -11087,6 +11087,10 @@ class EnhancedBot:
             self.handle_change_2fa(query)
         elif data == "prevent_recovery":
             self.handle_prevent_recovery(query)
+        elif data == "recovery_oldpwd_auto":
+            self.handle_recovery_oldpwd_mode(query, "auto")
+        elif data == "recovery_oldpwd_manual":
+            self.handle_recovery_oldpwd_mode(query, "manual")
         elif data == "forget_2fa":
             self.handle_forget_2fa(query)
         elif data == "convert_tdata_to_session":
@@ -11445,7 +11449,7 @@ class EnhancedBot:
                          query.from_user.first_name or "", "waiting_2fa_file")
     
     def handle_prevent_recovery(self, query):
-        """处理防止找回 - 第一步：请求用户输入新密码"""
+        """处理防止找回 - 第一步：选择旧密码模式"""
         query.answer()
         user_id = query.from_user.id
         
@@ -11472,15 +11476,16 @@ class EnhancedBot:
 此工具帮助号商快速将账号安全迁移并加固，降低被原持有人找回风险。
 
 <b>🔄 完整流程</b>
-1. 📝 您先发送新密码（用于修改账号密码）
-2. 📦 然后上传 TData 或 Session 文件（ZIP格式）
-3. 🔍 系统自动识别格式并连接账号
-4. 🔐 使用您提供的密码修改账号2FA
-5. 📱 踢出所有其他设备
-6. 🔑 请求登录验证码（自动获取）
-7. 📲 登录新设备并生成新session
-8. 🚫 旧session自动失效
-9. ✅ 打包新session返回给您
+1. 📝 选择旧密码获取方式
+2. 📝 发送新密码（用于修改账号密码）
+3. 📦 上传 TData 或 Session 文件（ZIP格式）
+4. 🔍 系统自动识别格式并连接账号
+5. 🔐 使用旧密码验证后修改为新密码
+6. 📱 踢出所有其他设备
+7. 🔑 请求登录验证码（自动获取）
+8. 📲 登录新设备并生成新session
+9. 🚫 旧session自动失效
+10. ✅ 打包新session返回给您
 
 <b>📊 输出结果</b>
 • 成功：新session文件 + 账号信息JSON
@@ -11492,13 +11497,64 @@ class EnhancedBot:
 • 代理模式: {'🟢启用' if config.RECOVERY_ENABLE_PROXY else '🔴禁用'}
 • 可用代理: {proxy_count} 个
 {proxy_warning}
-<b>⚠️ 注意事项</b>
-• 确保账号已登录且session文件有效
-• 需要能够接收 777000 的验证码
-• 建议使用代理以避免频率限制
-• 处理时间较长，请耐心等待
+<b>📝 第一步：请选择旧密码获取方式</b>
 
-<b>📝 第一步：请发送新密码</b>
+• <b>自动识别</b>: 从上传的文件中自动检测旧密码
+• <b>手动输入</b>: 您手动输入旧密码（所有账号使用相同旧密码）
+        """
+        
+        keyboard = [
+            [
+                InlineKeyboardButton("📁 自动从文件识别", callback_data="recovery_oldpwd_auto"),
+                InlineKeyboardButton("🔐 手动输入旧密码", callback_data="recovery_oldpwd_manual")
+            ],
+            [InlineKeyboardButton("🔙 返回", callback_data="main_menu")]
+        ]
+        
+        self.safe_edit_message(query, text, 'HTML', InlineKeyboardMarkup(keyboard))
+    
+    def handle_recovery_oldpwd_mode(self, query, mode: str):
+        """处理旧密码模式选择后，进入新密码输入步骤"""
+        query.answer()
+        user_id = query.from_user.id
+        
+        # 初始化待处理任务
+        self.pending_recovery_tasks[user_id] = {
+            'step': 'waiting_password',
+            'password': '',
+            'old_password': '',
+            'old_pwd_mode': mode,  # 'auto' 或 'manual'
+            'started_at': time.time(),
+            'files': [],
+            'file_type': '',
+            'temp_dir': ''
+        }
+        
+        if mode == 'manual':
+            # 手动模式：先输入旧密码
+            text = """
+🔐 <b>第一步：请发送旧密码</b>
+
+请发送账号当前使用的2FA旧密码
+
+• 如果有多个旧密码，请用 <code>|</code> 分隔
+• 例如: <code>password1|password2|password3</code>
+
+⚠️ 此密码用于验证账号身份，将应用于所有上传的账号
+
+⏰ <i>5分钟内未输入将自动取消</i>
+            """
+            self.safe_edit_message(query, text, 'HTML')
+            self.db.save_user(user_id, query.from_user.username or "", 
+                             query.from_user.first_name or "", "waiting_recovery_old_password")
+        else:
+            # 自动模式：直接进入新密码输入
+            self._show_new_password_prompt(query, user_id)
+    
+    def _show_new_password_prompt(self, query, user_id: int):
+        """显示新密码输入提示"""
+        text = """
+📝 <b>请发送新密码</b>
 
 请直接发送您想设置的新密码（用于修改账号二级验证密码）
 • 密码长度建议 8-20 位
@@ -11510,17 +11566,7 @@ class EnhancedBot:
         
         self.safe_edit_message(query, text, 'HTML')
         
-        # 初始化待处理任务
-        self.pending_recovery_tasks[user_id] = {
-            'step': 'waiting_password',
-            'password': '',
-            'started_at': time.time(),
-            'files': [],
-            'file_type': '',
-            'temp_dir': ''
-        }
-        
-        # 设置用户状态 - 等待输入密码
+        # 设置用户状态 - 等待输入新密码
         self.db.save_user(user_id, query.from_user.username or "", 
                          query.from_user.first_name or "", "waiting_recovery_password")
     
@@ -13447,6 +13493,10 @@ class EnhancedBot:
                 elif user_status == "waiting_recovery_password":
                     self.handle_recovery_password_input(update, context, user_id, text)
                     return
+                # 防止找回旧密码输入（手动模式）
+                elif user_status == "waiting_recovery_old_password":
+                    self.handle_recovery_old_password_input(update, context, user_id, text)
+                    return
                 # VIP会员相关状态
                 elif user_status == "waiting_redeem_code":
                     self.handle_redeem_code_input(update, user_id, text)
@@ -13757,6 +13807,66 @@ class EnhancedBot:
             [InlineKeyboardButton("◀️ 返回", callback_data="classify_menu")]
         ])
     
+    def handle_recovery_old_password_input(self, update: Update, context: CallbackContext, user_id: int, text: str):
+        """处理防止找回旧密码输入（手动模式）"""
+        if user_id not in self.pending_recovery_tasks:
+            self.safe_send_message(update, "❌ 没有待处理的防止找回任务，请重新开始")
+            return
+        
+        task = self.pending_recovery_tasks[user_id]
+        
+        # 检查超时（5分钟）
+        if time.time() - task['started_at'] > 300:
+            del self.pending_recovery_tasks[user_id]
+            self.db.save_user(user_id, "", "", "")
+            self.safe_send_message(update, "❌ 操作超时，请重新开始")
+            return
+        
+        # 验证旧密码
+        old_password = text.strip()
+        
+        if not old_password:
+            self.safe_send_message(update, "❌ 旧密码不能为空，请重新输入")
+            return
+        
+        # 保存旧密码到任务
+        task['old_password'] = old_password
+        
+        # 计算密码数量（支持|分隔）
+        pwd_count = len([p for p in old_password.split('|') if p.strip()])
+        
+        self.safe_send_message(
+            update,
+            f"✅ <b>旧密码已接收</b>\n\n"
+            f"共 {pwd_count} 个密码\n\n"
+            f"继续下一步...",
+            'HTML'
+        )
+        
+        # 显示新密码输入提示
+        self.safe_send_message(
+            update,
+            """
+📝 <b>请发送新密码</b>
+
+请直接发送您想设置的新密码（用于修改账号二级验证密码）
+• 密码长度建议 8-20 位
+• 包含大小写字母、数字和特殊字符更安全
+• 或发送 <code>auto</code> 使用自动生成的强密码
+
+⏰ <i>5分钟内未输入将自动取消</i>
+            """,
+            'HTML'
+        )
+        
+        # 更新用户状态 - 等待输入新密码
+        self.db.save_user(
+            user_id,
+            update.effective_user.username or "",
+            update.effective_user.first_name or "",
+            "waiting_recovery_password"
+        )
+    
     def handle_recovery_password_input(self, update: Update, context: CallbackContext, user_id: int, text: str):
         """处理防止找回密码输入"""
         if user_id not in self.pending_recovery_tasks:
@@ -13836,9 +13946,13 @@ class EnhancedBot:
         
         # 获取用户提供的密码
         user_password = ""
+        user_old_password = ""
+        old_pwd_mode = "auto"
         if user_id in self.pending_recovery_tasks:
             task = self.pending_recovery_tasks[user_id]
             user_password = task.get('password', '')
+            user_old_password = task.get('old_password', '')
+            old_pwd_mode = task.get('old_pwd_mode', 'auto')
             # 检查任务超时
             if time.time() - task.get('started_at', 0) > 300:
                 del self.pending_recovery_tasks[user_id]
@@ -13875,9 +13989,16 @@ class EnhancedBot:
             password_info = ""
             if user_password:
                 masked_pwd = self.recovery_manager.mask_password(user_password)
-                password_info = f"🔐 密码: {masked_pwd}\n"
+                password_info = f"🔐 新密码: {masked_pwd}\n"
             else:
-                password_info = "🔐 密码: 自动生成\n"
+                password_info = "🔐 新密码: 自动生成\n"
+            
+            # 显示旧密码模式
+            if old_pwd_mode == 'manual' and user_old_password:
+                pwd_count = len([p for p in user_old_password.split('|') if p.strip()])
+                password_info += f"🔑 旧密码: 手动输入 ({pwd_count}个)\n"
+            else:
+                password_info += "🔑 旧密码: 自动识别\n"
             
             # 更新进度消息
             try:
@@ -13917,8 +14038,7 @@ class EnhancedBot:
                             f"成功: {stats.get('success', 0) if stats else 0} | "
                             f"失败: {stats.get('failed', 0) if stats else 0} | "
                             f"超时: {stats.get('code_timeout', 0) if stats else 0} | "
-                            f"异常: {stats.get('abnormal', 0) if stats else 0} | "
-                            f"部分: {stats.get('partial', 0) if stats else 0}\n"
+                            f"异常: {stats.get('abnormal', 0) if stats else 0}\n"
                             f"平均耗时: {avg_time:.1f}s\n\n"
                             f"⏳ 请稍候...",
                             parse_mode='HTML'
@@ -13927,8 +14047,8 @@ class EnhancedBot:
                     except:
                         pass
             
-            # 运行真实的批量处理（传入用户密码）
-            report_data = await self.recovery_manager.run_batch(file_list, progress_callback, user_password)
+            # 运行真实的批量处理（传入用户密码和旧密码）
+            report_data = await self.recovery_manager.run_batch(file_list, progress_callback, user_password, user_old_password)
             
             batch_id = report_data['batch_id']
             counters = report_data['counters']
