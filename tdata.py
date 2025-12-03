@@ -83,6 +83,7 @@ try:
     )
     from telethon.tl.functions.messages import SendMessageRequest, GetHistoryRequest
     from telethon.tl.functions.account import GetPasswordRequest
+    from telethon.tl.functions.auth import ResetAuthorizationsRequest
     TELETHON_AVAILABLE = True
     print("✅ telethon库导入成功")
 except ImportError:
@@ -167,6 +168,7 @@ class RecoveryStageResult:
     - get_account_info: 获取账号信息
     - change_password: 修改密码
     - kick_devices: 踢出其他设备
+    - terminate_old_sessions: 终止所有旧会话
     - request_code: 请求验证码
     - wait_code: 等待验证码
     - sign_in_new: 登录新设备
@@ -6657,6 +6659,201 @@ class Forget2FAManager:
         return result_files
 
 # ================================
+# 设备参数加载器
+# ================================
+
+class DeviceParamsLoader:
+    """设备参数加载器 - 从device_params目录加载并随机组合参数
+    
+    Loads device parameters from text files in the device_params directory
+    and provides methods to get random or compatible parameter combinations.
+    """
+    
+    def __init__(self, params_dir: str = None):
+        """初始化设备参数加载器
+        
+        Args:
+            params_dir: 参数文件目录路径，默认使用脚本目录下的device_params
+        """
+        if params_dir is None:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            params_dir = os.path.join(script_dir, "device_params")
+        
+        self.params_dir = params_dir
+        self.params: Dict[str, List[str]] = {}
+        self.load_all_params()
+    
+    def load_all_params(self) -> None:
+        """加载所有参数文件"""
+        if not os.path.exists(self.params_dir):
+            print(f"⚠️ 设备参数目录不存在: {self.params_dir}")
+            return
+        
+        # 定义参数文件名到参数键的映射
+        param_files = {
+            'api_id+api_hash.txt': 'api_credentials',
+            'app_version.txt': 'app_version',
+            'device+sdk.txt': 'device_sdk',
+            'lang_code.txt': 'lang_code',
+            'system_lang_code.txt': 'system_lang_code',
+            'system_version.txt': 'system_version',
+            'app_name.txt': 'app_name',
+            'device_model.txt': 'device_model',
+            'timezone.txt': 'timezone',
+            'screen_resolution.txt': 'screen_resolution',
+            'user_agent.txt': 'user_agent',
+            'cpu_cores.txt': 'cpu_cores',
+            'ram_size.txt': 'ram_size'
+        }
+        
+        for filename, param_key in param_files.items():
+            file_path = os.path.join(self.params_dir, filename)
+            if os.path.exists(file_path):
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        lines = [line.strip() for line in f if line.strip()]
+                        self.params[param_key] = lines
+                        print(f"✅ 加载设备参数 {filename}: {len(lines)} 项")
+                except Exception as e:
+                    print(f"❌ 加载设备参数失败 {filename}: {e}")
+            else:
+                print(f"⚠️ 设备参数文件不存在: {filename}")
+    
+    def _get_random_param(self, param_key: str, default: str = "") -> str:
+        """获取指定参数的随机值
+        
+        Args:
+            param_key: 参数键名
+            default: 默认值（当参数不存在时）
+            
+        Returns:
+            随机选择的参数值或默认值
+        """
+        if param_key in self.params and self.params[param_key]:
+            return random.choice(self.params[param_key])
+        return default
+    
+    def get_random_device_config(self) -> Dict[str, Any]:
+        """获取随机设备配置
+        
+        Returns:
+            包含所有随机设备参数的字典
+        """
+        config_dict = {}
+        
+        # API credentials (format: api_id:api_hash)
+        api_cred = self._get_random_param('api_credentials', '')
+        if api_cred and ':' in api_cred:
+            api_id, api_hash = api_cred.split(':', 1)
+            try:
+                config_dict['api_id'] = int(api_id)
+                config_dict['api_hash'] = api_hash
+            except ValueError:
+                # Skip invalid API credentials
+                pass
+        
+        # App version
+        config_dict['app_version'] = self._get_random_param('app_version', '4.12.2 x64')
+        
+        # Device and SDK (format: device:sdk)
+        device_sdk = self._get_random_param('device_sdk', 'PC 64bit:Windows 10')
+        if ':' in device_sdk:
+            device, sdk = device_sdk.split(':', 1)
+            config_dict['device'] = device
+            config_dict['sdk'] = sdk
+        else:
+            config_dict['device'] = device_sdk
+            config_dict['sdk'] = 'Windows 10'
+        
+        # Language codes
+        config_dict['lang_code'] = self._get_random_param('lang_code', 'en')
+        config_dict['system_lang_code'] = self._get_random_param('system_lang_code', 'en-US')
+        
+        # System version
+        config_dict['system_version'] = self._get_random_param('system_version', 'Windows 10 Pro 19045')
+        
+        # App name
+        config_dict['app_name'] = self._get_random_param('app_name', 'Telegram Desktop')
+        
+        # Device model
+        config_dict['device_model'] = self._get_random_param('device_model', 'PC 64bit')
+        
+        # Timezone
+        config_dict['timezone'] = self._get_random_param('timezone', 'UTC+0')
+        
+        # Screen resolution
+        config_dict['screen_resolution'] = self._get_random_param('screen_resolution', '1920x1080')
+        
+        # User agent
+        config_dict['user_agent'] = self._get_random_param('user_agent', 
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
+        
+        # CPU cores
+        cpu_cores = self._get_random_param('cpu_cores', '8')
+        try:
+            config_dict['cpu_cores'] = int(cpu_cores)
+        except ValueError:
+            config_dict['cpu_cores'] = 8
+        
+        # RAM size (in MB)
+        ram_size = self._get_random_param('ram_size', '16384')
+        try:
+            config_dict['ram_size'] = int(ram_size)
+        except ValueError:
+            config_dict['ram_size'] = 16384
+        
+        return config_dict
+    
+    def get_compatible_params(self) -> Dict[str, Any]:
+        """获取兼容的参数组合（智能匹配）
+        
+        智能匹配规则:
+        - Windows 11 系统配合较新的 Telegram 版本
+        - Windows 10 系统可以配合任意版本
+        - 语言代码与系统语言代码匹配
+        
+        Returns:
+            包含兼容设备参数的字典
+        """
+        config = self.get_random_device_config()
+        
+        # 智能匹配: Windows 11 使用较新版本
+        if 'Windows 11' in config.get('system_version', ''):
+            # 确保使用 4.x 版本的 Telegram
+            newer_versions = [v for v in self.params.get('app_version', []) if v.startswith('4.')]
+            if newer_versions:
+                config['app_version'] = random.choice(newer_versions)
+        
+        # 智能匹配: 语言代码与系统语言代码应该一致
+        lang_code = config.get('lang_code', 'en')
+        system_lang_codes = self.params.get('system_lang_code', [])
+        
+        # 找到匹配的系统语言代码
+        matching_system_langs = [slc for slc in system_lang_codes if slc.startswith(lang_code)]
+        if matching_system_langs:
+            config['system_lang_code'] = random.choice(matching_system_langs)
+        
+        # 智能匹配: 高端配置（多核CPU）配合更多内存
+        cpu_cores = config.get('cpu_cores', 8)
+        if cpu_cores >= 16:
+            # 高核心数配合更大内存
+            high_ram = []
+            for r in self.params.get('ram_size', []):
+                try:
+                    if int(r) >= 32768:
+                        high_ram.append(r)
+                except ValueError:
+                    continue
+            if high_ram:
+                try:
+                    config['ram_size'] = int(random.choice(high_ram))
+                except ValueError:
+                    pass
+        
+        return config
+
+
+# ================================
 # 防止找回管理器
 # ================================
 
@@ -6667,6 +6864,8 @@ class RecoveryProtectionManager:
         self.proxy_manager = proxy_manager
         self.db = db
         self.semaphore = asyncio.Semaphore(config.RECOVERY_CONCURRENT)
+        # 初始化设备参数加载器
+        self.device_loader = DeviceParamsLoader()
     
     @staticmethod
     def _fix_client_api_hash(client: TelegramClient, api_hash: str) -> None:
@@ -6682,43 +6881,92 @@ class RecoveryProtectionManager:
                 client.api_hash = str(api_hash)
     
     def _get_random_device_info(self) -> Tuple[str, str, str]:
-        """生成随机设备信息以防风控"""
-        # 使用配置的设备信息，如果未配置则随机生成
+        """生成随机设备信息以防风控
         
+        优先使用 device_params 目录中的参数文件。
+        如果环境变量已配置，则使用环境变量的值。
+        
+        Returns:
+            Tuple[device_model, system_version, app_version]
+        """
+        # 尝试使用 DeviceParamsLoader 获取参数
+        if hasattr(self, 'device_loader') and self.device_loader.params:
+            device_config = self.device_loader.get_compatible_params()
+            
+            # 使用环境变量覆盖（如果已配置）
+            if config.RECOVERY_DEVICE_MODEL:
+                device_model = config.RECOVERY_DEVICE_MODEL
+            else:
+                device_model = device_config.get('device_model', 'PC 64bit')
+            
+            if config.RECOVERY_SYSTEM_VERSION:
+                system_version = config.RECOVERY_SYSTEM_VERSION
+            else:
+                system_version = device_config.get('system_version', 'Windows 10 Pro 19045')
+            
+            if config.RECOVERY_APP_VERSION:
+                app_version = config.RECOVERY_APP_VERSION
+            else:
+                app_version = device_config.get('app_version', '4.12.2 x64')
+            
+            return device_model, system_version, app_version
+        
+        # 回退到原有逻辑
         if config.RECOVERY_DEVICE_MODEL:
             device_model = config.RECOVERY_DEVICE_MODEL
         else:
-            # 随机选择常见设备型号
+            # 使用 Windows 设备型号（与 device_params 保持一致）
             devices = [
-                "Samsung SM-G973F", "iPhone 12 Pro", "Xiaomi Redmi Note 10",
-                "OnePlus 9 Pro", "Google Pixel 5", "Huawei P40 Pro",
-                "iPhone 13", "Samsung SM-A52", "Xiaomi Mi 11",
-                "OnePlus Nord", "Realme GT", "OPPO Find X3"
+                "PC 64bit", "Desktop", "DESKTOP-GAMING", "DESKTOP-WORK",
+                "Workstation", "Gaming-PC", "Office-PC", "Home-PC"
             ]
             device_model = random.choice(devices)
         
         if config.RECOVERY_SYSTEM_VERSION:
             system_version = config.RECOVERY_SYSTEM_VERSION
         else:
-            # 根据设备型号生成合理的系统版本
-            if "iPhone" in device_model or "iPad" in device_model:
-                ios_versions = ["iOS 15.5", "iOS 15.6", "iOS 16.0", "iOS 16.1", "iOS 16.2"]
-                system_version = random.choice(ios_versions)
-            else:
-                android_versions = ["Android 11", "Android 12", "Android 13"]
-                system_version = random.choice(android_versions)
+            # 使用 Windows 系统版本
+            system_versions = [
+                "Windows 10 Pro 19045", "Windows 11 Pro 22631",
+                "Windows 10 Home 19045", "Windows 11 Home 22621"
+            ]
+            system_version = random.choice(system_versions)
         
         if config.RECOVERY_APP_VERSION:
             app_version = config.RECOVERY_APP_VERSION
         else:
-            # 使用最新稳定版本的 Telegram
-            if "iOS" in system_version:
-                versions = ["9.2.1", "9.3.0", "9.3.1"]
-            else:
-                versions = ["9.2.3", "9.3.2", "9.4.0"]
+            # 使用 Telegram Desktop 版本
+            versions = ["4.10.3 x64", "4.11.6 x64", "4.12.2 x64"]
             app_version = random.choice(versions)
         
         return device_model, system_version, app_version
+    
+    def _get_full_device_config(self) -> Dict[str, Any]:
+        """获取完整的设备配置（包含所有参数）
+        
+        使用 DeviceParamsLoader 获取兼容的随机参数组合。
+        
+        Returns:
+            包含所有设备参数的字典
+        """
+        if hasattr(self, 'device_loader') and self.device_loader.params:
+            return self.device_loader.get_compatible_params()
+        
+        # 回退到基本配置
+        device_model, system_version, app_version = self._get_random_device_info()
+        return {
+            'device_model': device_model,
+            'system_version': system_version,
+            'app_version': app_version,
+            'lang_code': config.RECOVERY_LANG_CODE or 'en',
+            'system_lang_code': 'en-US',
+            'app_name': 'Telegram Desktop',
+            'timezone': 'UTC+0',
+            'screen_resolution': '1920x1080',
+            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'cpu_cores': 8,
+            'ram_size': 16384
+        }
     
     def generate_strong_password(self) -> str:
         """生成强密码"""
@@ -7373,6 +7621,90 @@ class RecoveryProtectionManager:
                 account_name=account_name,
                 phone=context.phone,
                 stage="kick_devices",
+                success=False,
+                error=error_msg,
+                elapsed=time.time() - stage_start
+            )
+            context.stage_results.append(stage_result)
+            self.db.insert_recovery_log(stage_result)
+            return False, error_msg
+    
+    async def _stage_terminate_old_sessions(self, client: TelegramClient, context: RecoveryAccountContext) -> Tuple[bool, str]:
+        """阶段: 终止所有旧会话（在成功登录新设备后执行）
+        
+        调用 ResetAuthorizationsRequest 来终止所有其他会话，
+        确保旧会话（包括原始session文件对应的会话）完全失效。
+        
+        注意: 这个方法应该在新设备成功登录并完成密码修改后调用。
+        
+        Returns:
+            (是否成功, 错误信息或成功详情)
+        """
+        account_name = os.path.basename(context.original_path)
+        stage_start = time.time()
+        
+        try:
+            print(f"🔒 [{account_name}] 正在终止所有旧会话...")
+            
+            # 调用 ResetAuthorizationsRequest 终止所有其他会话
+            # 这会使所有其他设备上的会话失效
+            if TELETHON_AVAILABLE:
+                await asyncio.wait_for(
+                    client(ResetAuthorizationsRequest()),
+                    timeout=30
+                )
+                
+                detail = "已成功终止所有其他会话"
+                print(f"✅ [{account_name}] {detail}")
+                
+                stage_result = RecoveryStageResult(
+                    account_name=account_name,
+                    phone=context.phone,
+                    stage="terminate_old_sessions",
+                    success=True,
+                    detail=detail,
+                    elapsed=time.time() - stage_start
+                )
+                context.stage_results.append(stage_result)
+                self.db.insert_recovery_log(stage_result)
+                
+                return True, detail
+            else:
+                error_msg = "Telethon 未安装，无法终止会话"
+                stage_result = RecoveryStageResult(
+                    account_name=account_name,
+                    phone=context.phone,
+                    stage="terminate_old_sessions",
+                    success=False,
+                    error=error_msg,
+                    elapsed=time.time() - stage_start
+                )
+                context.stage_results.append(stage_result)
+                self.db.insert_recovery_log(stage_result)
+                return False, error_msg
+                
+        except asyncio.TimeoutError:
+            error_msg = "终止会话超时"
+            print(f"⏰ [{account_name}] {error_msg}")
+            stage_result = RecoveryStageResult(
+                account_name=account_name,
+                phone=context.phone,
+                stage="terminate_old_sessions",
+                success=False,
+                error=error_msg,
+                elapsed=time.time() - stage_start
+            )
+            context.stage_results.append(stage_result)
+            self.db.insert_recovery_log(stage_result)
+            return False, error_msg
+            
+        except Exception as e:
+            error_msg = f"终止会话异常: {str(e)[:100]}"
+            print(f"❌ [{account_name}] {error_msg}")
+            stage_result = RecoveryStageResult(
+                account_name=account_name,
+                phone=context.phone,
+                stage="terminate_old_sessions",
                 success=False,
                 error=error_msg,
                 elapsed=time.time() - stage_start
@@ -8694,6 +9026,18 @@ class RecoveryProtectionManager:
                             # Still mark as invalid since password was changed
                             context.old_session_valid = False
                         
+                        # ===== 阶段6.6: 终止所有其他会话 =====
+                        # 调用 ResetAuthorizationsRequest 确保旧会话完全失效
+                        print(f"🔒 [{account_name}] 调用终止所有其他会话...")
+                        try:
+                            terminate_success, terminate_detail = await self._stage_terminate_old_sessions(new_client, context)
+                            if terminate_success:
+                                print(f"✅ [{account_name}] 已终止所有其他会话: {terminate_detail}")
+                            else:
+                                print(f"⚠️ [{account_name}] 终止其他会话失败: {terminate_detail}")
+                        except Exception as terminate_err:
+                            print(f"⚠️ [{account_name}] 终止其他会话异常: {terminate_err}")
+                        
                     except Exception as e:
                         print(f"⚠️ [{account_name}] 验证新设备失败: {e}")
                 
@@ -9163,25 +9507,35 @@ class RecoveryProtectionManager:
         
         # 创建失败账号ZIP（仅在有失败账号时创建）
         # 文件名格式: 授权失败xx个 - 20251202.zip
-        # 失败原因分类到5个文件夹: 未授权封禁, 密码错误, 会话太新, 冻结, 连接错误
+        # 失败原因分类到5个文件夹: 1_未授权封禁, 2_密码错误, 3_会话太新, 4_冻结, 5_连接错误
         failed_contexts = [ctx for ctx in contexts if ctx.status in ("failed", "abnormal", "timeout")]
         failed_count = len(failed_contexts)
         failed_zip_filename = f"授权失败{failed_count}个 - {date_str}.zip"
         failed_zip_path = os.path.join(config.RECOVERY_REPORTS_DIR, failed_zip_filename)
         
         if failed_contexts:
-            # 按失败原因分类
+            # 按失败原因分类 - 使用编号文件夹名
             categorized_failures = {
-                "未授权封禁": [],  # Unauthorized/Banned
-                "密码错误": [],    # Password Error
-                "会话太新": [],    # Session Too New
-                "冻结": [],        # Frozen
-                "连接错误": []     # Connection Error (default)
+                "1_未授权封禁": [],  # Unauthorized/Banned
+                "2_密码错误": [],    # Password Error
+                "3_会话太新": [],    # Session Too New
+                "4_冻结": [],        # Frozen
+                "5_连接错误": []     # Connection Error (default)
+            }
+            
+            # 类别名称映射（从内部名称到编号名称）
+            category_mapping = {
+                "未授权封禁": "1_未授权封禁",
+                "密码错误": "2_密码错误",
+                "会话太新": "3_会话太新",
+                "冻结": "4_冻结",
+                "连接错误": "5_连接错误"
             }
             
             for ctx in failed_contexts:
                 category = self._categorize_failure_reason(ctx.failure_reason, ctx.stage_results)
-                categorized_failures[category].append(ctx)
+                numbered_category = category_mapping.get(category, "5_连接错误")
+                categorized_failures[numbered_category].append(ctx)
             
             with zipfile.ZipFile(failed_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
                 # 创建失败原因汇总说明文件
