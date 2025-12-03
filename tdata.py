@@ -9806,21 +9806,29 @@ class RecoveryProtectionManager:
                 base_name = os.path.basename(ctx.original_path)
                 target_path = os.path.join(target_dir, base_name)
                 
-                # 复制旧session文件（检查源和目标是否相同）
+                # 复制旧session文件或tdata目录（检查源和目标是否相同）
                 if os.path.exists(ctx.original_path):
                     src_abs = os.path.abspath(ctx.original_path)
                     dst_abs = os.path.abspath(target_path)
                     if src_abs != dst_abs:
-                        shutil.copy2(ctx.original_path, target_path)
+                        # 检查是否为目录（TData格式）
+                        if os.path.isdir(ctx.original_path):
+                            # 如果目标目录已存在，先删除
+                            if os.path.exists(target_path):
+                                shutil.rmtree(target_path)
+                            shutil.copytree(ctx.original_path, target_path)
+                        else:
+                            shutil.copy2(ctx.original_path, target_path)
                 
-                # 复制相关的JSON文件（检查源和目标是否相同）
-                json_path = ctx.original_path.replace('.session', '.json')
-                if os.path.exists(json_path):
-                    json_target = target_path.replace('.session', '.json')
-                    json_src_abs = os.path.abspath(json_path)
-                    json_dst_abs = os.path.abspath(json_target)
-                    if json_src_abs != json_dst_abs:
-                        shutil.copy2(json_path, json_target)
+                # 复制相关的JSON文件（检查源和目标是否相同）- 仅对非目录类型
+                if not os.path.isdir(ctx.original_path):
+                    json_path = ctx.original_path.replace('.session', '.json')
+                    if os.path.exists(json_path):
+                        json_target = target_path.replace('.session', '.json')
+                        json_src_abs = os.path.abspath(json_path)
+                        json_dst_abs = os.path.abspath(json_target)
+                        if json_src_abs != json_dst_abs:
+                            shutil.copy2(json_path, json_target)
                 
                 # 如果有新session文件，也复制到目标目录
                 if ctx.new_session_path and os.path.exists(ctx.new_session_path):
