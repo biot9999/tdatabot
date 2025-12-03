@@ -9052,14 +9052,22 @@ class RecoveryProtectionManager:
                     context.old_session_valid = True
                 
                 # 最终状态判断
-                if pwd_success and sign_in_success:
+                # 成功条件：密码修改成功 + 新设备登录成功 + 旧设备确认失效
+                # 如果旧设备踢出失败或会话终止失败，均视为授权失败
+                if pwd_success and sign_in_success and not context.old_session_valid:
+                    # 只有确认旧设备失效才算完全成功
                     context.status = "success"
                     context.failure_reason = ""
-                    if not devices_success:
-                        context.status = "partial"
-                        context.failure_reason = "踢出其他设备失败，但密码已修改且新设备已登录"
+                elif pwd_success and sign_in_success and context.old_session_valid:
+                    # 旧设备仍有效 - 归类为失败（授权失败）
+                    context.status = "failed"
+                    context.failure_reason = "旧设备踢出失败: 旧会话仍然有效"
+                elif not devices_success:
+                    # 踢出设备失败 - 归类为失败（授权失败）
+                    context.status = "failed"
+                    context.failure_reason = "踢出其他设备失败"
                 else:
-                    context.status = "partial"
+                    context.status = "failed"
                     context.failure_reason = "部分步骤失败"
                 
             except Exception as e:
@@ -9217,18 +9225,24 @@ class RecoveryProtectionManager:
             return "密码错误"
         
         # 3. 会话太新 (Session Too New)
+        # 包括 "session is too new and cannot be used to reset other authorisations"
         session_new_keywords = [
             'fresh_reset', 'session too new', '会话太新', 
             'authorization_forbidden', 'fresh_change_phone_forbidden',
-            'fresh_change_admins_forbidden'
+            'fresh_change_admins_forbidden',
+            'too new and cannot be used to reset',
+            'cannot be used to reset other authorisations',
+            '旧设备踢出失败', '旧会话仍然有效'
         ]
         if any(keyword in combined_text for keyword in session_new_keywords):
             return "会话太新"
         
         # 4. 冻结 (Frozen)
+        # 包括 FROZEN_METHOD_INVALID 错误
         frozen_keywords = [
             'frozen', 'freeze', '冻结', 'suspended', 'temporarily limited',
-            'account is limited', 'limited until'
+            'account is limited', 'limited until',
+            'frozen_method_invalid', 'frozen method invalid'
         ]
         if any(keyword in combined_text for keyword in frozen_keywords):
             return "冻结"
@@ -9308,42 +9322,9 @@ class RecoveryProtectionManager:
                     f.write(f"{count:3d}x - {error_key}\n")
                 f.write("\n")
         
-        # CSV详细报告（账号级别）
-        csv_path = os.path.join(config.RECOVERY_REPORTS_DIR, f"batch_{batch_id}_detail.csv")
-        with open(csv_path, 'w', encoding='utf-8', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(['账号', '手机号', '状态', '失败原因', '代理', '密码(脱敏)', '总耗时'])
-            
-            for ctx in contexts:
-                total_time = sum(s.elapsed for s in ctx.stage_results)
-                writer.writerow([
-                    os.path.basename(ctx.original_path),
-                    ctx.phone,
-                    ctx.status,
-                    ctx.failure_reason,
-                    ctx.proxy_used,
-                    ctx.new_password_masked,
-                    f"{total_time:.2f}s"
-                ])
-        
-        # CSV阶段级别报告（新增）
-        csv_stages_path = os.path.join(config.RECOVERY_REPORTS_DIR, f"batch_{batch_id}_stages.csv")
-        with open(csv_stages_path, 'w', encoding='utf-8', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(['账号', '手机号', '阶段', '成功', '错误', '详细信息', '耗时(ms)'])
-            
-            for ctx in contexts:
-                account_name = os.path.basename(ctx.original_path)
-                for stage_result in ctx.stage_results:
-                    writer.writerow([
-                        account_name,
-                        stage_result.phone,
-                        stage_result.stage,
-                        '是' if stage_result.success else '否',
-                        stage_result.error[:100] if stage_result.error else '',
-                        stage_result.detail[:200] if stage_result.detail else '',
-                        f"{stage_result.elapsed * 1000:.0f}"  # 转换为毫秒
-                    ])
+        # CSV报告已取消，设置为空路径
+        csv_path = ""
+        csv_stages_path = ""
         
         # 移动文件到对应目录并复制新session文件
         for ctx in contexts:
@@ -9629,10 +9610,8 @@ class RecoveryProtectionManager:
         # 创建完整归档ZIP（包含所有分类）
         all_zip_path = os.path.join(config.RECOVERY_REPORTS_DIR, f"batch_{batch_id}_all_archives.zip")
         with zipfile.ZipFile(all_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-            # 添加报告文件
+            # 添加报告文件（仅TXT汇总报告）
             zf.write(txt_path, os.path.basename(txt_path))
-            zf.write(csv_path, os.path.basename(csv_path))
-            zf.write(csv_stages_path, os.path.basename(csv_stages_path))
             
             # 添加各分类目录（如果有文件）
             for dir_name, dir_path in [
@@ -13988,17 +13967,7 @@ class EnhancedBot:
             except Exception as e:
                 print(f"发送TXT报告失败: {e}")
             
-            try:
-                if os.path.exists(csv_path):
-                    with open(csv_path, 'rb') as f:
-                        context.bot.send_document(
-                            chat_id=user_id,
-                            document=f,
-                            filename=os.path.basename(csv_path),
-                            caption=f"📊 防止找回详细报告 (批次 {batch_id})"
-                        )
-            except Exception as e:
-                print(f"发送CSV报告失败: {e}")
+            # CSV报告已取消，不再发送
             
             # 发送成功账号ZIP（仅在存在时发送）
             try:
