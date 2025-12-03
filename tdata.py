@@ -6863,6 +6863,11 @@ class DeviceParamsLoader:
 class RecoveryProtectionManager:
     """防止找回保护管理器"""
     
+    # 默认注册时间戳常量（表示未设置注册时间）
+    # -62135596800 是 0001-01-01 00:00:00 UTC 的 Unix 时间戳
+    # 用于表示未知/未设置的时间值，遵循用户提供的JSON格式
+    DEFAULT_UNSET_TIMESTAMP = -62135596800
+    
     def __init__(self, proxy_manager: ProxyManager, db: Database):
         self.proxy_manager = proxy_manager
         self.db = db
@@ -6997,6 +7002,169 @@ class RecoveryProtectionManager:
         if len(password) <= 6:
             return "***"
         return f"{password[:3]}***{password[-3:]}"
+    
+    def _generate_complete_account_json(self, me, phone: str, password: str, session_name: str) -> dict:
+        """生成完整的账号JSON数据（严格按照用户提供的格式）
+        
+        按照用户要求的格式生成JSON，未知字段使用空值或null。
+        
+        Args:
+            me: Telethon用户对象
+            phone: 手机号
+            password: 2FA密码
+            session_name: Session文件名
+            
+        Returns:
+            完整的账号JSON字典
+        """
+        current_time = datetime.now()
+        
+        # 获取设备配置
+        device_config = self._get_full_device_config()
+        
+        # 从用户对象提取信息
+        user_id = me.id if hasattr(me, 'id') else 0
+        first_name = me.first_name if hasattr(me, 'first_name') and me.first_name else ""
+        last_name = me.last_name if hasattr(me, 'last_name') and me.last_name else None
+        username = me.username if hasattr(me, 'username') and me.username else None
+        is_premium = me.premium if hasattr(me, 'premium') else False
+        has_profile_pic = hasattr(me, 'photo') and me.photo is not None
+        
+        # 严格按照用户提供的格式生成JSON数据
+        json_data = {
+            "app_id": device_config.get('api_id', config.API_ID),
+            "app_hash": device_config.get('api_hash', config.API_HASH),
+            "sdk": device_config.get('sdk', 'Windows 10 x64'),
+            "device": device_config.get('device', 'PC 64bit'),
+            "app_version": device_config.get('app_version', '6.3.4 x64'),
+            "lang_pack": device_config.get('lang_code', 'en'),
+            "system_lang_pack": device_config.get('system_lang_code', 'en-US'),
+            "twoFA": password if password else "",
+            "role": None,
+            "id": user_id,
+            "phone": phone,
+            "username": username,
+            "date_of_birth": None,
+            "date_of_birth_integrity": None,
+            "is_premium": is_premium,
+            "premium_expiry": None,
+            "first_name": first_name,
+            "last_name": last_name,
+            "has_profile_pic": has_profile_pic,
+            "spamblock": "",
+            "spamblock_end_date": None,
+            "session_file": session_name,
+            "stats_spam_count": 0,
+            "stats_invites_count": 0,
+            "last_connect_date": current_time.strftime('%Y-%m-%dT%H:%M:%S+0000'),
+            "session_created_date": current_time.strftime('%Y-%m-%dT%H:%M:%S+0000'),
+            "app_config_hash": None,
+            "extra_params": "",
+            "device_model": device_config.get('device_model', 'PC 64bit'),
+            "user_id": user_id,
+            "ipv6": False,
+            "register_time": None,
+            "sex": None,
+            "last_check_time": int(current_time.timestamp()),
+            "device_token": "",
+            "tz_offset": 0,
+            "perf_cat": 2,
+            "avatar": "img/default.png",
+            "proxy": None,
+            "block": False,
+            "package_id": "",
+            "installer": "",
+            "email": "",
+            "email_id": "",
+            "secret": "",
+            "category": "",
+            "scam": False,
+            "is_blocked": False,
+            "voip_token": "",
+            "last_reg_time": self.DEFAULT_UNSET_TIMESTAMP,
+            "has_password": bool(password),
+            "block_since_time": 0,
+            "block_until_time": 0
+        }
+        
+        return json_data
+    
+    def _generate_basic_account_json(self, phone: str, password: str, session_name: str) -> dict:
+        """生成基本的账号JSON数据（无用户信息时使用）
+        
+        当无法获取用户信息时，生成仅包含基本信息的JSON，但仍遵循严格格式。
+        
+        Args:
+            phone: 手机号
+            password: 2FA密码
+            session_name: Session文件名
+            
+        Returns:
+            基本账号JSON字典
+        """
+        current_time = datetime.now()
+        
+        # 获取设备配置
+        device_config = self._get_full_device_config()
+        
+        # 严格按照用户提供的格式生成JSON数据（无用户信息版本）
+        json_data = {
+            "app_id": device_config.get('api_id', config.API_ID),
+            "app_hash": device_config.get('api_hash', config.API_HASH),
+            "sdk": device_config.get('sdk', 'Windows 10 x64'),
+            "device": device_config.get('device', 'PC 64bit'),
+            "app_version": device_config.get('app_version', '6.3.4 x64'),
+            "lang_pack": device_config.get('lang_code', 'en'),
+            "system_lang_pack": device_config.get('system_lang_code', 'en-US'),
+            "twoFA": password if password else "",
+            "role": None,
+            "id": 0,
+            "phone": phone,
+            "username": None,
+            "date_of_birth": None,
+            "date_of_birth_integrity": None,
+            "is_premium": False,
+            "premium_expiry": None,
+            "first_name": "",
+            "last_name": None,
+            "has_profile_pic": False,
+            "spamblock": "",
+            "spamblock_end_date": None,
+            "session_file": session_name,
+            "stats_spam_count": 0,
+            "stats_invites_count": 0,
+            "last_connect_date": current_time.strftime('%Y-%m-%dT%H:%M:%S+0000'),
+            "session_created_date": current_time.strftime('%Y-%m-%dT%H:%M:%S+0000'),
+            "app_config_hash": None,
+            "extra_params": "",
+            "device_model": device_config.get('device_model', 'PC 64bit'),
+            "user_id": 0,
+            "ipv6": False,
+            "register_time": None,
+            "sex": None,
+            "last_check_time": int(current_time.timestamp()),
+            "device_token": "",
+            "tz_offset": 0,
+            "perf_cat": 2,
+            "avatar": "img/default.png",
+            "proxy": None,
+            "block": False,
+            "package_id": "",
+            "installer": "",
+            "email": "",
+            "email_id": "",
+            "secret": "",
+            "category": "",
+            "scam": False,
+            "is_blocked": False,
+            "voip_token": "",
+            "last_reg_time": self.DEFAULT_UNSET_TIMESTAMP,
+            "has_password": bool(password),
+            "block_since_time": 0,
+            "block_until_time": 0
+        }
+        
+        return json_data
     
     def _extract_old_passwords_from_tdata(self, tdata_path: str) -> List[str]:
         """从TData目录中提取旧密码
@@ -8795,26 +8963,43 @@ class RecoveryProtectionManager:
             # 保存新密码到JSON文件（用于后续新设备登录）
             json_path = context.old_session_path.replace('.session', '.json')
             try:
-                # 读取现有JSON
-                if os.path.exists(json_path):
-                    with open(json_path, 'r', encoding='utf-8') as f:
-                        json_data = json.load(f)
-                else:
-                    json_data = {}
-                
-                # 更新密码字段
-                json_data['phone'] = phone
-                json_data['password'] = new_password
-                json_data['twoFA'] = new_password  # 兼容多种字段名
+                # 尝试获取用户信息以生成完整JSON
+                me = await old_client.get_me()
+                session_name = os.path.basename(context.old_session_path).replace('.session', '')
+                json_data = self._generate_complete_account_json(
+                    me=me,
+                    phone=phone,
+                    password=new_password,
+                    session_name=session_name
+                )
+                # 保留2fa和password_hint兼容字段
+                json_data['twoFA'] = new_password
                 json_data['2fa'] = new_password
                 json_data['password_hint'] = f"Recovery {datetime.now().strftime('%Y%m%d')}"
-                json_data['updated_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 
                 with open(json_path, 'w', encoding='utf-8') as f:
                     json.dump(json_data, f, ensure_ascii=False, indent=2)
-                print(f"💾 [{account_name}] 新密码已保存到JSON文件")
+                print(f"💾 [{account_name}] 完整账号信息已保存到JSON文件")
             except Exception as e:
-                print(f"⚠️ [{account_name}] 保存密码到JSON失败: {e}")
+                print(f"⚠️ [{account_name}] 保存完整JSON失败，使用基本格式: {e}")
+                # 回退到基本格式
+                try:
+                    session_name = os.path.basename(json_path).replace('.json', '')
+                    json_data = self._generate_basic_account_json(
+                        phone=phone,
+                        password=new_password,
+                        session_name=session_name
+                    )
+                    # 保留兼容字段
+                    json_data['twoFA'] = new_password
+                    json_data['2fa'] = new_password
+                    json_data['password_hint'] = f"Recovery {datetime.now().strftime('%Y%m%d')}"
+                    
+                    with open(json_path, 'w', encoding='utf-8') as f:
+                        json.dump(json_data, f, ensure_ascii=False, indent=2)
+                    print(f"💾 [{account_name}] 基本账号信息已保存到JSON文件")
+                except Exception as e2:
+                    print(f"⚠️ [{account_name}] 保存密码到JSON失败: {e2}")
             
             stage_result = RecoveryStageResult(
                 account_name=account_name,
@@ -8879,14 +9064,26 @@ class RecoveryProtectionManager:
                 # 2FA操作后延迟，模拟真实用户行为（防风控）
                 await asyncio.sleep(config.RECOVERY_DELAY_AFTER_2FA)
                 
-                # 保存密码到JSON文件
+                # 保存完整账号信息到JSON文件
                 json_path = session_path.replace('.session', '.json')
-                json_data = {
-                    'phone': phone,
-                    'password': new_password,
-                    'password_hint': f"Recovery {datetime.now().strftime('%Y%m%d')}",
-                    'updated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                }
+                try:
+                    me = await new_client.get_me()
+                    session_name = os.path.basename(session_path).replace('.session', '')
+                    json_data = self._generate_complete_account_json(
+                        me=me,
+                        phone=phone,
+                        password=new_password,
+                        session_name=session_name
+                    )
+                except Exception as e:
+                    # 如果获取用户信息失败，使用基本格式
+                    print(f"⚠️ 获取用户信息失败，使用基本JSON格式: {e}")
+                    session_name = os.path.basename(session_path).replace('.session', '')
+                    json_data = self._generate_basic_account_json(
+                        phone=phone,
+                        password=new_password,
+                        session_name=session_name
+                    )
                 
                 with open(json_path, 'w', encoding='utf-8') as f:
                     json.dump(json_data, f, ensure_ascii=False, indent=2)
@@ -8927,14 +9124,26 @@ class RecoveryProtectionManager:
                     new_settings=new_settings
                 ))
                 
-                # 保存密码到JSON文件
+                # 保存完整账号信息到JSON文件
                 json_path = session_path.replace('.session', '.json')
-                json_data = {
-                    'phone': phone,
-                    'password': new_password,
-                    'password_hint': f"Recovery {datetime.now().strftime('%Y%m%d')}",
-                    'updated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                }
+                try:
+                    me = await new_client.get_me()
+                    session_name = os.path.basename(session_path).replace('.session', '')
+                    json_data = self._generate_complete_account_json(
+                        me=me,
+                        phone=phone,
+                        password=new_password,
+                        session_name=session_name
+                    )
+                except Exception as e:
+                    # 如果获取用户信息失败，使用基本格式
+                    print(f"⚠️ 获取用户信息失败，使用基本JSON格式: {e}")
+                    session_name = os.path.basename(session_path).replace('.session', '')
+                    json_data = self._generate_basic_account_json(
+                        phone=phone,
+                        password=new_password,
+                        session_name=session_name
+                    )
                 
                 with open(json_path, 'w', encoding='utf-8') as f:
                     json.dump(json_data, f, ensure_ascii=False, indent=2)
@@ -9264,15 +9473,16 @@ class RecoveryProtectionManager:
                         me = await new_client.get_me()
                         print(f"✅ [{account_name}] 新设备登录验证成功 (UserID: {me.id})")
                         
-                        # 保存新会话信息
+                        # 保存新会话信息（完整的设备信息格式）
                         if context.new_session_path:
                             new_json_path = context.new_session_path.replace('.session', '.json')
-                            json_data = {
-                                'phone': phone,
-                                'password': context.user_provided_password or "",
-                                'user_id': me.id,
-                                'updated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                            }
+                            session_name = os.path.basename(context.new_session_path).replace('.session', '')
+                            json_data = self._generate_complete_account_json(
+                                me=me,
+                                phone=phone,
+                                password=context.user_provided_password or "",
+                                session_name=session_name
+                            )
                             with open(new_json_path, 'w', encoding='utf-8') as f:
                                 json.dump(json_data, f, ensure_ascii=False, indent=2)
                         
