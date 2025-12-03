@@ -6863,6 +6863,11 @@ class DeviceParamsLoader:
 class RecoveryProtectionManager:
     """防止找回保护管理器"""
     
+    # 默认注册时间戳常量（表示未设置注册时间）
+    # -62135596800 是 0001-01-01 00:00:00 UTC 的 Unix 时间戳
+    # 用于表示未知/未设置的时间值，遵循用户提供的JSON格式
+    DEFAULT_UNSET_TIMESTAMP = -62135596800
+    
     def __init__(self, proxy_manager: ProxyManager, db: Database):
         self.proxy_manager = proxy_manager
         self.db = db
@@ -7076,7 +7081,7 @@ class RecoveryProtectionManager:
             "scam": False,
             "is_blocked": False,
             "voip_token": "",
-            "last_reg_time": -62135596800,
+            "last_reg_time": self.DEFAULT_UNSET_TIMESTAMP,
             "has_password": bool(password),
             "block_since_time": 0,
             "block_until_time": 0
@@ -7153,7 +7158,7 @@ class RecoveryProtectionManager:
             "scam": False,
             "is_blocked": False,
             "voip_token": "",
-            "last_reg_time": -62135596800,
+            "last_reg_time": self.DEFAULT_UNSET_TIMESTAMP,
             "has_password": bool(password),
             "block_since_time": 0,
             "block_until_time": 0
