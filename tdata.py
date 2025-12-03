@@ -14566,7 +14566,7 @@ class EnhancedBot:
                             chat_id=user_id,
                             document=f,
                             filename=os.path.basename(txt_path),
-                            caption=f"📄 防止找回结果报告 (批次 {batch_id})"
+                            caption=f"📄 防止找回结果报告 "
                         )
             except Exception as e:
                 print(f"发送TXT报告失败: {e}")
@@ -14581,7 +14581,7 @@ class EnhancedBot:
                             chat_id=user_id,
                             document=f,
                             filename=os.path.basename(success_zip_path),
-                            caption=f"✅ 成功账号打包 (批次 {batch_id}) - 共 {counters['success']} 个账号"
+                            caption=f"✅ 成功账号打包 -共 {counters['success']} 个"
                         )
             except Exception as e:
                 print(f"发送成功ZIP失败: {e}")
@@ -14595,7 +14595,7 @@ class EnhancedBot:
                             chat_id=user_id,
                             document=f,
                             filename=os.path.basename(failed_zip_path),
-                            caption=f"❌ 失败/异常账号打包 (批次 {batch_id}) - 共 {failed_count} 个账号\n包含详细失败原因说明"
+                            caption=f"❌ 失败/异常账号打包 - 共 {failed_count} 个"
                         )
             except Exception as e:
                 print(f"发送失败ZIP失败: {e}")
