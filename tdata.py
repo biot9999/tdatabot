@@ -5859,12 +5859,13 @@ class Forget2FAManager:
         self.db = db
         
         # 使用环境变量配置或传入参数或默认值
-        self.concurrent_limit = concurrent_limit or getattr(config, 'FORGET2FA_CONCURRENT', None) or self.DEFAULT_CONCURRENT_LIMIT
-        self.max_proxy_retries = max_proxy_retries or getattr(config, 'FORGET2FA_MAX_PROXY_RETRIES', None) or self.DEFAULT_MAX_PROXY_RETRIES
-        self.proxy_timeout = proxy_timeout or getattr(config, 'FORGET2FA_PROXY_TIMEOUT', None) or self.DEFAULT_PROXY_TIMEOUT
-        self.min_delay = min_delay if min_delay is not None else getattr(config, 'FORGET2FA_MIN_DELAY', None) or self.DEFAULT_MIN_DELAY
-        self.max_delay = max_delay if max_delay is not None else getattr(config, 'FORGET2FA_MAX_DELAY', None) or self.DEFAULT_MAX_DELAY
-        self.notify_wait = notify_wait if notify_wait is not None else getattr(config, 'FORGET2FA_NOTIFY_WAIT', None) or self.DEFAULT_NOTIFY_WAIT
+        # 使用显式None检查以支持0值作为有效配置
+        self.concurrent_limit = concurrent_limit if concurrent_limit is not None else (getattr(config, 'FORGET2FA_CONCURRENT', None) or self.DEFAULT_CONCURRENT_LIMIT)
+        self.max_proxy_retries = max_proxy_retries if max_proxy_retries is not None else (getattr(config, 'FORGET2FA_MAX_PROXY_RETRIES', None) or self.DEFAULT_MAX_PROXY_RETRIES)
+        self.proxy_timeout = proxy_timeout if proxy_timeout is not None else (getattr(config, 'FORGET2FA_PROXY_TIMEOUT', None) or self.DEFAULT_PROXY_TIMEOUT)
+        self.min_delay = min_delay if min_delay is not None else (getattr(config, 'FORGET2FA_MIN_DELAY', None) or self.DEFAULT_MIN_DELAY)
+        self.max_delay = max_delay if max_delay is not None else (getattr(config, 'FORGET2FA_MAX_DELAY', None) or self.DEFAULT_MAX_DELAY)
+        self.notify_wait = notify_wait if notify_wait is not None else (getattr(config, 'FORGET2FA_NOTIFY_WAIT', None) or self.DEFAULT_NOTIFY_WAIT)
         
         # 创建信号量控制并发
         self.semaphore = asyncio.Semaphore(self.concurrent_limit)
