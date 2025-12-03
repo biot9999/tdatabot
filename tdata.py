@@ -9599,7 +9599,6 @@ class RecoveryProtectionManager:
         
         # 并发处理
         tasks = []
-        task_contexts = {}  # 用于存储任务和context的映射
         for file_path, file_type in files:
             context = RecoveryAccountContext(
                 original_path=file_path,
@@ -9617,13 +9616,11 @@ class RecoveryProtectionManager:
                 )
             )
             tasks.append(task)
-            task_contexts[id(task)] = context
         
         # 等待所有任务完成，并实时更新进度
         completed = 0
         results = []
         for coro in asyncio.as_completed(tasks):
-            context = None
             try:
                 result = await coro
                 results.append(result)
@@ -9679,9 +9676,9 @@ class RecoveryProtectionManager:
                     except Exception:
                         pass
         
-        # 整理结果
+        # 整理结果 - 只收集成功返回的RecoveryAccountContext对象
         for result in results:
-            if isinstance(result, RecoveryAccountContext):
+            if result is not None and isinstance(result, RecoveryAccountContext):
                 contexts.append(result)
         
         # 保存汇总到数据库
