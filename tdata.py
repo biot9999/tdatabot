@@ -9640,51 +9640,57 @@ class RecoveryProtectionManager:
                     counters['failed'] += 1
                     continue
                 
-                try:
-                    result = task.result()
-                    if result is not None and isinstance(result, RecoveryAccountContext):
-                        contexts.append(result)
-                        
-                        # 实时统计
-                        if result.status == "success":
-                            counters['success'] += 1
-                        elif result.status == "abnormal":
-                            counters['abnormal'] += 1
-                        elif result.status == "timeout":
-                            counters['code_timeout'] += 1
-                        elif result.status == "partial":
-                            counters['partial'] += 1
-                        else:
-                            counters['failed'] += 1
-                    else:
-                        # 任务返回None或非RecoveryAccountContext，标记为失败并使用预创建的上下文
-                        counters['failed'] += 1
-                        context.status = "failed"
-                        context.failure_reason = "任务返回无效结果"
-                        contexts.append(context)
-                        
-                except asyncio.TimeoutError:
-                    # 任务超时，使用预创建的上下文
-                    counters['code_timeout'] += 1
-                    print(f"[run_batch] 任务超时: {context.original_path}")
-                    context.status = "timeout"
-                    context.failure_reason = "任务执行超时"
-                    contexts.append(context)
-                        
-                except asyncio.CancelledError:
-                    # 任务被取消，使用预创建的上下文
+                # 先检查任务状态，避免调用result()时出现意外异常
+                if task.cancelled():
+                    # 任务被取消
                     counters['failed'] += 1
                     print(f"[run_batch] 任务被取消: {context.original_path}")
                     context.status = "failed"
                     context.failure_reason = "任务被取消"
                     contexts.append(context)
-                        
-                except Exception as e:
-                    # 其他异常，使用预创建的上下文
+                    continue
+                
+                exc = task.exception()
+                if exc is not None:
+                    # 任务抛出异常
+                    error_type = type(exc).__name__
+                    error_msg = str(exc) if str(exc) else error_type
+                    
+                    if isinstance(exc, asyncio.TimeoutError):
+                        counters['code_timeout'] += 1
+                        print(f"[run_batch] 任务超时: {context.original_path}")
+                        context.status = "timeout"
+                        context.failure_reason = "任务执行超时"
+                    else:
+                        counters['failed'] += 1
+                        print(f"[run_batch] 任务异常 ({error_type}): {error_msg[:100]}")
+                        context.status = "failed"
+                        context.failure_reason = f"{error_type}: {error_msg[:100]}"
+                    
+                    contexts.append(context)
+                    continue
+                
+                # 任务正常完成，获取结果
+                result = task.result()
+                if result is not None and isinstance(result, RecoveryAccountContext):
+                    contexts.append(result)
+                    
+                    # 实时统计
+                    if result.status == "success":
+                        counters['success'] += 1
+                    elif result.status == "abnormal":
+                        counters['abnormal'] += 1
+                    elif result.status == "timeout":
+                        counters['code_timeout'] += 1
+                    elif result.status == "partial":
+                        counters['partial'] += 1
+                    else:
+                        counters['failed'] += 1
+                else:
+                    # 任务返回None或非RecoveryAccountContext，标记为失败并使用预创建的上下文
                     counters['failed'] += 1
-                    print(f"[run_batch] 任务异常: {e}")
                     context.status = "failed"
-                    context.failure_reason = f"任务异常: {str(e)[:100]}"
+                    context.failure_reason = "任务返回无效结果"
                     contexts.append(context)
                 
                 # 调用进度回调
