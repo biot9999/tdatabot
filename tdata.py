@@ -9601,11 +9601,30 @@ class RecoveryProtectionManager:
         tasks = []
         task_context_map = {}  # 映射: task -> context，用于异常时恢复上下文
         for file_path, file_type in files:
+            # 尝试从文件路径中提取手机号作为初始值
+            # 这样即使任务失败，也能保留账号标识用于打包
+            initial_phone = ""
+            if file_type == 'tdata':
+                # TData: 尝试从目录路径中提取手机号
+                initial_phone = self.extract_phone_from_tdata_directory(file_path)
+            else:
+                # Session: 从文件名中提取（去掉.session后缀）
+                basename = os.path.basename(file_path)
+                if basename.endswith('.session'):
+                    name_part = basename[:-8]  # 去掉 .session
+                    # 验证是否像手机号
+                    clean_name = name_part.lstrip('+').replace('_', '')
+                    if clean_name.isdigit() and len(clean_name) >= 10:
+                        initial_phone = clean_name
+                    else:
+                        # 非手机号格式，使用文件名作为标识
+                        initial_phone = name_part
+            
             context = RecoveryAccountContext(
                 original_path=file_path,
                 old_session_path=file_path,
                 new_session_path="",
-                phone="",
+                phone=initial_phone,  # 使用从路径提取的手机号
                 user_provided_password=user_password,  # 新密码（登录成功后设置）
                 user_provided_old_password=user_old_password  # 旧密码（用于2FA登录验证）
             )
@@ -9792,7 +9811,9 @@ class RecoveryProtectionManager:
         connection_keywords = [
             'connection', 'timeout', '超时', 'network', 'refused',
             'connect', '连接', 'timed out', 'dns', 'socket',
-            'proxy', 'localhost', 'unreachable', 'reset'
+            'proxy', 'localhost', 'unreachable', 'reset',
+            '任务执行超时', 'timeouterror', '任务被取消', 'cancellederror',
+            '任务异常', '任务返回无效结果'
         ]
         if any(keyword in combined_text for keyword in connection_keywords):
             return "连接错误"
