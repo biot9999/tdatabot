@@ -9599,6 +9599,7 @@ class RecoveryProtectionManager:
         
         # 并发处理
         tasks = []
+        task_context_map = {}  # 映射: task -> context，用于异常时恢复上下文
         for file_path, file_type in files:
             context = RecoveryAccountContext(
                 original_path=file_path,
@@ -9616,27 +9617,73 @@ class RecoveryProtectionManager:
                 )
             )
             tasks.append(task)
+            task_context_map[task] = context  # 保存任务与上下文的映射
         
         # 等待所有任务完成，并实时更新进度
+        # 使用 asyncio.wait 来追踪具体哪个任务完成/失败，以便正确关联上下文
         completed = 0
-        results = []
-        for coro in asyncio.as_completed(tasks):
-            try:
-                result = await coro
-                results.append(result)
+        pending_tasks = set(tasks)
+        
+        while pending_tasks:
+            done, pending_tasks = await asyncio.wait(
+                pending_tasks,
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            
+            for task in done:
                 completed += 1
+                context = task_context_map.get(task)
                 
-                # 实时统计
-                if result.status == "success":
-                    counters['success'] += 1
-                elif result.status == "abnormal":
-                    counters['abnormal'] += 1
-                elif result.status == "timeout":
+                try:
+                    result = task.result()
+                    if result is not None and isinstance(result, RecoveryAccountContext):
+                        contexts.append(result)
+                        
+                        # 实时统计
+                        if result.status == "success":
+                            counters['success'] += 1
+                        elif result.status == "abnormal":
+                            counters['abnormal'] += 1
+                        elif result.status == "timeout":
+                            counters['code_timeout'] += 1
+                        elif result.status == "partial":
+                            counters['partial'] += 1
+                        else:
+                            counters['failed'] += 1
+                    else:
+                        # 任务返回None或非RecoveryAccountContext，标记为失败并使用预创建的上下文
+                        counters['failed'] += 1
+                        if context:
+                            context.status = "failed"
+                            context.failure_reason = "任务返回无效结果"
+                            contexts.append(context)
+                        
+                except asyncio.TimeoutError:
+                    # 任务超时，使用预创建的上下文
                     counters['code_timeout'] += 1
-                elif result.status == "partial":
-                    counters['partial'] += 1
-                else:
+                    print(f"[run_batch] 任务超时: {context.original_path if context else 'unknown'}")
+                    if context:
+                        context.status = "timeout"
+                        context.failure_reason = "任务执行超时"
+                        contexts.append(context)
+                        
+                except asyncio.CancelledError:
+                    # 任务被取消，使用预创建的上下文
                     counters['failed'] += 1
+                    print(f"[run_batch] 任务被取消: {context.original_path if context else 'unknown'}")
+                    if context:
+                        context.status = "failed"
+                        context.failure_reason = "任务被取消"
+                        contexts.append(context)
+                        
+                except Exception as e:
+                    # 其他异常，使用预创建的上下文
+                    counters['failed'] += 1
+                    print(f"[run_batch] 任务异常: {e}")
+                    if context:
+                        context.status = "failed"
+                        context.failure_reason = f"任务异常: {str(e)[:100]}"
+                        contexts.append(context)
                 
                 # 调用进度回调
                 if progress_callback:
@@ -9644,42 +9691,6 @@ class RecoveryProtectionManager:
                         progress_callback(completed, len(files), counters)
                     except Exception:
                         pass
-                    
-            except asyncio.TimeoutError:
-                # 任务超时，标记为超时
-                completed += 1
-                counters['code_timeout'] += 1
-                print(f"[run_batch] 任务超时")
-                if progress_callback:
-                    try:
-                        progress_callback(completed, len(files), counters)
-                    except Exception:
-                        pass
-            except asyncio.CancelledError:
-                # 任务被取消，标记为失败但继续处理其他任务
-                completed += 1
-                counters['failed'] += 1
-                print(f"[run_batch] 任务被取消")
-                if progress_callback:
-                    try:
-                        progress_callback(completed, len(files), counters)
-                    except Exception:
-                        pass
-            except Exception as e:
-                # 其他异常，标记为失败
-                completed += 1
-                counters['failed'] += 1
-                print(f"[run_batch] 任务异常: {e}")
-                if progress_callback:
-                    try:
-                        progress_callback(completed, len(files), counters)
-                    except Exception:
-                        pass
-        
-        # 整理结果 - 只收集成功返回的RecoveryAccountContext对象
-        for result in results:
-            if result is not None and isinstance(result, RecoveryAccountContext):
-                contexts.append(result)
         
         # 保存汇总到数据库
         self.db.insert_recovery_summary(batch_id, counters)
