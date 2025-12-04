@@ -9608,7 +9608,13 @@ class RecoveryProtectionManager:
                 user_provided_password=user_password,  # 新密码（登录成功后设置）
                 user_provided_old_password=user_old_password  # 旧密码（用于2FA登录验证）
             )
-            task = self.process_single_account(file_path, file_type, context)
+            # 为每个任务添加超时保护（默认300秒）
+            task = asyncio.create_task(
+                asyncio.wait_for(
+                    self.process_single_account(file_path, file_type, context),
+                    timeout=config.RECOVERY_TIMEOUT if hasattr(config, 'RECOVERY_TIMEOUT') else 300
+                )
+            )
             tasks.append(task)
         
         # 等待所有任务完成，并实时更新进度
@@ -9634,18 +9640,45 @@ class RecoveryProtectionManager:
                 
                 # 调用进度回调
                 if progress_callback:
-                    progress_callback(completed, len(files), counters)
+                    try:
+                        progress_callback(completed, len(files), counters)
+                    except Exception:
+                        pass
                     
-            except Exception as e:
-                results.append(e)
+            except asyncio.TimeoutError:
+                # 任务超时，标记为超时
+                completed += 1
+                counters['code_timeout'] += 1
+                print(f"[run_batch] 任务超时")
+                if progress_callback:
+                    try:
+                        progress_callback(completed, len(files), counters)
+                    except Exception:
+                        pass
+            except asyncio.CancelledError:
+                # 任务被取消，标记为失败但继续处理其他任务
                 completed += 1
                 counters['failed'] += 1
+                print(f"[run_batch] 任务被取消")
                 if progress_callback:
-                    progress_callback(completed, len(files), counters)
+                    try:
+                        progress_callback(completed, len(files), counters)
+                    except Exception:
+                        pass
+            except Exception as e:
+                # 其他异常，标记为失败
+                completed += 1
+                counters['failed'] += 1
+                print(f"[run_batch] 任务异常: {e}")
+                if progress_callback:
+                    try:
+                        progress_callback(completed, len(files), counters)
+                    except Exception:
+                        pass
         
-        # 整理结果
+        # 整理结果 - 只收集成功返回的RecoveryAccountContext对象
         for result in results:
-            if not isinstance(result, Exception):
+            if result is not None and isinstance(result, RecoveryAccountContext):
                 contexts.append(result)
         
         # 保存汇总到数据库
@@ -12674,52 +12707,95 @@ class EnhancedBot:
         if user_status == "waiting_file":
             # 异步处理账号检测
             def process_file():
-                asyncio.run(self.process_enhanced_check(update, context, document))
+                try:
+                    asyncio.run(self.process_enhanced_check(update, context, document))
+                except asyncio.CancelledError:
+                    print(f"[process_file] 任务被取消")
+                except Exception as e:
+                    print(f"[process_file] 处理异常: {e}")
+                    import traceback
+                    traceback.print_exc()
             thread = threading.Thread(target=process_file)
             thread.start()
 
         elif user_status in ["waiting_convert_tdata", "waiting_convert_session"]:
             # 异步处理格式转换
             def process_conversion():
-                asyncio.run(self.process_format_conversion(update, context, document, user_status))
+                try:
+                    asyncio.run(self.process_format_conversion(update, context, document, user_status))
+                except asyncio.CancelledError:
+                    print(f"[process_conversion] 任务被取消")
+                except Exception as e:
+                    print(f"[process_conversion] 处理异常: {e}")
+                    import traceback
+                    traceback.print_exc()
             thread = threading.Thread(target=process_conversion)
             thread.start()
 
         elif user_status == "waiting_2fa_file":
             # 异步处理2FA密码修改
             def process_2fa():
-                asyncio.run(self.process_2fa_change(update, context, document))
+                try:
+                    asyncio.run(self.process_2fa_change(update, context, document))
+                except asyncio.CancelledError:
+                    print(f"[process_2fa] 任务被取消")
+                except Exception as e:
+                    print(f"[process_2fa] 处理异常: {e}")
+                    import traceback
+                    traceback.print_exc()
             thread = threading.Thread(target=process_2fa)
             thread.start()
 
         elif user_status == "waiting_api_file":
             # 新增：API转换处理
             def process_api_conversion():
-                asyncio.run(self.process_api_conversion(update, context, document))
+                try:
+                    asyncio.run(self.process_api_conversion(update, context, document))
+                except asyncio.CancelledError:
+                    print(f"[process_api_conversion] 任务被取消")
+                except Exception as e:
+                    print(f"[process_api_conversion] 处理异常: {e}")
+                    import traceback
+                    traceback.print_exc()
             thread = threading.Thread(target=process_api_conversion)
             thread.start()
         elif user_status == "waiting_classify_file":
             # 账号分类处理
             def process_classify():
-                asyncio.run(self.process_classify_stage1(update, context, document))
+                try:
+                    asyncio.run(self.process_classify_stage1(update, context, document))
+                except asyncio.CancelledError:
+                    print(f"[process_classify] 任务被取消")
+                except Exception as e:
+                    print(f"[process_classify] 处理异常: {e}")
+                    import traceback
+                    traceback.print_exc()
             thread = threading.Thread(target=process_classify, daemon=True)
-            thread.start()
-        elif user_status == "waiting_api_file":
-            # API转换：阶段1（解析并询问2FA）
-            def process_api_conversion():
-                asyncio.run(self.process_api_conversion(update, context, document))
-            thread = threading.Thread(target=process_api_conversion)
             thread.start()
         elif user_status == "waiting_recovery_file":
             # 防止找回处理
             def process_recovery():
-                asyncio.run(self.process_recovery_protection(update, context, document))
+                try:
+                    asyncio.run(self.process_recovery_protection(update, context, document))
+                except asyncio.CancelledError:
+                    print(f"[process_recovery] 任务被取消")
+                except Exception as e:
+                    print(f"[process_recovery] 处理异常: {e}")
+                    import traceback
+                    traceback.print_exc()
             thread = threading.Thread(target=process_recovery, daemon=True)
             thread.start()
         elif user_status == "waiting_forget_2fa_file":
             # 忘记2FA处理
             def process_forget_2fa():
-                asyncio.run(self.process_forget_2fa(update, context, document))
+                try:
+                    asyncio.run(self.process_forget_2fa(update, context, document))
+                except asyncio.CancelledError:
+                    print(f"[process_forget_2fa] 任务被取消")
+                except Exception as e:
+                    print(f"[process_forget_2fa] 处理异常: {e}")
+                    import traceback
+                    traceback.print_exc()
             thread = threading.Thread(target=process_forget_2fa, daemon=True)
             thread.start()
         # 清空用户状态
@@ -14624,6 +14700,13 @@ class EnhancedBot:
             except Exception as e:
                 print(f"发送失败ZIP失败: {e}")
             
+        except asyncio.CancelledError:
+            print(f"防止找回处理被取消: user_id={user_id}")
+            try:
+                progress_msg.edit_text("⚠️ <b>处理被取消</b>\n\n任务已中断，请重试", parse_mode='HTML')
+            except:
+                self.safe_send_message(update, "⚠️ <b>处理被取消</b>\n\n任务已中断，请重试", 'HTML')
+        
         except Exception as e:
             print(f"防止找回处理异常: {e}")
             import traceback
