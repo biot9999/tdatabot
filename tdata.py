@@ -15237,19 +15237,26 @@ class EnhancedBot:
                             json_name = file_name.replace('.session', '.json')
                             zf.write(json_path, json_name)
                     else:
-                        # 添加整个TData目录
-                        base_name = os.path.basename(file_path)
+                        # 添加整个TData目录，结构为: phone_number/tdata/...
+                        # file_path 是 tdata 目录的路径
+                        # file_name 是显示名称（通常是手机号）
+                        tdata_dir_name = os.path.basename(file_path)  # 通常是 "tdata"
+                        parent_dir = os.path.dirname(file_path)
+                        
+                        # 遍历tdata目录下的所有文件
                         for root, dirs, filenames in os.walk(file_path):
                             for fn in filenames:
                                 full_path = os.path.join(root, fn)
-                                rel_path = os.path.relpath(full_path, os.path.dirname(file_path))
-                                zf.write(full_path, rel_path)
+                                # 计算相对于tdata目录的路径
+                                rel_from_tdata = os.path.relpath(full_path, file_path)
+                                # 最终路径: phone_number/tdata/相对路径
+                                arcname = os.path.join(file_name, tdata_dir_name, rel_from_tdata)
+                                zf.write(full_path, arcname)
                         
-                        # 添加2fa.txt文件（与tdata同级）
-                        parent_dir = os.path.dirname(file_path)
+                        # 添加2fa.txt文件（与tdata同级，在phone_number目录下）
                         twofa_txt_path = os.path.join(parent_dir, "2fa.txt")
                         if os.path.exists(twofa_txt_path):
-                            # 使用file_name（显示名称，可能是手机号）作为前缀
+                            # 路径: phone_number/2fa.txt
                             twofa_arcname = os.path.join(file_name, "2fa.txt")
                             zf.write(twofa_txt_path, twofa_arcname)
             
