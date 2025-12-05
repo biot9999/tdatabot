@@ -9599,12 +9599,32 @@ class RecoveryProtectionManager:
         
         # 并发处理
         tasks = []
+        task_context_map = {}  # 映射: task -> context，用于异常时恢复上下文
         for file_path, file_type in files:
+            # 尝试从文件路径中提取手机号作为初始值
+            # 这样即使任务失败，也能保留账号标识用于打包
+            initial_phone = ""
+            if file_type == 'tdata':
+                # TData: 尝试从目录路径中提取手机号
+                initial_phone = self.extract_phone_from_tdata_directory(file_path)
+            else:
+                # Session: 从文件名中提取（去掉.session后缀）
+                basename = os.path.basename(file_path)
+                if basename.endswith('.session'):
+                    name_part = basename[:-8]  # 去掉 .session
+                    # 验证是否像手机号
+                    clean_name = name_part.lstrip('+').replace('_', '')
+                    if clean_name.isdigit() and len(clean_name) >= 10:
+                        initial_phone = clean_name
+                    else:
+                        # 非手机号格式，使用文件名作为标识
+                        initial_phone = name_part
+            
             context = RecoveryAccountContext(
                 original_path=file_path,
                 old_session_path=file_path,
                 new_session_path="",
-                phone="",
+                phone=initial_phone,  # 使用从路径提取的手机号
                 user_provided_password=user_password,  # 新密码（登录成功后设置）
                 user_provided_old_password=user_old_password  # 旧密码（用于2FA登录验证）
             )
@@ -9616,27 +9636,81 @@ class RecoveryProtectionManager:
                 )
             )
             tasks.append(task)
+            task_context_map[task] = context  # 保存任务与上下文的映射
         
         # 等待所有任务完成，并实时更新进度
+        # 使用 asyncio.wait 来追踪具体哪个任务完成/失败，以便正确关联上下文
         completed = 0
-        results = []
-        for coro in asyncio.as_completed(tasks):
-            try:
-                result = await coro
-                results.append(result)
+        pending_tasks = set(tasks)
+        
+        while pending_tasks:
+            done, pending_tasks = await asyncio.wait(
+                pending_tasks,
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            
+            for task in done:
                 completed += 1
+                context = task_context_map.get(task)
                 
-                # 实时统计
-                if result.status == "success":
-                    counters['success'] += 1
-                elif result.status == "abnormal":
-                    counters['abnormal'] += 1
-                elif result.status == "timeout":
-                    counters['code_timeout'] += 1
-                elif result.status == "partial":
-                    counters['partial'] += 1
-                else:
+                # 防御性检查：如果上下文不存在，记录警告并跳过
+                if context is None:
+                    print(f"[run_batch] 警告: 任务无对应上下文，可能存在编程错误")
                     counters['failed'] += 1
+                    continue
+                
+                # 先检查任务状态，避免调用result()时出现意外异常
+                if task.cancelled():
+                    # 任务被取消
+                    counters['failed'] += 1
+                    print(f"[run_batch] 任务被取消: {context.original_path}")
+                    context.status = "failed"
+                    context.failure_reason = "任务被取消"
+                    contexts.append(context)
+                    continue
+                
+                exc = task.exception()
+                if exc is not None:
+                    # 任务抛出异常
+                    error_type = type(exc).__name__
+                    error_msg = str(exc) if str(exc) else error_type
+                    
+                    if isinstance(exc, asyncio.TimeoutError):
+                        counters['code_timeout'] += 1
+                        print(f"[run_batch] 任务超时: {context.original_path}")
+                        context.status = "timeout"
+                        context.failure_reason = "任务执行超时"
+                    else:
+                        counters['failed'] += 1
+                        print(f"[run_batch] 任务异常 ({error_type}): {error_msg[:100]}")
+                        context.status = "failed"
+                        context.failure_reason = f"{error_type}: {error_msg[:100]}"
+                    
+                    contexts.append(context)
+                    continue
+                
+                # 任务正常完成，获取结果
+                result = task.result()
+                if result is not None and isinstance(result, RecoveryAccountContext):
+                    contexts.append(result)
+                    
+                    # 实时统计
+                    if result.status == "success":
+                        counters['success'] += 1
+                    elif result.status == "abnormal":
+                        counters['abnormal'] += 1
+                    elif result.status == "timeout":
+                        counters['code_timeout'] += 1
+                    elif result.status == "partial":
+                        counters['partial'] += 1
+                    else:
+                        counters['failed'] += 1
+                else:
+                    # 任务返回None或非RecoveryAccountContext，标记为失败并使用预创建的上下文
+                    counters['failed'] += 1
+                    context.status = "failed"
+                    context.failure_reason = "任务返回无效结果"
+                    contexts.append(context)
                 
                 # 调用进度回调
                 if progress_callback:
@@ -9644,42 +9718,6 @@ class RecoveryProtectionManager:
                         progress_callback(completed, len(files), counters)
                     except Exception:
                         pass
-                    
-            except asyncio.TimeoutError:
-                # 任务超时，标记为超时
-                completed += 1
-                counters['code_timeout'] += 1
-                print(f"[run_batch] 任务超时")
-                if progress_callback:
-                    try:
-                        progress_callback(completed, len(files), counters)
-                    except Exception:
-                        pass
-            except asyncio.CancelledError:
-                # 任务被取消，标记为失败但继续处理其他任务
-                completed += 1
-                counters['failed'] += 1
-                print(f"[run_batch] 任务被取消")
-                if progress_callback:
-                    try:
-                        progress_callback(completed, len(files), counters)
-                    except Exception:
-                        pass
-            except Exception as e:
-                # 其他异常，标记为失败
-                completed += 1
-                counters['failed'] += 1
-                print(f"[run_batch] 任务异常: {e}")
-                if progress_callback:
-                    try:
-                        progress_callback(completed, len(files), counters)
-                    except Exception:
-                        pass
-        
-        # 整理结果 - 只收集成功返回的RecoveryAccountContext对象
-        for result in results:
-            if result is not None and isinstance(result, RecoveryAccountContext):
-                contexts.append(result)
         
         # 保存汇总到数据库
         self.db.insert_recovery_summary(batch_id, counters)
@@ -9773,7 +9811,9 @@ class RecoveryProtectionManager:
         connection_keywords = [
             'connection', 'timeout', '超时', 'network', 'refused',
             'connect', '连接', 'timed out', 'dns', 'socket',
-            'proxy', 'localhost', 'unreachable', 'reset'
+            'proxy', 'localhost', 'unreachable', 'reset',
+            '任务执行超时', 'timeouterror', '任务被取消', 'cancellederror',
+            '任务异常', '任务返回无效结果'
         ]
         if any(keyword in combined_text for keyword in connection_keywords):
             return "连接错误"
@@ -14602,17 +14642,31 @@ class EnhancedBot:
                     try:
                         elapsed = current_time - start_time
                         avg_time = elapsed / processed if processed > 0 else 0
+                        progress_pct = int(processed / total * 100) if total > 0 else 0
+                        
+                        # 获取统计数据
+                        success_count = stats.get('success', 0) if stats else 0
+                        failed_count = stats.get('failed', 0) if stats else 0
+                        
+                        # 使用按钮显示实时进度 - 2排，每排2个按钮
+                        progress_keyboard = InlineKeyboardMarkup([
+                            [
+                                InlineKeyboardButton(f"✅ 成功", callback_data="progress_noop"),
+                                InlineKeyboardButton(f"{success_count}", callback_data="progress_noop")
+                            ],
+                            [
+                                InlineKeyboardButton(f"❌ 失败", callback_data="progress_noop"),
+                                InlineKeyboardButton(f"{failed_count}", callback_data="progress_noop")
+                            ]
+                        ])
                         
                         progress_msg.edit_text(
                             f"🛡️ <b>防止找回进度</b>\n\n"
-                            f"已处理: {processed}/{total}\n"
-                            f"成功: {stats.get('success', 0) if stats else 0} | "
-                            f"失败: {stats.get('failed', 0) if stats else 0} | "
-                            f"超时: {stats.get('code_timeout', 0) if stats else 0} | "
-                            f"异常: {stats.get('abnormal', 0) if stats else 0}\n"
-                            f"平均耗时: {avg_time:.1f}s\n\n"
-                            f"⏳ 请稍候...",
-                            parse_mode='HTML'
+                            f"📊 进度: {progress_pct}% ({processed}/{total})\n"
+                            f"⏱️ 平均耗时: {avg_time:.1f}s\n\n"
+                            f"⏳ 处理中...",
+                            parse_mode='HTML',
+                            reply_markup=progress_keyboard
                         )
                         last_update_time = current_time
                     except:
