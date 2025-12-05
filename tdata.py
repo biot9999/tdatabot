@@ -14647,10 +14647,8 @@ class EnhancedBot:
                         # 获取统计数据
                         success_count = stats.get('success', 0) if stats else 0
                         failed_count = stats.get('failed', 0) if stats else 0
-                        timeout_count = stats.get('code_timeout', 0) if stats else 0
-                        abnormal_count = stats.get('abnormal', 0) if stats else 0
                         
-                        # 使用按钮显示实时进度
+                        # 使用按钮显示实时进度 - 2排，每排2个按钮
                         progress_keyboard = InlineKeyboardMarkup([
                             [
                                 InlineKeyboardButton(f"✅ 成功", callback_data="progress_noop"),
@@ -14659,14 +14657,6 @@ class EnhancedBot:
                             [
                                 InlineKeyboardButton(f"❌ 失败", callback_data="progress_noop"),
                                 InlineKeyboardButton(f"{failed_count}", callback_data="progress_noop")
-                            ],
-                            [
-                                InlineKeyboardButton(f"⏱️ 超时", callback_data="progress_noop"),
-                                InlineKeyboardButton(f"{timeout_count}", callback_data="progress_noop")
-                            ],
-                            [
-                                InlineKeyboardButton(f"⚠️ 异常", callback_data="progress_noop"),
-                                InlineKeyboardButton(f"{abnormal_count}", callback_data="progress_noop")
                             ]
                         ])
                         
