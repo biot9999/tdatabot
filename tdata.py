@@ -15327,12 +15327,23 @@ class EnhancedBot:
             # 创建新的JSON文件
             # 从session文件名提取手机号（如果可能）
             base_name = session_name.replace('.session', '')
-            phone = base_name if base_name.replace('+', '').isdigit() else ""
+            # 清理手机号格式：移除常见的非数字字符
+            cleaned_phone = ''.join(c for c in base_name if c.isdigit())
+            phone = cleaned_phone if cleaned_phone and len(cleaned_phone) >= 10 else ""
             
             current_time = datetime.now()
             
-            # 获取设备配置
-            device_config = self.two_factor_manager._get_full_device_config()
+            # 使用默认设备配置
+            device_config = {
+                'api_id': config.API_ID,
+                'api_hash': config.API_HASH,
+                'sdk': 'Windows 10 x64',
+                'device': 'PC 64bit',
+                'app_version': '6.3.4 x64',
+                'lang_code': 'en',
+                'system_lang_code': 'en-US',
+                'device_model': 'PC 64bit',
+            }
             
             # 使用用户提供的模板格式生成JSON
             json_data = {
