@@ -14642,17 +14642,41 @@ class EnhancedBot:
                     try:
                         elapsed = current_time - start_time
                         avg_time = elapsed / processed if processed > 0 else 0
+                        progress_pct = int(processed / total * 100) if total > 0 else 0
+                        
+                        # 获取统计数据
+                        success_count = stats.get('success', 0) if stats else 0
+                        failed_count = stats.get('failed', 0) if stats else 0
+                        timeout_count = stats.get('code_timeout', 0) if stats else 0
+                        abnormal_count = stats.get('abnormal', 0) if stats else 0
+                        
+                        # 使用按钮显示实时进度
+                        progress_keyboard = InlineKeyboardMarkup([
+                            [
+                                InlineKeyboardButton(f"✅ 成功", callback_data="progress_noop"),
+                                InlineKeyboardButton(f"{success_count}", callback_data="progress_noop")
+                            ],
+                            [
+                                InlineKeyboardButton(f"❌ 失败", callback_data="progress_noop"),
+                                InlineKeyboardButton(f"{failed_count}", callback_data="progress_noop")
+                            ],
+                            [
+                                InlineKeyboardButton(f"⏱️ 超时", callback_data="progress_noop"),
+                                InlineKeyboardButton(f"{timeout_count}", callback_data="progress_noop")
+                            ],
+                            [
+                                InlineKeyboardButton(f"⚠️ 异常", callback_data="progress_noop"),
+                                InlineKeyboardButton(f"{abnormal_count}", callback_data="progress_noop")
+                            ]
+                        ])
                         
                         progress_msg.edit_text(
                             f"🛡️ <b>防止找回进度</b>\n\n"
-                            f"已处理: {processed}/{total}\n"
-                            f"成功: {stats.get('success', 0) if stats else 0} | "
-                            f"失败: {stats.get('failed', 0) if stats else 0} | "
-                            f"超时: {stats.get('code_timeout', 0) if stats else 0} | "
-                            f"异常: {stats.get('abnormal', 0) if stats else 0}\n"
-                            f"平均耗时: {avg_time:.1f}s\n\n"
-                            f"⏳ 请稍候...",
-                            parse_mode='HTML'
+                            f"📊 进度: {progress_pct}% ({processed}/{total})\n"
+                            f"⏱️ 平均耗时: {avg_time:.1f}s\n\n"
+                            f"⏳ 处理中...",
+                            parse_mode='HTML',
+                            reply_markup=progress_keyboard
                         )
                         last_update_time = current_time
                     except:
