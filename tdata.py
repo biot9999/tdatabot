@@ -15217,48 +15217,21 @@ class EnhancedBot:
                     failed_count += 1
                     results.append((file_name, "❌ 错误", str(e)[:50]))
             
-            # 创建结果ZIP文件
+            # 创建结果ZIP文件 - 保持原始目录结构，只添加2fa.txt
             timestamp = int(time.time())
             result_dir = os.path.join(config.RESULTS_DIR, f"add_2fa_{user_id}_{timestamp}")
             os.makedirs(result_dir, exist_ok=True)
             
             result_zip_path = os.path.join(result_dir, f"add_2fa_result_{timestamp}.zip")
             
+            # 直接打包整个extract_dir，保持原始结构（2fa.txt已经被添加到正确位置）
             with zipfile.ZipFile(result_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-                for file_path, file_name in files:
-                    if file_type == "session":
-                        # 添加session文件
-                        if os.path.exists(file_path):
-                            zf.write(file_path, file_name)
-                        
-                        # 添加对应的json文件
-                        json_path = file_path.replace('.session', '.json')
-                        if os.path.exists(json_path):
-                            json_name = file_name.replace('.session', '.json')
-                            zf.write(json_path, json_name)
-                    else:
-                        # 添加整个TData目录，结构为: phone_number/tdata/...
-                        # file_path 是 tdata 目录的路径
-                        # file_name 是显示名称（通常是手机号）
-                        tdata_dir_name = os.path.basename(file_path)  # 通常是 "tdata"
-                        parent_dir = os.path.dirname(file_path)
-                        
-                        # 遍历tdata目录下的所有文件
-                        for root, dirs, filenames in os.walk(file_path):
-                            for fn in filenames:
-                                full_path = os.path.join(root, fn)
-                                # 计算相对于tdata目录的路径
-                                rel_from_tdata = os.path.relpath(full_path, file_path)
-                                # 最终路径: phone_number/tdata/相对路径
-                                arcname = os.path.join(file_name, tdata_dir_name, rel_from_tdata)
-                                zf.write(full_path, arcname)
-                        
-                        # 添加2fa.txt文件（与tdata同级，在phone_number目录下）
-                        twofa_txt_path = os.path.join(parent_dir, "2fa.txt")
-                        if os.path.exists(twofa_txt_path):
-                            # 路径: phone_number/2fa.txt
-                            twofa_arcname = os.path.join(file_name, "2fa.txt")
-                            zf.write(twofa_txt_path, twofa_arcname)
+                for root, dirs, filenames in os.walk(extract_dir):
+                    for fn in filenames:
+                        full_path = os.path.join(root, fn)
+                        # 计算相对于extract_dir的路径，保持原始结构
+                        rel_path = os.path.relpath(full_path, extract_dir)
+                        zf.write(full_path, rel_path)
             
             # 发送结果
             elapsed = time.time() - task_info['start_time']
