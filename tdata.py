@@ -824,6 +824,7 @@ class Config:
         self.RECOVERY_TIMEOUT = int(os.getenv("RECOVERY_TIMEOUT", "300"))  # Per-account processing timeout (seconds)
         self.RECOVERY_CLEANUP_DELAY = float(os.getenv("RECOVERY_CLEANUP_DELAY", "0.5"))  # Delay for task cleanup (seconds)
         self.RECOVERY_CONNECT_TIMEOUT = int(os.getenv("RECOVERY_CONNECT_TIMEOUT", "30"))  # Connection timeout per attempt (seconds)
+        self.RECOVERY_TASK_CLEANUP_TIMEOUT = float(os.getenv("RECOVERY_TASK_CLEANUP_TIMEOUT", "2.0"))  # Timeout for cleaning up tasks (seconds)
         self.WEB_SERVER_PORT = int(os.getenv("WEB_SERVER_PORT", "8080"))
         self.ALLOW_PORT_SHIFT = os.getenv("ALLOW_PORT_SHIFT", "true").lower() == "true"
         self.DEBUG_RECOVERY = os.getenv("DEBUG_RECOVERY", "true").lower() == "true"
@@ -935,6 +936,7 @@ RECOVERY_RETRY_BACKOFF_BASE=0.75
 RECOVERY_STAGE_TIMEOUT=300
 RECOVERY_TIMEOUT=300
 RECOVERY_CONNECT_TIMEOUT=30
+RECOVERY_TASK_CLEANUP_TIMEOUT=2.0
 WEB_SERVER_PORT=8080
 ALLOW_PORT_SHIFT=true
 DEBUG_RECOVERY=true
@@ -7592,10 +7594,11 @@ class RecoveryProtectionManager:
             
             try:
                 # 先断开连接（带超时保护）
+                # Note: Broad exception catch is intentional - disconnect should never block or fail the retry flow
                 try:
                     await asyncio.wait_for(client.disconnect(), timeout=5)
-                except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
-                    pass  # 忽略断开连接的错误
+                except (asyncio.TimeoutError, asyncio.CancelledError, OSError, Exception):
+                    pass  # 忽略断开连接的错误（包括超时、取消、网络错误等）
                 
                 # 设置代理参数（简化版，实际可能需要更复杂的proxy配置）
                 # 这里假设client已经在创建时配置了proxy
@@ -7607,7 +7610,6 @@ class RecoveryProtectionManager:
             
             except asyncio.TimeoutError:
                 reason = "timeout"
-                last_error = f"连接超时({connect_timeout}s)"
                 print(f"⚠️ 代理连接超时 (attempt {attempt + 1}/{config.RECOVERY_PROXY_RETRIES + 1})")
             except asyncio.CancelledError:
                 # 任务被取消，重新抛出以便上层处理
@@ -7623,7 +7625,6 @@ class RecoveryProtectionManager:
                 else:
                     reason = "connection refused"
                 
-                last_error = f"{reason}: {str(e)[:50]}"
                 print(f"⚠️ 代理连接失败 (attempt {attempt + 1}): {reason}")
             
             # 最后一次尝试后，回退到本地连接
@@ -9812,6 +9813,7 @@ class RecoveryProtectionManager:
             # Cleanup phase: ensure all tasks are properly awaited to avoid "Task was destroyed but pending" warnings
             # This handles cases where asyncio.wait_for timeout cancels tasks but they haven't fully cleaned up
             # Enhanced: Use shield and more aggressive cleanup for tasks with pending network operations
+            task_cleanup_timeout = getattr(config, 'RECOVERY_TASK_CLEANUP_TIMEOUT', 2.0)
             all_batch_tasks = list(task_context_map.keys())
             for task in all_batch_tasks:
                 context = task_context_map.get(task)
@@ -9823,7 +9825,7 @@ class RecoveryProtectionManager:
                         task.cancel()
                         try:
                             # Use a short timeout for cleanup to avoid hanging
-                            await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
+                            await asyncio.wait_for(asyncio.shield(task), timeout=task_cleanup_timeout)
                         except (asyncio.CancelledError, asyncio.TimeoutError):
                             # Expected exceptions during task cleanup
                             pass
@@ -9838,7 +9840,7 @@ class RecoveryProtectionManager:
                     task.cancel()
                     try:
                         # Use a short timeout for cleanup to avoid hanging on network operations
-                        await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
+                        await asyncio.wait_for(asyncio.shield(task), timeout=task_cleanup_timeout)
                     except asyncio.CancelledError:
                         # Expected when task is cancelled
                         pass
