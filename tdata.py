@@ -822,6 +822,7 @@ class Config:
         self.RECOVERY_RETRY_BACKOFF_BASE = float(os.getenv("RECOVERY_RETRY_BACKOFF_BASE", "0.75"))
         self.RECOVERY_STAGE_TIMEOUT = int(os.getenv("RECOVERY_STAGE_TIMEOUT", "300"))
         self.RECOVERY_TIMEOUT = int(os.getenv("RECOVERY_TIMEOUT", "300"))  # Per-account processing timeout (seconds)
+        self.RECOVERY_CLEANUP_DELAY = float(os.getenv("RECOVERY_CLEANUP_DELAY", "0.5"))  # Delay for task cleanup (seconds)
         self.WEB_SERVER_PORT = int(os.getenv("WEB_SERVER_PORT", "8080"))
         self.ALLOW_PORT_SHIFT = os.getenv("ALLOW_PORT_SHIFT", "true").lower() == "true"
         self.DEBUG_RECOVERY = os.getenv("DEBUG_RECOVERY", "true").lower() == "true"
@@ -9756,8 +9757,12 @@ class RecoveryProtectionManager:
                         task.cancel()
                         try:
                             await task
-                        except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                        except (asyncio.CancelledError, asyncio.TimeoutError):
+                            # Expected exceptions during task cleanup
                             pass
+                        except Exception as e:
+                            # Log unexpected exceptions but don't fail
+                            print(f"[run_batch] Unexpected cleanup exception: {type(e).__name__}")
                     continue
                 
                 # Cancel if still running
@@ -9797,7 +9802,8 @@ class RecoveryProtectionManager:
         
         # Final cleanup: give event loop a chance to clean up any remaining pending tasks
         # This helps prevent "Task was destroyed but it is pending" warnings
-        await asyncio.sleep(0.5)
+        cleanup_delay = config.RECOVERY_CLEANUP_DELAY if hasattr(config, 'RECOVERY_CLEANUP_DELAY') else 0.5
+        await asyncio.sleep(cleanup_delay)
         
         print(f"[run_batch] Batch processing completed: success {counters['success']}, failed {counters['failed']}, "
               f"abnormal {counters['abnormal']}, timeout {counters['code_timeout']}, partial {counters['partial']}")
