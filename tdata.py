@@ -9071,12 +9071,8 @@ class RecoveryProtectionManager:
                                             context: RecoveryAccountContext) -> Tuple[bool, str]:
         """在旧会话修改密码（改进版）
         
-        按照issue要求的流程，使用UpdatePasswordSettingsRequest来修改密码
+        使用Telethon的edit_2fa方法来修改密码
         """
-        from telethon.tl.functions.account import GetPasswordRequest, UpdatePasswordSettingsRequest
-        from telethon.tl.types import account as account_types
-        from telethon.crypto import pwd as pwd_mod
-        
         account_name = os.path.basename(context.original_path)
         stage_start = time.time()
         
@@ -9086,39 +9082,26 @@ class RecoveryProtectionManager:
                 new_password = self.generate_strong_password()
                 context.user_provided_password = new_password
             
-            password = await old_client(GetPasswordRequest())
-            
-            # 计算密码哈希
-            if password.has_password:
-                old_password_hash = pwd_mod.compute_check(
-                    password, 
-                    context.verified_old_password
+            # 使用Telethon的edit_2fa方法修改密码
+            # 如果账号有2FA，需要提供verified_old_password
+            if context.has_2fa and context.verified_old_password:
+                await old_client.edit_2fa(
+                    current_password=context.verified_old_password,
+                    new_password=new_password,
+                    hint=context.new_password_hint or f"Recovery {datetime.now().strftime('%Y%m%d')}"
                 )
             else:
-                old_password_hash = b''
-            
-            new_password_hash = pwd_mod.compute_hash(password.new_algo, new_password)
-            
-            # 修改密码
-            await old_client(UpdatePasswordSettingsRequest(
-                password=old_password_hash,
-                new_settings=account_types.PasswordInputSettings(
-                    new_algo=password.new_algo,
-                    new_password_hash=new_password_hash,
-                    hint=context.new_password_hint or ""
+                # 账号没有2FA，直接设置新密码
+                await old_client.edit_2fa(
+                    new_password=new_password,
+                    hint=context.new_password_hint or f"Recovery {datetime.now().strftime('%Y%m%d')}"
                 )
-            ))
             
             # 等待生效
             await asyncio.sleep(3)
             
-            # 验证新密码
-            test_password = await old_client(GetPasswordRequest())
-            if test_password.has_password:
-                pwd_mod.compute_check(test_password, new_password)
-                print(f"✅ [{account_name}] 新密码验证成功")
-            
             context.new_password_masked = self.mask_password(new_password)
+            print(f"✅ [{account_name}] 密码修改成功: {context.new_password_masked}")
             
             elapsed = time.time() - stage_start
             stage_result = RecoveryStageResult(
@@ -9136,6 +9119,7 @@ class RecoveryProtectionManager:
             
         except PasswordHashInvalidError:
             elapsed = time.time() - stage_start
+            print(f"❌ [{account_name}] 旧密码错误")
             stage_result = RecoveryStageResult(
                 account_name=account_name,
                 phone=context.phone,
@@ -9150,6 +9134,7 @@ class RecoveryProtectionManager:
         except FloodWaitError as e:
             elapsed = time.time() - stage_start
             wait_time = getattr(e, 'seconds', 60)
+            print(f"❌ [{account_name}] 操作过快，需等待{wait_time}秒")
             stage_result = RecoveryStageResult(
                 account_name=account_name,
                 phone=context.phone,
@@ -9164,6 +9149,7 @@ class RecoveryProtectionManager:
         except Exception as e:
             elapsed = time.time() - stage_start
             error_msg = str(e)[:50]
+            print(f"❌ [{account_name}] 密码修改异常: {error_msg}")
             stage_result = RecoveryStageResult(
                 account_name=account_name,
                 phone=context.phone,
