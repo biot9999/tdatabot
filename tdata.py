@@ -236,6 +236,40 @@ class RecoveryAccountContext:
     
     # 新增字段 - 旧会话验证
     old_session_valid: bool = True  # 旧会话是否仍有效（成功后应为False）
+    
+    # 新增字段 - 2FA和密码验证
+    has_2fa: bool = False  # 账号是否有2FA
+    verified_old_password: str = ""  # 验证成功的旧密码
+    password_source: str = ""  # 密码来源（TData文件/JSON文件/用户提供等）
+    phone_code_hash: str = ""  # 验证码请求返回的hash
+    new_password_hint: str = ""  # 新密码提示
+    old_client: Optional[Any] = None  # 旧客户端实例
+    new_client: Optional[Any] = None  # 新客户端实例
+    final_sessions_count: int = 0  # 最终会话数量
+
+# ================================
+# 速率限制器
+# ================================
+
+class RateLimiter:
+    """速率限制器 - 防止操作过快触发Telegram限制"""
+    def __init__(self):
+        self.last_operations = {}
+        self.locks = {}
+    
+    async def acquire(self, operation: str, min_interval: float = 1.0):
+        """获取操作许可"""
+        if operation not in self.locks:
+            self.locks[operation] = asyncio.Lock()
+        
+        async with self.locks[operation]:
+            if operation in self.last_operations:
+                elapsed = time.time() - self.last_operations[operation]
+                if elapsed < min_interval:
+                    wait_time = min_interval - elapsed
+                    await asyncio.sleep(wait_time)
+            
+            self.last_operations[operation] = time.time()
 
 # ================================
 # 代理管理器
@@ -796,9 +830,9 @@ class Config:
         self.PROXY_DEBUG_VERBOSE = os.getenv("PROXY_DEBUG_VERBOSE", "false").lower() == "true"
         
         # 防止找回配置
-        self.RECOVERY_CONCURRENT = int(os.getenv("RECOVERY_CONCURRENT", "10"))
+        self.RECOVERY_CONCURRENT = int(os.getenv("RECOVERY_CONCURRENT", "5"))  # 从10降到5
         self.RECOVERY_CODE_TIMEOUT = int(os.getenv("RECOVERY_CODE_TIMEOUT", "300"))
-        self.RECOVERY_PASSWORD_LENGTH = int(os.getenv("RECOVERY_PASSWORD_LENGTH", "14"))
+        self.RECOVERY_PASSWORD_LENGTH = int(os.getenv("RECOVERY_PASSWORD_LENGTH", "16"))  # 从14提升到16
         self.RECOVERY_PASSWORD_SPECIALS = os.getenv("RECOVERY_PASSWORD_SPECIALS", "!@#$%^&*_-+=")
         self.RECOVERY_DEVICE_KILL_RETRIES = int(os.getenv("RECOVERY_DEVICE_KILL_RETRIES", "2"))
         self.RECOVERY_DEVICE_KILL_DELAY = float(os.getenv("RECOVERY_DEVICE_KILL_DELAY", "1.0"))
@@ -6903,8 +6937,12 @@ class RecoveryProtectionManager:
         self.proxy_manager = proxy_manager
         self.db = db
         self.semaphore = asyncio.Semaphore(config.RECOVERY_CONCURRENT)
+        # 初始化速率限制器
+        self.rate_limiter = RateLimiter()
         # 初始化设备参数加载器
         self.device_loader = DeviceParamsLoader()
+        # 验证码超时配置
+        self.code_timeout = config.RECOVERY_CODE_TIMEOUT
     
     @staticmethod
     def _fix_client_api_hash(client: TelegramClient, api_hash: str) -> None:
@@ -7033,6 +7071,10 @@ class RecoveryProtectionManager:
         if len(password) <= 6:
             return "***"
         return f"{password[:3]}***{password[-3:]}"
+    
+    def _validate_code_format(self, code: str) -> bool:
+        """验证验证码格式"""
+        return code and code.isdigit() and 5 <= len(code) <= 6
     
     def _generate_complete_account_json(self, me, phone: str, password: str, session_name: str) -> dict:
         """生成完整的账号JSON数据（严格按照用户提供的格式）
@@ -7504,6 +7546,45 @@ class RecoveryProtectionManager:
         
         print(f"❌ [{account_name}] 密码验证失败: 已尝试 {total_passwords} 个密码，均不正确")
         return False, f"所有 {total_passwords} 个密码均验证失败", "全部失败"
+    
+    async def _create_old_client(self, file_path: str, file_type: str, context: RecoveryAccountContext) -> Optional[TelegramClient]:
+        """创建并连接旧会话客户端
+        
+        Args:
+            file_path: 文件路径
+            file_type: 文件类型 (session/tdata)
+            context: 账号上下文
+            
+        Returns:
+            连接成功的TelegramClient或None
+        """
+        account_name = os.path.basename(context.original_path)
+        
+        try:
+            # 确定session路径
+            if file_type == "tdata":
+                # TData已经在前面转换为session
+                session_path = context.old_session_path
+            else:
+                session_path = file_path
+            
+            if not session_path or not os.path.exists(session_path):
+                print(f"❌ [{account_name}] Session文件不存在: {session_path}")
+                return None
+            
+            # 创建客户端
+            session_name = session_path.replace('.session', '')
+            api_hash_str = str(config.API_HASH)
+            old_client = TelegramClient(session_name, int(config.API_ID), api_hash_str)
+            
+            # 修复API hash类型
+            self._fix_client_api_hash(old_client, api_hash_str)
+            
+            return old_client
+            
+        except Exception as e:
+            print(f"❌ [{account_name}] 创建客户端失败: {e}")
+            return None
     
     async def wait_for_code(self, old_client: TelegramClient, phone: str, timeout: int = 300) -> Optional[str]:
         """等待777000验证码（带进度日志）"""
@@ -8329,6 +8410,50 @@ class RecoveryProtectionManager:
             self.db.insert_recovery_log(stage_result)
             return False, f"验证失败: {str(e)[:50]}"
     
+    async def _stage_verify_single_session(self, new_client: TelegramClient, 
+                                           context: RecoveryAccountContext) -> Tuple[bool, str]:
+        """验证只剩当前会话"""
+        account_name = os.path.basename(context.original_path)
+        stage_start = time.time()
+        
+        try:
+            from telethon.tl.functions.account import GetAuthorizationsRequest
+            auths = await new_client(GetAuthorizationsRequest())
+            other_sessions = [a for a in auths.authorizations if not a.current]
+            
+            context.final_sessions_count = len(auths.authorizations)
+            
+            stage_result = RecoveryStageResult(
+                account_name=account_name,
+                phone=context.phone,
+                stage="verify_single_session",
+                success=(len(other_sessions) == 0),
+                error="" if len(other_sessions) == 0 else f"存在{len(other_sessions)}个其他会话",
+                detail=f"总会话数: {len(auths.authorizations)}, 其他会话数: {len(other_sessions)}",
+                elapsed=time.time() - stage_start
+            )
+            context.stage_results.append(stage_result)
+            self.db.insert_recovery_log(stage_result)
+            
+            if len(other_sessions) == 0:
+                return True, "验证通过：只剩当前会话"
+            else:
+                return False, f"存在{len(other_sessions)}个其他会话"
+                
+        except Exception as e:
+            stage_result = RecoveryStageResult(
+                account_name=account_name,
+                phone=context.phone,
+                stage="verify_single_session",
+                success=False,
+                error=str(e)[:200],
+                detail="验证失败",
+                elapsed=time.time() - stage_start
+            )
+            context.stage_results.append(stage_result)
+            self.db.insert_recovery_log(stage_result)
+            return False, f"验证失败: {str(e)[:50]}"
+    
     async def _stage_request_and_wait_code(self, old_client: TelegramClient, phone: str, context: RecoveryAccountContext) -> Optional[str]:
         """阶段3+4: 请求并等待验证码（带详细日志和重试机制）
         
@@ -8913,6 +9038,116 @@ class RecoveryProtectionManager:
                     pass
             
             return None, False
+    
+    async def _stage_change_password_on_old(self, old_client: TelegramClient, 
+                                            context: RecoveryAccountContext) -> Tuple[bool, str]:
+        """在旧会话修改密码（改进版）
+        
+        按照issue要求的流程，使用UpdatePasswordSettingsRequest来修改密码
+        """
+        account_name = os.path.basename(context.original_path)
+        stage_start = time.time()
+        
+        try:
+            from telethon.tl.functions.account import GetPasswordRequest, UpdatePasswordSettingsRequest
+            from telethon.tl.types import PasswordInputSettings
+            
+            new_password = context.user_provided_password
+            if not new_password:
+                new_password = self.generate_strong_password()
+                context.user_provided_password = new_password
+            
+            password = await old_client(GetPasswordRequest())
+            
+            # 计算密码哈希
+            if password.has_password:
+                from telethon.crypto import pwd as pwd_mod
+                old_password_hash = pwd_mod.compute_check(
+                    password, 
+                    context.verified_old_password
+                )
+            else:
+                old_password_hash = b''
+            
+            from telethon.crypto import pwd as pwd_mod
+            new_password_hash = pwd_mod.compute_hash(password.new_algo, new_password)
+            
+            # 修改密码
+            await old_client(UpdatePasswordSettingsRequest(
+                password=old_password_hash,
+                new_settings=PasswordInputSettings(
+                    new_algo=password.new_algo,
+                    new_password_hash=new_password_hash,
+                    hint=context.new_password_hint or ""
+                )
+            ))
+            
+            # 等待生效
+            await asyncio.sleep(3)
+            
+            # 验证新密码
+            test_password = await old_client(GetPasswordRequest())
+            if test_password.has_password:
+                pwd_mod.compute_check(test_password, new_password)
+                print(f"✅ [{account_name}] 新密码验证成功")
+            
+            context.new_password_masked = self.mask_password(new_password)
+            
+            elapsed = time.time() - stage_start
+            stage_result = RecoveryStageResult(
+                account_name=account_name,
+                phone=context.phone,
+                stage="change_pwd_old",
+                success=True,
+                detail=f"密码修改成功: {context.new_password_masked}",
+                elapsed=elapsed
+            )
+            context.stage_results.append(stage_result)
+            self.db.insert_recovery_log(stage_result)
+            
+            return True, "密码修改成功"
+            
+        except PasswordHashInvalidError:
+            elapsed = time.time() - stage_start
+            stage_result = RecoveryStageResult(
+                account_name=account_name,
+                phone=context.phone,
+                stage="change_pwd_old",
+                success=False,
+                error="旧密码错误",
+                elapsed=elapsed
+            )
+            context.stage_results.append(stage_result)
+            self.db.insert_recovery_log(stage_result)
+            return False, "旧密码错误"
+        except FloodWaitError as e:
+            elapsed = time.time() - stage_start
+            wait_time = getattr(e, 'seconds', 60)
+            stage_result = RecoveryStageResult(
+                account_name=account_name,
+                phone=context.phone,
+                stage="change_pwd_old",
+                success=False,
+                error=f"操作过快，需等待{wait_time}秒",
+                elapsed=elapsed
+            )
+            context.stage_results.append(stage_result)
+            self.db.insert_recovery_log(stage_result)
+            return False, f"操作过快，需等待{wait_time}秒"
+        except Exception as e:
+            elapsed = time.time() - stage_start
+            error_msg = str(e)[:50]
+            stage_result = RecoveryStageResult(
+                account_name=account_name,
+                phone=context.phone,
+                stage="change_pwd_old",
+                success=False,
+                error=f"密码修改异常: {error_msg}",
+                elapsed=elapsed
+            )
+            context.stage_results.append(stage_result)
+            self.db.insert_recovery_log(stage_result)
+            return False, f"密码修改异常: {error_msg}"
     
     async def _stage_change_pwd_on_old_session(self, old_client: TelegramClient, phone: str, 
                                                 context: RecoveryAccountContext, file_type: str, 
