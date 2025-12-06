@@ -823,6 +823,8 @@ class Config:
         self.RECOVERY_STAGE_TIMEOUT = int(os.getenv("RECOVERY_STAGE_TIMEOUT", "300"))
         self.RECOVERY_TIMEOUT = int(os.getenv("RECOVERY_TIMEOUT", "300"))  # Per-account processing timeout (seconds)
         self.RECOVERY_CLEANUP_DELAY = float(os.getenv("RECOVERY_CLEANUP_DELAY", "0.5"))  # Delay for task cleanup (seconds)
+        self.RECOVERY_CONNECT_TIMEOUT = int(os.getenv("RECOVERY_CONNECT_TIMEOUT", "30"))  # Connection timeout per attempt (seconds)
+        self.RECOVERY_TASK_CLEANUP_TIMEOUT = float(os.getenv("RECOVERY_TASK_CLEANUP_TIMEOUT", "2.0"))  # Timeout for cleaning up tasks (seconds)
         self.WEB_SERVER_PORT = int(os.getenv("WEB_SERVER_PORT", "8080"))
         self.ALLOW_PORT_SHIFT = os.getenv("ALLOW_PORT_SHIFT", "true").lower() == "true"
         self.DEBUG_RECOVERY = os.getenv("DEBUG_RECOVERY", "true").lower() == "true"
@@ -933,6 +935,8 @@ RECOVERY_CODE_REQUEST_RETRIES=2
 RECOVERY_RETRY_BACKOFF_BASE=0.75
 RECOVERY_STAGE_TIMEOUT=300
 RECOVERY_TIMEOUT=300
+RECOVERY_CONNECT_TIMEOUT=30
+RECOVERY_TASK_CLEANUP_TIMEOUT=2.0
 WEB_SERVER_PORT=8080
 ALLOW_PORT_SHIFT=true
 DEBUG_RECOVERY=true
@@ -7547,21 +7551,35 @@ class RecoveryProtectionManager:
             return None
     
     async def connect_with_proxy_retry(self, client: TelegramClient, phone: str) -> Tuple[bool, str, float]:
-        """使用代理重试连接"""
+        """使用代理重试连接
+        
+        增强版：
+        - 每个连接尝试都有超时保护（使用 RECOVERY_CONNECT_TIMEOUT）
+        - 防止连接挂起导致整个任务超时
+        - 更好的错误分类和日志记录
+        """
         start_time = time.time()
+        connect_timeout = getattr(config, 'RECOVERY_CONNECT_TIMEOUT', 30)
         
         if not config.RECOVERY_ENABLE_PROXY or not self.proxy_manager.proxies:
-            # 本地连接
+            # 本地连接（带超时保护）
             try:
-                await client.connect()
+                await asyncio.wait_for(client.connect(), timeout=connect_timeout)
                 elapsed = time.time() - start_time
                 return True, f"Local({elapsed:.2f}s)", elapsed
+            except asyncio.TimeoutError:
+                elapsed = time.time() - start_time
+                return False, f"Local TIMEOUT({connect_timeout}s)", elapsed
+            except asyncio.CancelledError:
+                # 任务被取消，重新抛出以便上层处理
+                raise
             except Exception as e:
                 elapsed = time.time() - start_time
                 return False, f"Local FAILED: {str(e)[:80]}", elapsed
         
         # 尝试代理连接
         tried_proxies = []
+        last_error = ""
         for attempt in range(config.RECOVERY_PROXY_RETRIES + 1):
             proxy = self.proxy_manager.get_next_proxy()
             if not proxy:
@@ -7575,16 +7593,27 @@ class RecoveryProtectionManager:
             tried_proxies.append(proxy_str_internal)
             
             try:
-                # 重新创建客户端使用代理
-                await client.disconnect()
+                # 先断开连接（带超时保护）
+                # Note: Broad exception catch is intentional - disconnect should never block or fail the retry flow
+                try:
+                    await asyncio.wait_for(client.disconnect(), timeout=5)
+                except (asyncio.TimeoutError, asyncio.CancelledError, OSError, Exception):
+                    pass  # 忽略断开连接的错误（包括超时、取消、网络错误等）
                 
                 # 设置代理参数（简化版，实际可能需要更复杂的proxy配置）
                 # 这里假设client已经在创建时配置了proxy
-                await client.connect()
+                # 连接尝试（带超时保护）
+                await asyncio.wait_for(client.connect(), timeout=connect_timeout)
                 
                 elapsed = time.time() - start_time
                 return True, f"使用代理(ok {elapsed:.2f}s)", elapsed
-                
+            
+            except asyncio.TimeoutError:
+                reason = "timeout"
+                print(f"⚠️ 代理连接超时 (attempt {attempt + 1}/{config.RECOVERY_PROXY_RETRIES + 1})")
+            except asyncio.CancelledError:
+                # 任务被取消，重新抛出以便上层处理
+                raise
             except Exception as e:
                 error_msg = str(e).lower()
                 if "timeout" in error_msg:
@@ -7596,23 +7625,33 @@ class RecoveryProtectionManager:
                 else:
                     reason = "connection refused"
                 
-                print(f"⚠️ 代理连接失败: {reason}")
-                
-                if attempt == config.RECOVERY_PROXY_RETRIES:
-                    # 最后一次尝试本地连接
-                    try:
-                        await client.connect()
-                        elapsed = time.time() - start_time
-                        return True, f"Proxy FAILED({reason}) -> Local({elapsed:.2f}s)", elapsed
-                    except Exception as local_e:
-                        elapsed = time.time() - start_time
-                        return False, f"All FAILED: {str(local_e)[:80]}", elapsed
+                print(f"⚠️ 代理连接失败 (attempt {attempt + 1}): {reason}")
+            
+            # 最后一次尝试后，回退到本地连接
+            if attempt == config.RECOVERY_PROXY_RETRIES:
+                try:
+                    await asyncio.wait_for(client.connect(), timeout=connect_timeout)
+                    elapsed = time.time() - start_time
+                    return True, f"Proxy FAILED({reason}) -> Local({elapsed:.2f}s)", elapsed
+                except asyncio.TimeoutError:
+                    elapsed = time.time() - start_time
+                    return False, f"All FAILED: Local TIMEOUT({connect_timeout}s)", elapsed
+                except asyncio.CancelledError:
+                    raise
+                except Exception as local_e:
+                    elapsed = time.time() - start_time
+                    return False, f"All FAILED: {str(local_e)[:80]}", elapsed
         
-        # 回退本地
+        # 回退本地（带超时保护）
         try:
-            await client.connect()
+            await asyncio.wait_for(client.connect(), timeout=connect_timeout)
             elapsed = time.time() - start_time
             return True, f"Local({elapsed:.2f}s)", elapsed
+        except asyncio.TimeoutError:
+            elapsed = time.time() - start_time
+            return False, f"Local TIMEOUT({connect_timeout}s)", elapsed
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             elapsed = time.time() - start_time
             return False, f"Local FAILED: {str(e)[:80]}", elapsed
@@ -8199,7 +8238,11 @@ class RecoveryProtectionManager:
                 # 检查是否还能授权
                 is_authorized = await asyncio.wait_for(old_client.is_user_authorized(), timeout=5)
                 
-                await old_client.disconnect()
+                # 断开连接（带超时保护）
+                try:
+                    await asyncio.wait_for(old_client.disconnect(), timeout=5)
+                except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                    pass
                 
                 if is_authorized:
                     # 旧session仍然有效 - 这不是我们期望的
@@ -8234,7 +8277,10 @@ class RecoveryProtectionManager:
             except (AuthKeyUnregisteredError, UserDeactivatedError, UserDeactivatedBanError):
                 # 这些异常表示旧session已失效 - 预期结果
                 context.old_session_valid = False
-                await old_client.disconnect()
+                try:
+                    await asyncio.wait_for(old_client.disconnect(), timeout=5)
+                except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                    pass
                 stage_result = RecoveryStageResult(
                     account_name=account_name,
                     phone=context.phone,
@@ -8251,8 +8297,8 @@ class RecoveryProtectionManager:
                 # 其他异常 - 无法确定旧会话状态，保守起见视为仍有效
                 context.old_session_valid = True
                 try:
-                    await old_client.disconnect()
-                except Exception:
+                    await asyncio.wait_for(old_client.disconnect(), timeout=5)
+                except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
                     pass  # 忽略断开连接时的异常
                 stage_result = RecoveryStageResult(
                     account_name=account_name,
@@ -9564,16 +9610,17 @@ class RecoveryProtectionManager:
                     print(f"🔍 [{account_name}] 完整堆栈跟踪:\n{traceback.format_exc()}")
             
             finally:
-                # 清理客户端连接
+                # 清理客户端连接（带超时保护，防止disconnect挂起）
+                disconnect_timeout = 5  # 5秒超时用于断开连接
                 if old_client:
                     try:
-                        await old_client.disconnect()
-                    except:
+                        await asyncio.wait_for(old_client.disconnect(), timeout=disconnect_timeout)
+                    except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
                         pass
                 if new_client:
                     try:
-                        await new_client.disconnect()
-                    except:
+                        await asyncio.wait_for(new_client.disconnect(), timeout=disconnect_timeout)
+                    except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
                         pass
             
             return context
@@ -9700,12 +9747,31 @@ class RecoveryProtectionManager:
                             # Task threw an exception
                             error_type = type(exc).__name__
                             error_msg = str(exc) if str(exc) else error_type
+                            error_msg_lower = error_msg.lower()
                             
                             if isinstance(exc, asyncio.TimeoutError):
                                 counters['code_timeout'] += 1
                                 print(f"[run_batch] Task timeout: {context.original_path}")
                                 context.status = "timeout"
                                 context.failure_reason = "Task execution timeout"
+                            elif isinstance(exc, asyncio.CancelledError):
+                                # CancelledError should be treated as timeout (task was cancelled due to timeout)
+                                counters['code_timeout'] += 1
+                                print(f"[run_batch] Task cancelled (timeout): {context.original_path}")
+                                context.status = "timeout"
+                                context.failure_reason = "Task cancelled (timeout)"
+                            elif 'timeout' in error_msg_lower or 'timed out' in error_msg_lower:
+                                # Connection timeout or other timeout errors
+                                counters['code_timeout'] += 1
+                                print(f"[run_batch] Connection timeout: {context.original_path}")
+                                context.status = "timeout"
+                                context.failure_reason = f"Connection timeout: {error_msg[:80]}"
+                            elif any(kw in error_msg_lower for kw in ['connection', 'connect', 'network', 'socket', 'dns']):
+                                # Connection-related errors
+                                counters['failed'] += 1
+                                print(f"[run_batch] Connection error ({error_type}): {error_msg[:100]}")
+                                context.status = "failed"
+                                context.failure_reason = f"连接错误: {error_msg[:80]}"
                             else:
                                 counters['failed'] += 1
                                 print(f"[run_batch] Task exception ({error_type}): {error_msg[:100]}")
@@ -9746,6 +9812,8 @@ class RecoveryProtectionManager:
             
             # Cleanup phase: ensure all tasks are properly awaited to avoid "Task was destroyed but pending" warnings
             # This handles cases where asyncio.wait_for timeout cancels tasks but they haven't fully cleaned up
+            # Enhanced: Use shield and more aggressive cleanup for tasks with pending network operations
+            task_cleanup_timeout = getattr(config, 'RECOVERY_TASK_CLEANUP_TIMEOUT', 2.0)
             all_batch_tasks = list(task_context_map.keys())
             for task in all_batch_tasks:
                 context = task_context_map.get(task)
@@ -9756,29 +9824,34 @@ class RecoveryProtectionManager:
                     if not task.done():
                         task.cancel()
                         try:
-                            await task
+                            # Use a short timeout for cleanup to avoid hanging
+                            await asyncio.wait_for(asyncio.shield(task), timeout=task_cleanup_timeout)
                         except (asyncio.CancelledError, asyncio.TimeoutError):
                             # Expected exceptions during task cleanup
                             pass
                         except Exception as e:
                             # Log unexpected exceptions but don't fail
-                            print(f"[run_batch] Unexpected cleanup exception: {type(e).__name__}")
+                            if config.DEBUG_RECOVERY:
+                                print(f"[run_batch] Unexpected cleanup exception: {type(e).__name__}")
                     continue
                 
                 # Cancel if still running
                 if not task.done():
                     task.cancel()
                     try:
-                        await task
+                        # Use a short timeout for cleanup to avoid hanging on network operations
+                        await asyncio.wait_for(asyncio.shield(task), timeout=task_cleanup_timeout)
                     except asyncio.CancelledError:
                         # Expected when task is cancelled
                         pass
                     except asyncio.TimeoutError:
-                        # Task timed out during cleanup
+                        # Task timed out during cleanup - this is expected for hung connections
+                        if config.DEBUG_RECOVERY:
+                            print(f"[run_batch] Task cleanup timeout (connection may be hung)")
                         pass
                     except Exception as e:
                         # Log unexpected exceptions during cleanup
-                        if context:
+                        if context and config.DEBUG_RECOVERY:
                             print(f"[run_batch] Cleanup exception for {context.original_path}: {type(e).__name__}: {str(e)[:50]}")
                 
                 # Handle unprocessed tasks
