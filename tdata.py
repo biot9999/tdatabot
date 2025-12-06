@@ -258,7 +258,14 @@ class RateLimiter:
         self.locks = {}
     
     async def acquire(self, operation: str, min_interval: float = 1.0):
-        """获取操作许可"""
+        """获取操作许可
+        
+        Args:
+            operation: 操作类型（如 'password_change', 'device_removal'）
+            min_interval: 最小时间间隔（秒）
+        
+        此方法会确保同类操作之间至少间隔 min_interval 秒，防止触发 Telegram 限制
+        """
         if operation not in self.locks:
             self.locks[operation] = asyncio.Lock()
         
@@ -8695,19 +8702,33 @@ class RecoveryProtectionManager:
         try:
             code = await self.wait_for_code(old_client, phone_normalized, timeout=config.RECOVERY_CODE_TIMEOUT)
             
-            if code and self._validate_code_format(code):
-                context.verification_code = code
-                stage_result = RecoveryStageResult(
-                    account_name=account_name,
-                    phone=phone_normalized,
-                    stage="wait_code",
-                    success=True,
-                    detail=f"成功获取验证码: {code[:2]}***",
-                    elapsed=time.time() - stage_start
-                )
-                context.stage_results.append(stage_result)
-                self.db.insert_recovery_log(stage_result)
-                return code
+            if code:
+                if self._validate_code_format(code):
+                    context.verification_code = code
+                    stage_result = RecoveryStageResult(
+                        account_name=account_name,
+                        phone=phone_normalized,
+                        stage="wait_code",
+                        success=True,
+                        detail=f"成功获取验证码: {code[:2]}***",
+                        elapsed=time.time() - stage_start
+                    )
+                    context.stage_results.append(stage_result)
+                    self.db.insert_recovery_log(stage_result)
+                    return code
+                else:
+                    print(f"⚠️ [{account_name}] 验证码格式无效: {code}")
+                    stage_result = RecoveryStageResult(
+                        account_name=account_name,
+                        phone=phone_normalized,
+                        stage="wait_code",
+                        success=False,
+                        error=f"验证码格式无效: {code}",
+                        elapsed=time.time() - stage_start
+                    )
+                    context.stage_results.append(stage_result)
+                    self.db.insert_recovery_log(stage_result)
+                    return None
             else:
                 stage_result = RecoveryStageResult(
                     account_name=account_name,
@@ -9052,13 +9073,14 @@ class RecoveryProtectionManager:
         
         按照issue要求的流程，使用UpdatePasswordSettingsRequest来修改密码
         """
+        from telethon.tl.functions.account import GetPasswordRequest, UpdatePasswordSettingsRequest
+        from telethon.tl.types import PasswordInputSettings
+        from telethon.crypto import pwd as pwd_mod
+        
         account_name = os.path.basename(context.original_path)
         stage_start = time.time()
         
         try:
-            from telethon.tl.functions.account import GetPasswordRequest, UpdatePasswordSettingsRequest
-            from telethon.tl.types import PasswordInputSettings
-            
             new_password = context.user_provided_password
             if not new_password:
                 new_password = self.generate_strong_password()
@@ -9068,7 +9090,6 @@ class RecoveryProtectionManager:
             
             # 计算密码哈希
             if password.has_password:
-                from telethon.crypto import pwd as pwd_mod
                 old_password_hash = pwd_mod.compute_check(
                     password, 
                     context.verified_old_password
@@ -9076,7 +9097,6 @@ class RecoveryProtectionManager:
             else:
                 old_password_hash = b''
             
-            from telethon.crypto import pwd as pwd_mod
             new_password_hash = pwd_mod.compute_hash(password.new_algo, new_password)
             
             # 修改密码
