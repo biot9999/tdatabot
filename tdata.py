@@ -6892,6 +6892,12 @@ class RecoveryProtectionManager:
     # 用于表示未知/未设置的时间值，遵循用户提供的JSON格式
     DEFAULT_UNSET_TIMESTAMP = -62135596800
     
+    # 错误消息最大长度常量
+    MAX_ERROR_MSG_LENGTH = 80
+    
+    # 客户端断开连接超时时间（秒）
+    DISCONNECT_TIMEOUT = 5.0
+    
     def __init__(self, proxy_manager: ProxyManager, db: Database):
         self.proxy_manager = proxy_manager
         self.db = db
@@ -6911,6 +6917,24 @@ class RecoveryProtectionManager:
         if hasattr(client, 'api_hash') and not callable(getattr(client, 'api_hash', None)):
             if not isinstance(client.api_hash, str):
                 client.api_hash = str(api_hash)
+    
+    async def _safe_disconnect(self, client: TelegramClient, client_name: str = "client") -> None:
+        """安全断开客户端连接，带超时保护和调试日志
+        
+        Args:
+            client: 要断开的Telegram客户端
+            client_name: 客户端名称，用于日志记录
+        """
+        if client is None:
+            return
+        try:
+            await asyncio.wait_for(client.disconnect(), timeout=self.DISCONNECT_TIMEOUT)
+        except asyncio.TimeoutError:
+            if config.DEBUG_RECOVERY:
+                print(f"🔌 [{client_name}] 断开连接超时 (>{self.DISCONNECT_TIMEOUT}s)")
+        except (OSError, ConnectionError, RuntimeError) as e:
+            if config.DEBUG_RECOVERY:
+                print(f"🔌 [{client_name}] 断开连接异常: {type(e).__name__}: {str(e)[:50]}")
     
     def _get_random_device_info(self) -> Tuple[str, str, str]:
         """生成随机设备信息以防风控
@@ -7576,8 +7600,9 @@ class RecoveryProtectionManager:
                 # 安全断开连接，忽略网络相关的异常
                 try:
                     await client.disconnect()
-                except (OSError, ConnectionError, asyncio.TimeoutError):
-                    pass  # 忽略断开连接时的网络异常
+                except (OSError, ConnectionError, asyncio.TimeoutError) as e:
+                    if config.DEBUG_RECOVERY:
+                        print(f"🔌 代理重试断开连接异常: {type(e).__name__}")
                 
                 # 设置代理参数（简化版，实际可能需要更复杂的proxy配置）
                 # 这里假设client已经在创建时配置了proxy
@@ -9565,17 +9590,9 @@ class RecoveryProtectionManager:
                     print(f"🔍 [{account_name}] 完整堆栈跟踪:\n{traceback.format_exc()}")
             
             finally:
-                # 清理客户端连接 (带超时保护，防止disconnect操作挂起)
-                if old_client:
-                    try:
-                        await asyncio.wait_for(old_client.disconnect(), timeout=5.0)
-                    except (asyncio.TimeoutError, OSError, ConnectionError, RuntimeError):
-                        pass  # 忽略断开连接时的超时和网络异常
-                if new_client:
-                    try:
-                        await asyncio.wait_for(new_client.disconnect(), timeout=5.0)
-                    except (asyncio.TimeoutError, OSError, ConnectionError, RuntimeError):
-                        pass  # 忽略断开连接时的超时和网络异常
+                # 清理客户端连接 (使用安全断开方法)
+                await self._safe_disconnect(old_client, f"{account_name}_old")
+                await self._safe_disconnect(new_client, f"{account_name}_new")
             
             return context
     
@@ -9592,7 +9609,7 @@ class RecoveryProtectionManager:
         Returns:
             (错误消息, 更新后的上下文状态)
         """
-        error_msg = f"{error_prefix}: {type(state_err).__name__}: {str(state_err)[:80]}"
+        error_msg = f"{error_prefix}: {type(state_err).__name__}: {str(state_err)[:self.MAX_ERROR_MSG_LENGTH]}"
         print(f"[run_batch] {error_msg}: {context.original_path}")
         counters['failed'] += 1
         context.status = "failed"
