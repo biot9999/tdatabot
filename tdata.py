@@ -9569,13 +9569,13 @@ class RecoveryProtectionManager:
                 if old_client:
                     try:
                         await asyncio.wait_for(old_client.disconnect(), timeout=5.0)
-                    except (asyncio.TimeoutError, Exception):
-                        pass  # 忽略断开连接时的超时和其他异常
+                    except (asyncio.TimeoutError, OSError, ConnectionError, RuntimeError):
+                        pass  # 忽略断开连接时的超时和网络异常
                 if new_client:
                     try:
                         await asyncio.wait_for(new_client.disconnect(), timeout=5.0)
-                    except (asyncio.TimeoutError, Exception):
-                        pass  # 忽略断开连接时的超时和其他异常
+                    except (asyncio.TimeoutError, OSError, ConnectionError, RuntimeError):
+                        pass  # 忽略断开连接时的超时和网络异常
             
             return context
     
