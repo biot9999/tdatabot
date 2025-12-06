@@ -7414,27 +7414,33 @@ class RecoveryProtectionManager:
         
         return passwords
     
-    def _collect_all_passwords(self, context: RecoveryAccountContext, file_type: str, file_path: str) -> List[Tuple[str, str]]:
-        """收集所有可用的旧密码（含类型标识）
+    def _collect_all_passwords(self, context: RecoveryAccountContext, file_type: str, file_path: str, 
+                               for_new_session: bool = False) -> List[Tuple[str, str]]:
+        """收集所有可用的密码（含类型标识）
         
-        用于2FA登录验证时尝试的旧密码。
+        用于2FA登录验证时尝试的密码。
         
         按优先级收集密码：
-        1. 从TData目录提取的密码（2fa.txt等文件）- 最高优先级
-        2. 从JSON文件提取的密码（twoFA、2fa等字段）
-        3. 用户提供的旧密码（当文件中没有密码时使用）- 最低优先级
-        
-        注意：user_provided_password 是用户想要设置的新密码，不是旧密码，不应包含在这里。
+        - 如果for_new_session=True（新会话登录），优先使用刚设置的新密码
+        - 否则收集旧密码：
+          1. 从TData目录提取的密码（2fa.txt等文件）- 最高优先级
+          2. 从JSON文件提取的密码（twoFA、2fa等字段）
+          3. 用户提供的旧密码（当文件中没有密码时使用）- 最低优先级
         
         Args:
             context: 账号上下文
             file_type: 文件类型 (tdata/session)
             file_path: 文件路径
+            for_new_session: 是否用于新会话登录（如果是，优先使用新密码）
             
         Returns:
             密码列表，每项为 (密码, 类型描述) 元组
         """
         passwords_with_type = []
+        
+        # 如果是新会话登录，优先使用刚设置的新密码
+        if for_new_session and context.user_provided_password:
+            passwords_with_type.append((context.user_provided_password, "新设置的密码"))
         
         # 1. 从TData目录提取旧密码（最高优先级）
         if file_type == "tdata":
@@ -8904,8 +8910,8 @@ class RecoveryProtectionManager:
                 
                 print(f"🔐 [{account_name}] 账号已设置2FA，开始密码验证...")
                 
-                # 收集所有可用的密码
-                passwords = self._collect_all_passwords(context, file_type, file_path or context.original_path)
+                # 收集所有可用的密码（新会话登录时优先使用新设置的密码）
+                passwords = self._collect_all_passwords(context, file_type, file_path or context.original_path, for_new_session=True)
                 
                 if not passwords:
                     print(f"❌ [{account_name}] 没有可用的密码进行2FA验证")
@@ -9790,14 +9796,9 @@ class RecoveryProtectionManager:
                 
                 # ===== 阶段5: 新设备登录 =====
                 # 注意：此时应使用新密码（刚才设置的）进行2FA验证
-                # 需要临时更新context中的旧密码为新密码
-                original_old_pwd = context.user_provided_old_password
-                context.user_provided_old_password = context.user_provided_password or context.new_password_masked.replace('***', '')
-                
+                # context.user_provided_password已经在_stage_change_password_on_old中设置
+                # 直接使用即可，无需临时修改旧密码字段
                 new_client, sign_in_success = await self._stage_sign_in_new(phone, code, context, file_type, file_path)
-                
-                # 恢复原始值
-                context.user_provided_old_password = original_old_pwd
                 
                 if not sign_in_success:
                     context.status = "failed"
