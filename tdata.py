@@ -7573,7 +7573,11 @@ class RecoveryProtectionManager:
             
             try:
                 # 重新创建客户端使用代理
-                await client.disconnect()
+                # 安全断开连接，忽略可能的异常
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass  # 忽略断开连接时的异常
                 
                 # 设置代理参数（简化版，实际可能需要更复杂的proxy配置）
                 # 这里假设client已经在创建时配置了proxy
@@ -9561,17 +9565,17 @@ class RecoveryProtectionManager:
                     print(f"🔍 [{account_name}] 完整堆栈跟踪:\n{traceback.format_exc()}")
             
             finally:
-                # 清理客户端连接
+                # 清理客户端连接 (带超时保护，防止disconnect操作挂起)
                 if old_client:
                     try:
-                        await old_client.disconnect()
-                    except:
-                        pass
+                        await asyncio.wait_for(old_client.disconnect(), timeout=5.0)
+                    except (asyncio.TimeoutError, Exception):
+                        pass  # 忽略断开连接时的超时和其他异常
                 if new_client:
                     try:
-                        await new_client.disconnect()
-                    except:
-                        pass
+                        await asyncio.wait_for(new_client.disconnect(), timeout=5.0)
+                    except (asyncio.TimeoutError, Exception):
+                        pass  # 忽略断开连接时的超时和其他异常
             
             return context
     
@@ -9669,7 +9673,20 @@ class RecoveryProtectionManager:
                     contexts.append(context)
                     continue
                 
-                exc = task.exception()
+                # 使用try-except包装task.exception()和task.result()调用
+                # 防止在任务状态异常时抛出InvalidStateError或RuntimeError
+                try:
+                    exc = task.exception()
+                except (asyncio.InvalidStateError, RuntimeError) as state_err:
+                    # 任务可能处于意外状态，记录错误并继续
+                    counters['failed'] += 1
+                    error_msg = f"任务状态异常: {type(state_err).__name__}: {str(state_err)[:80]}"
+                    print(f"[run_batch] {error_msg}: {context.original_path}")
+                    context.status = "failed"
+                    context.failure_reason = error_msg
+                    contexts.append(context)
+                    continue
+                
                 if exc is not None:
                     # 任务抛出异常
                     error_type = type(exc).__name__
@@ -9690,7 +9707,18 @@ class RecoveryProtectionManager:
                     continue
                 
                 # 任务正常完成，获取结果
-                result = task.result()
+                try:
+                    result = task.result()
+                except (asyncio.InvalidStateError, RuntimeError) as state_err:
+                    # 任务结果获取失败，记录错误并继续
+                    counters['failed'] += 1
+                    error_msg = f"获取结果失败: {type(state_err).__name__}: {str(state_err)[:80]}"
+                    print(f"[run_batch] {error_msg}: {context.original_path}")
+                    context.status = "failed"
+                    context.failure_reason = error_msg
+                    contexts.append(context)
+                    continue
+                
                 if result is not None and isinstance(result, RecoveryAccountContext):
                     contexts.append(result)
                     
