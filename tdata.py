@@ -821,6 +821,8 @@ class Config:
         self.RECOVERY_CODE_REQUEST_RETRIES = int(os.getenv("RECOVERY_CODE_REQUEST_RETRIES", "2"))
         self.RECOVERY_RETRY_BACKOFF_BASE = float(os.getenv("RECOVERY_RETRY_BACKOFF_BASE", "0.75"))
         self.RECOVERY_STAGE_TIMEOUT = int(os.getenv("RECOVERY_STAGE_TIMEOUT", "300"))
+        self.RECOVERY_TIMEOUT = int(os.getenv("RECOVERY_TIMEOUT", "300"))  # Per-account processing timeout (seconds)
+        self.RECOVERY_CLEANUP_DELAY = float(os.getenv("RECOVERY_CLEANUP_DELAY", "0.5"))  # Delay for task cleanup (seconds)
         self.WEB_SERVER_PORT = int(os.getenv("WEB_SERVER_PORT", "8080"))
         self.ALLOW_PORT_SHIFT = os.getenv("ALLOW_PORT_SHIFT", "true").lower() == "true"
         self.DEBUG_RECOVERY = os.getenv("DEBUG_RECOVERY", "true").lower() == "true"
@@ -930,6 +932,7 @@ RECOVERY_DEFAULT_COUNTRY_PREFIX=+62
 RECOVERY_CODE_REQUEST_RETRIES=2
 RECOVERY_RETRY_BACKOFF_BASE=0.75
 RECOVERY_STAGE_TIMEOUT=300
+RECOVERY_TIMEOUT=300
 WEB_SERVER_PORT=8080
 ALLOW_PORT_SHIFT=true
 DEBUG_RECOVERY=true
@@ -9577,17 +9580,22 @@ class RecoveryProtectionManager:
     
     async def run_batch(self, files: List[Tuple[str, str]], progress_callback=None, 
                         user_password: str = "", user_old_password: str = "") -> Dict:
-        """批量运行防止找回
+        """Run batch recovery protection processing.
+        
+        Uses batch processing strategy to avoid creating too many async tasks at once,
+        which can exhaust event loop resources. Each batch contains RECOVERY_CONCURRENT
+        tasks, and uses asyncio.wait() with FIRST_COMPLETED for real-time result processing.
         
         Args:
-            files: 文件列表，每个元素为 (file_path, file_type) 元组
-            progress_callback: 进度回调函数
-            user_password: 用户提供的新密码（登录成功后设置），如果为空则自动生成
-            user_old_password: 用户提供的旧密码（用于2FA登录验证），支持多个密码用|分隔
-                              仅当文件中没有密码时使用
+            files: List of tuples (file_path, file_type)
+            progress_callback: Progress callback function
+            user_password: User-provided new password (set after login), auto-generated if empty
+            user_old_password: User-provided old password for 2FA login, supports multiple passwords separated by |
+                              Only used when file contains no password
         """
         batch_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         contexts = []
+        processed_paths = set()  # Track processed file paths for O(1) lookup
         counters = {
             'total': len(files),
             'success': 0,
@@ -9597,132 +9605,213 @@ class RecoveryProtectionManager:
             'partial': 0
         }
         
-        # 并发处理
-        tasks = []
-        task_context_map = {}  # 映射: task -> context，用于异常时恢复上下文
-        for file_path, file_type in files:
-            # 尝试从文件路径中提取手机号作为初始值
-            # 这样即使任务失败，也能保留账号标识用于打包
-            initial_phone = ""
-            if file_type == 'tdata':
-                # TData: 尝试从目录路径中提取手机号
-                initial_phone = self.extract_phone_from_tdata_directory(file_path)
-            else:
-                # Session: 从文件名中提取（去掉.session后缀）
-                basename = os.path.basename(file_path)
-                if basename.endswith('.session'):
-                    name_part = basename[:-8]  # 去掉 .session
-                    # 验证是否像手机号
-                    clean_name = name_part.lstrip('+').replace('_', '')
-                    if clean_name.isdigit() and len(clean_name) >= 10:
-                        initial_phone = clean_name
-                    else:
-                        # 非手机号格式，使用文件名作为标识
-                        initial_phone = name_part
-            
-            context = RecoveryAccountContext(
-                original_path=file_path,
-                old_session_path=file_path,
-                new_session_path="",
-                phone=initial_phone,  # 使用从路径提取的手机号
-                user_provided_password=user_password,  # 新密码（登录成功后设置）
-                user_provided_old_password=user_old_password  # 旧密码（用于2FA登录验证）
-            )
-            # 为每个任务添加超时保护（默认300秒）
-            task = asyncio.create_task(
-                asyncio.wait_for(
-                    self.process_single_account(file_path, file_type, context),
-                    timeout=config.RECOVERY_TIMEOUT if hasattr(config, 'RECOVERY_TIMEOUT') else 300
-                )
-            )
-            tasks.append(task)
-            task_context_map[task] = context  # 保存任务与上下文的映射
+        # Batch size equals concurrency limit
+        batch_size = config.RECOVERY_CONCURRENT
+        # Per-task timeout (seconds)
+        task_timeout = config.RECOVERY_TIMEOUT if hasattr(config, 'RECOVERY_TIMEOUT') else 300
         
-        # 等待所有任务完成，并实时更新进度
-        # 使用 asyncio.wait 来追踪具体哪个任务完成/失败，以便正确关联上下文
+        total_files = len(files)
         completed = 0
-        pending_tasks = set(tasks)
         
-        while pending_tasks:
-            done, pending_tasks = await asyncio.wait(
-                pending_tasks,
-                return_when=asyncio.FIRST_COMPLETED
-            )
+        print(f"[run_batch] Starting batch processing: {total_files} files, batch size {batch_size}, task timeout {task_timeout}s")
+        
+        # Process files in batches
+        for batch_start in range(0, total_files, batch_size):
+            batch_end = min(batch_start + batch_size, total_files)
+            batch_files = files[batch_start:batch_end]
+            batch_num = (batch_start // batch_size) + 1
+            total_batches = (total_files + batch_size - 1) // batch_size
             
-            for task in done:
-                completed += 1
+            print(f"[run_batch] Processing batch {batch_num}/{total_batches}: files {batch_start+1}-{batch_end}")
+            
+            # Create tasks and contexts for current batch
+            task_context_map = {}  # task -> context mapping
+            
+            for file_path, file_type in batch_files:
+                # Extract phone number from file path as initial value
+                initial_phone = ""
+                if file_type == 'tdata':
+                    initial_phone = self.extract_phone_from_tdata_directory(file_path)
+                else:
+                    basename = os.path.basename(file_path)
+                    if basename.endswith('.session'):
+                        name_part = basename[:-8]
+                        clean_name = name_part.lstrip('+').replace('_', '')
+                        if clean_name.isdigit() and len(clean_name) >= 10:
+                            initial_phone = clean_name
+                        else:
+                            initial_phone = name_part
+                
+                context = RecoveryAccountContext(
+                    original_path=file_path,
+                    old_session_path=file_path,
+                    new_session_path="",
+                    phone=initial_phone,
+                    user_provided_password=user_password,
+                    user_provided_old_password=user_old_password
+                )
+                
+                # Add timeout protection for each task
+                task = asyncio.create_task(
+                    asyncio.wait_for(
+                        self.process_single_account(file_path, file_type, context),
+                        timeout=task_timeout
+                    )
+                )
+                task_context_map[task] = context
+            
+            # Process batch using asyncio.wait with FIRST_COMPLETED
+            pending_tasks = set(task_context_map.keys())
+            
+            while pending_tasks:
+                done, pending_tasks = await asyncio.wait(
+                    pending_tasks,
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+                
+                for task in done:
+                    completed += 1
+                    context = task_context_map.get(task)
+                    
+                    if context is None:
+                        print(f"[run_batch] Warning: task has no context, possible programming error")
+                        counters['failed'] += 1
+                        if progress_callback:
+                            try:
+                                progress_callback(completed, total_files, counters)
+                            except Exception:
+                                pass
+                        continue
+                    
+                    # Mark as processed
+                    processed_paths.add(context.original_path)
+                    
+                    # Check task status before calling result()
+                    if task.cancelled():
+                        counters['failed'] += 1
+                        print(f"[run_batch] Task cancelled: {context.original_path}")
+                        context.status = "failed"
+                        context.failure_reason = "Task cancelled"
+                        contexts.append(context)
+                    else:
+                        exc = task.exception()
+                        
+                        if exc is not None:
+                            # Task threw an exception
+                            error_type = type(exc).__name__
+                            error_msg = str(exc) if str(exc) else error_type
+                            
+                            if isinstance(exc, asyncio.TimeoutError):
+                                counters['code_timeout'] += 1
+                                print(f"[run_batch] Task timeout: {context.original_path}")
+                                context.status = "timeout"
+                                context.failure_reason = "Task execution timeout"
+                            else:
+                                counters['failed'] += 1
+                                print(f"[run_batch] Task exception ({error_type}): {error_msg[:100]}")
+                                context.status = "failed"
+                                context.failure_reason = f"{error_type}: {error_msg[:100]}"
+                            
+                            contexts.append(context)
+                        else:
+                            # Task completed successfully, get result
+                            result = task.result()
+                            if result is not None and isinstance(result, RecoveryAccountContext):
+                                contexts.append(result)
+                                
+                                # Update statistics
+                                if result.status == "success":
+                                    counters['success'] += 1
+                                elif result.status == "abnormal":
+                                    counters['abnormal'] += 1
+                                elif result.status == "timeout":
+                                    counters['code_timeout'] += 1
+                                elif result.status == "partial":
+                                    counters['partial'] += 1
+                                else:
+                                    counters['failed'] += 1
+                            else:
+                                # Task returned None or non-RecoveryAccountContext
+                                counters['failed'] += 1
+                                context.status = "failed"
+                                context.failure_reason = "Task returned invalid result"
+                                contexts.append(context)
+                    
+                    # Call progress callback
+                    if progress_callback:
+                        try:
+                            progress_callback(completed, total_files, counters)
+                        except Exception:
+                            pass
+            
+            # Cleanup phase: ensure all tasks are properly awaited to avoid "Task was destroyed but pending" warnings
+            # This handles cases where asyncio.wait_for timeout cancels tasks but they haven't fully cleaned up
+            all_batch_tasks = list(task_context_map.keys())
+            for task in all_batch_tasks:
                 context = task_context_map.get(task)
                 
-                # 防御性检查：如果上下文不存在，记录警告并跳过
-                if context is None:
-                    print(f"[run_batch] 警告: 任务无对应上下文，可能存在编程错误")
-                    counters['failed'] += 1
+                # Skip already processed tasks that completed normally
+                if context and context.original_path in processed_paths:
+                    # Even for processed tasks, ensure they are fully awaited if still pending
+                    if not task.done():
+                        task.cancel()
+                        try:
+                            await task
+                        except (asyncio.CancelledError, asyncio.TimeoutError):
+                            # Expected exceptions during task cleanup
+                            pass
+                        except Exception as e:
+                            # Log unexpected exceptions but don't fail
+                            print(f"[run_batch] Unexpected cleanup exception: {type(e).__name__}")
                     continue
                 
-                # 先检查任务状态，避免调用result()时出现意外异常
-                if task.cancelled():
-                    # 任务被取消
-                    counters['failed'] += 1
-                    print(f"[run_batch] 任务被取消: {context.original_path}")
-                    context.status = "failed"
-                    context.failure_reason = "任务被取消"
-                    contexts.append(context)
-                    continue
-                
-                exc = task.exception()
-                if exc is not None:
-                    # 任务抛出异常
-                    error_type = type(exc).__name__
-                    error_msg = str(exc) if str(exc) else error_type
-                    
-                    if isinstance(exc, asyncio.TimeoutError):
-                        counters['code_timeout'] += 1
-                        print(f"[run_batch] 任务超时: {context.original_path}")
-                        context.status = "timeout"
-                        context.failure_reason = "任务执行超时"
-                    else:
-                        counters['failed'] += 1
-                        print(f"[run_batch] 任务异常 ({error_type}): {error_msg[:100]}")
-                        context.status = "failed"
-                        context.failure_reason = f"{error_type}: {error_msg[:100]}"
-                    
-                    contexts.append(context)
-                    continue
-                
-                # 任务正常完成，获取结果
-                result = task.result()
-                if result is not None and isinstance(result, RecoveryAccountContext):
-                    contexts.append(result)
-                    
-                    # 实时统计
-                    if result.status == "success":
-                        counters['success'] += 1
-                    elif result.status == "abnormal":
-                        counters['abnormal'] += 1
-                    elif result.status == "timeout":
-                        counters['code_timeout'] += 1
-                    elif result.status == "partial":
-                        counters['partial'] += 1
-                    else:
-                        counters['failed'] += 1
-                else:
-                    # 任务返回None或非RecoveryAccountContext，标记为失败并使用预创建的上下文
-                    counters['failed'] += 1
-                    context.status = "failed"
-                    context.failure_reason = "任务返回无效结果"
-                    contexts.append(context)
-                
-                # 调用进度回调
-                if progress_callback:
+                # Cancel if still running
+                if not task.done():
+                    task.cancel()
                     try:
-                        progress_callback(completed, len(files), counters)
-                    except Exception:
+                        await task
+                    except asyncio.CancelledError:
+                        # Expected when task is cancelled
                         pass
+                    except asyncio.TimeoutError:
+                        # Task timed out during cleanup
+                        pass
+                    except Exception as e:
+                        # Log unexpected exceptions during cleanup
+                        if context:
+                            print(f"[run_batch] Cleanup exception for {context.original_path}: {type(e).__name__}: {str(e)[:50]}")
+                
+                # Handle unprocessed tasks
+                if context and context.original_path not in processed_paths:
+                    counters['failed'] += 1
+                    context.status = "failed"
+                    context.failure_reason = "Task did not complete normally"
+                    contexts.append(context)
+                    processed_paths.add(context.original_path)
+                    completed += 1
+                    
+                    if progress_callback:
+                        try:
+                            progress_callback(completed, total_files, counters)
+                        except Exception:
+                            pass
+            
+            # Brief pause between batches to let event loop process other tasks
+            if batch_end < total_files:
+                await asyncio.sleep(0.1)
         
-        # 保存汇总到数据库
+        # Final cleanup: give event loop a chance to clean up any remaining pending tasks
+        # This helps prevent "Task was destroyed but it is pending" warnings
+        cleanup_delay = config.RECOVERY_CLEANUP_DELAY if hasattr(config, 'RECOVERY_CLEANUP_DELAY') else 0.5
+        await asyncio.sleep(cleanup_delay)
+        
+        print(f"[run_batch] Batch processing completed: success {counters['success']}, failed {counters['failed']}, "
+              f"abnormal {counters['abnormal']}, timeout {counters['code_timeout']}, partial {counters['partial']}")
+        
+        # Save summary to database
         self.db.insert_recovery_summary(batch_id, counters)
         
-        # 生成报告
+        # Generate report
         report_data = {
             'batch_id': batch_id,
             'counters': counters,
