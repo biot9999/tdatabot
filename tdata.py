@@ -7573,11 +7573,11 @@ class RecoveryProtectionManager:
             
             try:
                 # 重新创建客户端使用代理
-                # 安全断开连接，忽略可能的异常
+                # 安全断开连接，忽略网络相关的异常
                 try:
                     await client.disconnect()
-                except Exception:
-                    pass  # 忽略断开连接时的异常
+                except (OSError, ConnectionError, asyncio.TimeoutError):
+                    pass  # 忽略断开连接时的网络异常
                 
                 # 设置代理参数（简化版，实际可能需要更复杂的proxy配置）
                 # 这里假设client已经在创建时配置了proxy
@@ -9579,6 +9579,26 @@ class RecoveryProtectionManager:
             
             return context
     
+    def _handle_task_state_error(self, state_err: Exception, context: RecoveryAccountContext, 
+                                  error_prefix: str, counters: Dict) -> Tuple[str, str]:
+        """处理任务状态异常的辅助函数
+        
+        Args:
+            state_err: 捕获的状态异常
+            context: 账号上下文
+            error_prefix: 错误消息前缀
+            counters: 计数器字典
+            
+        Returns:
+            (错误消息, 更新后的上下文状态)
+        """
+        error_msg = f"{error_prefix}: {type(state_err).__name__}: {str(state_err)[:80]}"
+        print(f"[run_batch] {error_msg}: {context.original_path}")
+        counters['failed'] += 1
+        context.status = "failed"
+        context.failure_reason = error_msg
+        return error_msg, "failed"
+    
     async def run_batch(self, files: List[Tuple[str, str]], progress_callback=None, 
                         user_password: str = "", user_old_password: str = "") -> Dict:
         """批量运行防止找回
@@ -9678,12 +9698,8 @@ class RecoveryProtectionManager:
                 try:
                     exc = task.exception()
                 except (asyncio.InvalidStateError, RuntimeError) as state_err:
-                    # 任务可能处于意外状态，记录错误并继续
-                    counters['failed'] += 1
-                    error_msg = f"任务状态异常: {type(state_err).__name__}: {str(state_err)[:80]}"
-                    print(f"[run_batch] {error_msg}: {context.original_path}")
-                    context.status = "failed"
-                    context.failure_reason = error_msg
+                    # 任务可能处于意外状态，使用辅助函数处理
+                    self._handle_task_state_error(state_err, context, "任务状态异常", counters)
                     contexts.append(context)
                     continue
                 
@@ -9710,12 +9726,8 @@ class RecoveryProtectionManager:
                 try:
                     result = task.result()
                 except (asyncio.InvalidStateError, RuntimeError) as state_err:
-                    # 任务结果获取失败，记录错误并继续
-                    counters['failed'] += 1
-                    error_msg = f"获取结果失败: {type(state_err).__name__}: {str(state_err)[:80]}"
-                    print(f"[run_batch] {error_msg}: {context.original_path}")
-                    context.status = "failed"
-                    context.failure_reason = error_msg
+                    # 任务结果获取失败，使用辅助函数处理
+                    self._handle_task_state_error(state_err, context, "获取结果失败", counters)
                     contexts.append(context)
                     continue
                 
