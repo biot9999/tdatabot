@@ -10304,6 +10304,9 @@ class EnhancedBot:
         
         # 账户合并待处理任务
         self.pending_merge: Dict[int, Dict[str, Any]] = {}
+        
+        # 添加2FA待处理任务
+        self.pending_add_2fa_tasks: Dict[int, Dict[str, Any]] = {}
 
         self.updater = Updater(config.TOKEN, use_context=True)
         self.dp = self.updater.dispatcher
@@ -10621,14 +10624,15 @@ class EnhancedBot:
                 InlineKeyboardButton("🔗 API转换", callback_data="api_conversion")
             ],
             [
-                InlineKeyboardButton("📦 账号拆分", callback_data="classify_menu"),
-                InlineKeyboardButton("📝 文件重命名", callback_data="rename_start")
+                InlineKeyboardButton("➕ 添加2FA", callback_data="add_2fa"),
+                InlineKeyboardButton("📦 账号拆分", callback_data="classify_menu")
             ],
             [
-                InlineKeyboardButton("🧩 账户合并", callback_data="merge_start"),
-                InlineKeyboardButton("💳 开通/兑换会员", callback_data="vip_menu")
+                InlineKeyboardButton("📝 文件重命名", callback_data="rename_start"),
+                InlineKeyboardButton("🧩 账户合并", callback_data="merge_start")
             ],
             [
+                InlineKeyboardButton("💳 开通/兑换会员", callback_data="vip_menu"),
                 InlineKeyboardButton("ℹ️ 帮助", callback_data="help")
             ]
         ]
@@ -11661,6 +11665,8 @@ class EnhancedBot:
             self.handle_recovery_oldpwd_mode(query, "manual")
         elif data == "forget_2fa":
             self.handle_forget_2fa(query)
+        elif data == "add_2fa":
+            self.handle_add_2fa(query)
         elif data == "convert_tdata_to_session":
             self.handle_convert_tdata_to_session(query)
         elif data == "convert_session_to_tdata":
@@ -11720,6 +11726,18 @@ class EnhancedBot:
                 [
                     InlineKeyboardButton("🔓 忘记2FA", callback_data="forget_2fa"),
                     InlineKeyboardButton("🔗 API转换", callback_data="api_conversion")
+                ],
+                [
+                    InlineKeyboardButton("➕ 添加2FA", callback_data="add_2fa"),
+                    InlineKeyboardButton("📦 账号拆分", callback_data="classify_menu")
+                ],
+                [
+                    InlineKeyboardButton("📝 文件重命名", callback_data="rename_start"),
+                    InlineKeyboardButton("🧩 账户合并", callback_data="merge_start")
+                ],
+                [
+                    InlineKeyboardButton("💳 开通/兑换会员", callback_data="vip_menu"),
+                    InlineKeyboardButton("ℹ️ 帮助", callback_data="help")
                 ]
             ]
             
@@ -12193,6 +12211,46 @@ class EnhancedBot:
         # 设置用户状态 - 等待上传文件
         self.db.save_user(user_id, query.from_user.username or "", 
                          query.from_user.first_name or "", "waiting_forget_2fa_file")
+    
+    def handle_add_2fa(self, query):
+        """处理添加2FA功能"""
+        query.answer()
+        user_id = query.from_user.id
+        
+        # 检查权限
+        is_member, level, _ = self.db.check_membership(user_id)
+        if not is_member and not self.db.is_admin(user_id):
+            self.safe_edit_message(query, "❌ 需要会员权限才能使用添加2FA功能")
+            return
+        
+        text = """
+➕ <b>添加2FA密码</b>
+
+<b>📋 功能说明：</b>
+• 为 Session 文件自动创建 JSON 配置文件
+• 为 TData 目录自动创建 2fa.txt 密码文件
+• 您可以自定义2FA密码内容
+
+<b>📤 支持的文件格式：</b>
+• ZIP 压缩包（包含 Session 或 TData）
+• 自动识别文件类型并添加对应的2FA配置
+
+<b>⚙️ 处理规则：</b>
+• Session 文件 → 创建同名 JSON 文件（包含 twoFA 字段）
+• TData 目录 → 创建 2fa.txt 文件（与 tdata 同级）
+
+<b>📤 请上传您的账号文件</b>
+        """
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 返回主菜单", callback_data="back_to_main")]
+        ])
+        
+        self.safe_edit_message(query, text, 'HTML', keyboard)
+        
+        # 设置用户状态 - 等待上传文件
+        self.db.save_user(user_id, query.from_user.username or "", 
+                         query.from_user.first_name or "", "waiting_add_2fa_file")
     
     def handle_help_callback(self, query):
         query.answer()
@@ -12712,6 +12770,7 @@ class EnhancedBot:
                 "waiting_merge_files",
                 "waiting_recovery_file",
                 "waiting_forget_2fa_file",
+                "waiting_add_2fa_file",
             ]:
                 self.safe_send_message(update, "❌ 请先点击相应的功能按钮")
                 return
@@ -12837,6 +12896,19 @@ class EnhancedBot:
                     import traceback
                     traceback.print_exc()
             thread = threading.Thread(target=process_forget_2fa, daemon=True)
+            thread.start()
+        elif user_status == "waiting_add_2fa_file":
+            # 添加2FA处理
+            def process_add_2fa():
+                try:
+                    asyncio.run(self.process_add_2fa(update, context, document))
+                except asyncio.CancelledError:
+                    print(f"[process_add_2fa] 任务被取消")
+                except Exception as e:
+                    print(f"[process_add_2fa] 处理异常: {e}")
+                    import traceback
+                    traceback.print_exc()
+            thread = threading.Thread(target=process_add_2fa, daemon=True)
             thread.start()
         # 清空用户状态
         self.db.save_user(
@@ -14124,6 +14196,11 @@ class EnhancedBot:
         except Exception as e:
             print(f"❌ 检查广播状态失败: {e}")
         
+        # 处理添加2FA等待的密码输入（使用任务字典检查，不依赖数据库状态）
+        if user_id in getattr(self, "pending_add_2fa_tasks", {}):
+            self.handle_add_2fa_input(update, context, user_id, text)
+            return
+        
         # 新增：处理 API 转换等待的 2FA 输入
         if user_id in getattr(self, "pending_api_tasks", {}):
             two_fa_input = (text or "").strip()
@@ -14549,6 +14626,44 @@ class EnhancedBot:
             "⏰ <i>5分钟内未上传将自动取消</i>",
             'HTML'
         )
+    
+    def handle_add_2fa_input(self, update: Update, context: CallbackContext, user_id: int, text: str):
+        """处理添加2FA密码输入"""
+        if user_id not in self.pending_add_2fa_tasks:
+            self.safe_send_message(update, "❌ 没有待处理的添加2FA任务，请重新开始")
+            return
+        
+        task = self.pending_add_2fa_tasks[user_id]
+        
+        # 检查超时（5分钟）
+        if time.time() - task['start_time'] > 300:
+            del self.pending_add_2fa_tasks[user_id]
+            self.db.save_user(user_id, "", "", "")
+            self.safe_send_message(update, "❌ 操作超时，请重新开始")
+            return
+        
+        # 验证密码
+        two_fa_password = text.strip()
+        
+        if not two_fa_password:
+            self.safe_send_message(update, "❌ 2FA密码不能为空，请重新输入")
+            return
+        
+        # 确认接收密码
+        self.safe_send_message(
+            update,
+            f"✅ <b>2FA密码已接收</b>\n\n"
+            f"密码: <code>{two_fa_password}</code>\n\n"
+            f"正在处理...",
+            'HTML'
+        )
+        
+        # 异步处理添加2FA
+        def process_add_2fa():
+            asyncio.run(self.complete_add_2fa(update, context, user_id, two_fa_password))
+        
+        thread = threading.Thread(target=process_add_2fa, daemon=True)
+        thread.start()
     
     async def process_recovery_protection(self, update, context, document):
         """防止找回保护处理 - 使用用户提供的密码"""
@@ -14981,6 +15096,333 @@ class EnhancedBot:
                     shutil.rmtree(os.path.dirname(temp_zip), ignore_errors=True)
                 except:
                     pass
+    
+    async def process_add_2fa(self, update, context, document):
+        """添加2FA处理 - 为Session创建JSON文件，为TData创建2fa.txt文件"""
+        user_id = update.effective_user.id
+        start_time = time.time()
+        task_id = f"{user_id}_{int(start_time)}"
+        
+        progress_msg = self.safe_send_message(update, "📥 <b>正在处理您的文件...</b>", 'HTML')
+        if not progress_msg:
+            return
+        
+        temp_zip = None
+        try:
+            temp_dir = tempfile.mkdtemp(prefix="temp_add_2fa_")
+            temp_zip = os.path.join(temp_dir, document.file_name)
+            document.get_file().download(temp_zip)
+            
+            # 使用FileProcessor扫描
+            files, extract_dir, file_type = self.processor.scan_zip_file(temp_zip, user_id, task_id)
+            
+            if not files:
+                try:
+                    progress_msg.edit_text(
+                        "❌ <b>未找到有效文件</b>\n\n请确保ZIP包含Session或TData格式的账号文件",
+                        parse_mode='HTML'
+                    )
+                except:
+                    pass
+                return
+            
+            total_files = len(files)
+            
+            # 保存任务信息，等待用户输入2FA密码
+            self.pending_add_2fa_tasks[user_id] = {
+                'files': files,
+                'file_type': file_type,
+                'extract_dir': extract_dir,
+                'task_id': task_id,
+                'progress_msg': progress_msg,
+                'start_time': start_time,
+                'temp_zip': temp_zip,
+                'temp_dir': temp_dir
+            }
+            
+            # 提示用户输入2FA密码
+            text = f"""
+✅ <b>文件扫描完成！</b>
+
+📊 <b>统计信息</b>
+• 总账号数: {total_files} 个
+• 文件类型: {file_type.upper()}
+
+<b>📝 请输入要设置的2FA密码</b>
+
+• 该密码将应用于所有账号
+• Session文件将创建对应的JSON配置文件
+• TData目录将创建2fa.txt文件
+
+⏰ <i>5分钟内未输入将自动取消</i>
+            """
+            
+            try:
+                progress_msg.edit_text(text, parse_mode='HTML')
+            except:
+                pass
+            
+            # 设置用户状态 - 等待输入2FA密码
+            self.db.save_user(user_id, update.effective_user.username or "", 
+                             update.effective_user.first_name or "", "waiting_add_2fa_input")
+            
+        except Exception as e:
+            print(f"❌ 添加2FA处理失败: {e}")
+            import traceback
+            traceback.print_exc()
+            try:
+                progress_msg.edit_text(
+                    f"❌ <b>处理失败</b>\n\n错误: {str(e)[:100]}",
+                    parse_mode='HTML'
+                )
+            except:
+                pass
+    
+    async def complete_add_2fa(self, update, context, user_id: int, two_fa_password: str):
+        """完成添加2FA - 为文件添加2FA配置"""
+        if user_id not in self.pending_add_2fa_tasks:
+            self.safe_send_message(update, "❌ 没有待处理的添加2FA任务")
+            return
+        
+        task_info = self.pending_add_2fa_tasks[user_id]
+        files = task_info['files']
+        file_type = task_info['file_type']
+        extract_dir = task_info['extract_dir']
+        temp_dir = task_info.get('temp_dir')
+        
+        progress_msg = self.safe_send_message(update, "🔄 <b>正在添加2FA配置...</b>", 'HTML')
+        
+        try:
+            success_count = 0
+            failed_count = 0
+            results = []
+            
+            for file_path, file_name in files:
+                try:
+                    if file_type == "session":
+                        # 处理Session文件 - 创建对应的JSON文件
+                        result = await self._add_2fa_to_session(file_path, file_name, two_fa_password)
+                    else:
+                        # 处理TData目录 - 创建2fa.txt文件
+                        result = await self._add_2fa_to_tdata(file_path, file_name, two_fa_password)
+                    
+                    if result['success']:
+                        success_count += 1
+                        results.append((file_name, "✅ 成功", result.get('message', '')))
+                    else:
+                        failed_count += 1
+                        results.append((file_name, "❌ 失败", result.get('error', '')))
+                        
+                except Exception as e:
+                    failed_count += 1
+                    results.append((file_name, "❌ 错误", str(e)[:50]))
+            
+            # 创建结果ZIP文件 - 保持原始目录结构，只添加2fa.txt
+            timestamp = int(time.time())
+            result_dir = os.path.join(config.RESULTS_DIR, f"add_2fa_{user_id}_{timestamp}")
+            os.makedirs(result_dir, exist_ok=True)
+            
+            result_zip_path = os.path.join(result_dir, f"add_2fa_result_{timestamp}.zip")
+            
+            # 直接打包整个extract_dir，保持原始结构（2fa.txt已经被添加到正确位置）
+            with zipfile.ZipFile(result_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for root, dirs, filenames in os.walk(extract_dir):
+                    for fn in filenames:
+                        full_path = os.path.join(root, fn)
+                        # 计算相对于extract_dir的路径，保持原始结构
+                        rel_path = os.path.relpath(full_path, extract_dir)
+                        zf.write(full_path, rel_path)
+            
+            # 发送结果
+            elapsed = time.time() - task_info['start_time']
+            
+            summary_text = f"""
+✅ <b>添加2FA完成！</b>
+
+📊 <b>处理结果</b>
+• 成功: {success_count} 个
+• 失败: {failed_count} 个
+• 总计: {len(files)} 个
+• 用时: {elapsed:.1f}秒
+
+🔐 <b>设置的2FA密码</b>: <code>{two_fa_password}</code>
+            """
+            
+            try:
+                progress_msg.edit_text(summary_text, parse_mode='HTML')
+            except:
+                self.safe_send_message(update, summary_text, 'HTML')
+            
+            # 发送结果文件
+            if os.path.exists(result_zip_path):
+                with open(result_zip_path, 'rb') as f:
+                    context.bot.send_document(
+                        chat_id=user_id,
+                        document=f,
+                        caption=f"📦 添加2FA结果 - 成功 {success_count} 个",
+                        filename=os.path.basename(result_zip_path)
+                    )
+            
+        except Exception as e:
+            print(f"❌ 完成添加2FA失败: {e}")
+            import traceback
+            traceback.print_exc()
+            self.safe_send_message(update, f"❌ 处理失败: {str(e)[:100]}")
+        
+        finally:
+            # 清理任务
+            if user_id in self.pending_add_2fa_tasks:
+                del self.pending_add_2fa_tasks[user_id]
+            
+            # 清除用户状态
+            self.db.save_user(user_id, "", "", "")
+            
+            # 清理临时文件
+            if temp_dir and os.path.exists(temp_dir):
+                try:
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                except:
+                    pass
+    
+    async def _add_2fa_to_session(self, session_path: str, session_name: str, two_fa_password: str) -> dict:
+        """为Session文件添加2FA配置 - 创建对应的JSON文件"""
+        try:
+            # 生成JSON文件路径
+            json_path = session_path.replace('.session', '.json')
+            
+            # 检查JSON文件是否已存在
+            if os.path.exists(json_path):
+                # 读取现有JSON并更新twoFA字段
+                with open(json_path, 'r', encoding='utf-8') as f:
+                    json_data = json.load(f)
+                
+                json_data['twoFA'] = two_fa_password
+                json_data['has_password'] = True
+                
+                with open(json_path, 'w', encoding='utf-8') as f:
+                    json.dump(json_data, f, indent=2, ensure_ascii=False)
+                
+                return {'success': True, 'message': 'JSON文件已更新twoFA'}
+            
+            # 创建新的JSON文件
+            # 从session文件名提取手机号（如果可能）
+            base_name = session_name.replace('.session', '')
+            # 清理手机号格式：移除常见的非数字字符
+            cleaned_phone = ''.join(c for c in base_name if c.isdigit())
+            phone = cleaned_phone if cleaned_phone and len(cleaned_phone) >= 10 else ""
+            
+            current_time = datetime.now()
+            
+            # 使用默认设备配置
+            device_config = {
+                'api_id': config.API_ID,
+                'api_hash': config.API_HASH,
+                'sdk': 'Windows 10 x64',
+                'device': 'PC 64bit',
+                'app_version': '6.3.4 x64',
+                'lang_code': 'en',
+                'system_lang_code': 'en-US',
+                'device_model': 'PC 64bit',
+            }
+            
+            # 使用用户提供的模板格式生成JSON
+            json_data = {
+                "app_id": device_config.get('api_id', config.API_ID),
+                "app_hash": device_config.get('api_hash', config.API_HASH),
+                "sdk": device_config.get('sdk', 'Windows 10 x64'),
+                "device": device_config.get('device', 'PC 64bit'),
+                "app_version": device_config.get('app_version', '6.3.4 x64'),
+                "lang_pack": device_config.get('lang_code', 'en'),
+                "system_lang_pack": device_config.get('system_lang_code', 'en-US'),
+                "twoFA": two_fa_password,
+                "role": None,
+                "id": 0,
+                "phone": phone,
+                "username": None,
+                "date_of_birth": None,
+                "date_of_birth_integrity": None,
+                "is_premium": False,
+                "premium_expiry": None,
+                "first_name": "",
+                "last_name": None,
+                "has_profile_pic": False,
+                "spamblock": "",
+                "spamblock_end_date": None,
+                "session_file": base_name,
+                "stats_spam_count": 0,
+                "stats_invites_count": 0,
+                "last_connect_date": current_time.strftime('%Y-%m-%dT%H:%M:%S+0000'),
+                "session_created_date": current_time.strftime('%Y-%m-%dT%H:%M:%S+0000'),
+                "app_config_hash": None,
+                "extra_params": "",
+                "device_model": device_config.get('device_model', 'PC 64bit'),
+                "user_id": 0,
+                "ipv6": False,
+                "register_time": None,
+                "sex": None,
+                "last_check_time": int(current_time.timestamp()),
+                "device_token": "",
+                "tz_offset": 0,
+                "perf_cat": 2,
+                "avatar": "img/default.png",
+                "proxy": None,
+                "block": False,
+                "package_id": "",
+                "installer": "",
+                "email": "",
+                "email_id": "",
+                "secret": "",
+                "category": "",
+                "scam": False,
+                "is_blocked": False,
+                "voip_token": "",
+                "last_reg_time": 0,
+                "has_password": True,
+                "block_since_time": 0,
+                "block_until_time": 0
+            }
+            
+            with open(json_path, 'w', encoding='utf-8') as f:
+                json.dump(json_data, f, indent=2, ensure_ascii=False)
+            
+            return {'success': True, 'message': 'JSON文件已创建'}
+            
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+    
+    async def _add_2fa_to_tdata(self, tdata_path: str, display_name: str, two_fa_password: str) -> dict:
+        """为TData目录添加2FA配置 - 创建2fa.txt文件"""
+        try:
+            # TData目录的父目录（与tdata同级）
+            parent_dir = os.path.dirname(tdata_path)
+            
+            # 2fa.txt文件路径
+            twofa_txt_path = os.path.join(parent_dir, "2fa.txt")
+            
+            # 检查是否已存在密码文件
+            existing_password_files = ['2fa.txt', 'twofa.txt', 'password.txt', '2FA.txt', 'TwoFA.txt']
+            existing_file = None
+            
+            for pwd_file in existing_password_files:
+                pwd_path = os.path.join(parent_dir, pwd_file)
+                if os.path.exists(pwd_path):
+                    existing_file = pwd_path
+                    break
+            
+            if existing_file:
+                # 更新现有密码文件
+                with open(existing_file, 'w', encoding='utf-8') as f:
+                    f.write(two_fa_password)
+                return {'success': True, 'message': f'密码文件已更新: {os.path.basename(existing_file)}'}
+            
+            # 创建新的2fa.txt文件
+            with open(twofa_txt_path, 'w', encoding='utf-8') as f:
+                f.write(two_fa_password)
+            
+            return {'success': True, 'message': '2fa.txt文件已创建'}
+            
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
     
     async def process_classify_stage1(self, update, context, document):
         """账号分类 - 阶段1：扫描文件并选择拆分方式"""
