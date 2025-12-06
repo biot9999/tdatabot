@@ -8689,7 +8689,8 @@ class RecoveryProtectionManager:
         try:
             code = await self.wait_for_code(old_client, phone_normalized, timeout=config.RECOVERY_CODE_TIMEOUT)
             
-            if code:
+            if code and self._validate_code_format(code):
+                context.verification_code = code
                 stage_result = RecoveryStageResult(
                     account_name=account_name,
                     phone=phone_normalized,
@@ -9708,12 +9709,33 @@ class RecoveryProtectionManager:
                         context.phone = phone
                         print(f"📱 从账号信息获取手机号: {phone}")
                     
+                    # 检查2FA状态并验证密码
+                    from telethon.tl.functions.account import GetPasswordRequest
+                    password_info = await old_client(GetPasswordRequest())
+                    context.has_2fa = password_info.has_password
+                    
+                    if context.has_2fa:
+                        print(f"🔐 [{account_name}] 账号有2FA，开始验证旧密码...")
+                        passwords = self._collect_all_passwords(context, file_type, file_path)
+                        if not passwords:
+                            raise Exception("账号有2FA但没有可用的旧密码")
+                        
+                        success, correct_pwd, source = await self._verify_2fa_password(
+                            old_client, passwords, context
+                        )
+                        if not success:
+                            raise Exception(f"2FA密码验证失败: {correct_pwd}")
+                        
+                        context.verified_old_password = correct_pwd
+                        context.password_source = source
+                        print(f"✅ [{account_name}] 2FA密码验证成功 (来源: {source})")
+                    
                     stage_result = RecoveryStageResult(
                         account_name=account_name,
                         phone=phone,
                         stage="connect_old",
                         success=True,
-                        detail=f"连接成功: {proxy_info}",
+                        detail=f"连接成功: {proxy_info}, 2FA: {context.has_2fa}",
                         elapsed=time.time() - stage_start
                     )
                     context.stage_results.append(stage_result)
@@ -9735,24 +9757,31 @@ class RecoveryProtectionManager:
                     return context
                 
                 # ===== 阶段2.5: 在旧会话上修改2FA密码 =====
-                # 使用旧密码验证并设置新密码
+                # 使用新方法，带速率限制
+                await self.rate_limiter.acquire('password_change', 5.0)
                 print(f"🔐 [{account_name}] 在旧会话上修改2FA密码...")
-                pwd_success = await self._stage_change_pwd_on_old_session(old_client, phone, context, file_type, file_path)
-                if not pwd_success:
+                success, msg = await self._stage_change_password_on_old(old_client, context)
+                if not success:
                     context.status = "failed"
-                    context.failure_reason = "修改2FA密码失败"
+                    context.failure_reason = f"密码修改失败: {msg}"
                     return context
+                
+                pwd_success = success
                 
                 # ===== 阶段3: 从旧会话踢出其他设备 (核心创新：旧设备无"too new"限制) =====
                 # 使用旧设备调用 ResetAuthorizationsRequest，绕过"session too new"错误
+                await self.rate_limiter.acquire('device_removal', 3.0)
                 print(f"🔄 [{account_name}] 从旧会话踢出所有其他设备（绕过'too new'限制）...")
                 devices_success, devices_detail = await self._stage_kick_devices_from_old(old_client, context)
                 if not devices_success:
                     print(f"⚠️ [{account_name}] 踢出设备失败: {devices_detail}，继续执行...")
+                    context.status = "partial"
+                    context.failure_reason = f"设备踢出失败: {devices_detail}"
                 else:
                     print(f"✅ [{account_name}] 踢出设备成功: {devices_detail}")
                 
                 # ===== 阶段4: 请求并等待验证码 =====
+                await self.rate_limiter.acquire('code_request', 3.0)
                 code = await self._stage_request_and_wait_code(old_client, phone, context)
                 if not code:
                     context.status = "timeout"
@@ -9821,6 +9850,19 @@ class RecoveryProtectionManager:
                     print(f"⚠️ [{account_name}] 旧会话可能仍有效: {old_invalid_detail}")
                     context.old_session_valid = True
                 
+                # ===== 阶段9: 验证只剩当前会话 =====
+                if new_client:
+                    print(f"🔍 [{account_name}] 验证只剩当前会话...")
+                    single_session, single_detail = await self._stage_verify_single_session(new_client, context)
+                    if single_session:
+                        print(f"✅ [{account_name}] {single_detail}")
+                    else:
+                        print(f"⚠️ [{account_name}] {single_detail}")
+                        if context.status != "partial":
+                            context.status = "warning"
+                        if not context.failure_reason:
+                            context.failure_reason = single_detail
+                
                 # 最终状态判断
                 # 成功条件：密码修改成功 + 新设备登录成功 + 旧设备确认失效
                 # 如果旧设备踢出失败或会话终止失败，均视为授权失败
@@ -9832,6 +9874,9 @@ class RecoveryProtectionManager:
                     # 旧设备仍有效 - 归类为失败（授权失败）
                     context.status = "failed"
                     context.failure_reason = "旧设备踢出失败: 旧会话仍然有效"
+                elif context.status == "partial":
+                    # 部分成功（设备踢出失败但其他操作成功）
+                    pass  # 保持partial状态
                 else:
                     # 只有确认旧设备失效才算完全成功
                     context.status = "success"
