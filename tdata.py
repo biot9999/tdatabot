@@ -10655,9 +10655,21 @@ class RecoveryProtectionManager:
                 if os.path.exists(dir_path):
                     for root, dirs, files in os.walk(dir_path):
                         for file in files:
+                            # 跳过临时文件和SQLite journal文件
+                            if file.startswith('temp_code_request_') or file.endswith('-journal') or file.endswith('-wal') or file.endswith('-shm'):
+                                continue
+                            
                             file_path = os.path.join(root, file)
+                            # 检查文件是否存在（防止race condition）
+                            if not os.path.exists(file_path):
+                                continue
+                            
                             arcname = os.path.join(dir_name, file)
-                            zf.write(file_path, arcname)
+                            try:
+                                zf.write(file_path, arcname)
+                            except (FileNotFoundError, OSError) as e:
+                                # 文件在检查和写入之间被删除，跳过
+                                print(f"⚠️ 跳过文件 {file_path}: {e}")
         
         return RecoveryReportFiles(
             summary_txt=txt_path,
