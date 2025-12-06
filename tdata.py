@@ -9743,23 +9743,41 @@ class RecoveryProtectionManager:
                         except Exception:
                             pass
             
-            # Defensive check: handle any unprocessed tasks in the batch
-            for task, context in task_context_map.items():
-                if context.original_path not in processed_paths:
+            # Cleanup phase: ensure all tasks are properly awaited to avoid "Task was destroyed but pending" warnings
+            # This handles cases where asyncio.wait_for timeout cancels tasks but they haven't fully cleaned up
+            all_batch_tasks = list(task_context_map.keys())
+            for task in all_batch_tasks:
+                context = task_context_map.get(task)
+                
+                # Skip already processed tasks that completed normally
+                if context and context.original_path in processed_paths:
+                    # Even for processed tasks, ensure they are fully awaited if still pending
                     if not task.done():
                         task.cancel()
                         try:
                             await task
-                        except asyncio.CancelledError:
-                            # Expected when task is cancelled
+                        except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
                             pass
-                        except asyncio.TimeoutError:
-                            # Task timed out during cancellation
-                            pass
-                        except Exception as e:
-                            # Log unexpected exceptions during cleanup
+                    continue
+                
+                # Cancel if still running
+                if not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        # Expected when task is cancelled
+                        pass
+                    except asyncio.TimeoutError:
+                        # Task timed out during cleanup
+                        pass
+                    except Exception as e:
+                        # Log unexpected exceptions during cleanup
+                        if context:
                             print(f"[run_batch] Cleanup exception for {context.original_path}: {type(e).__name__}: {str(e)[:50]}")
-                    
+                
+                # Handle unprocessed tasks
+                if context and context.original_path not in processed_paths:
                     counters['failed'] += 1
                     context.status = "failed"
                     context.failure_reason = "Task did not complete normally"
@@ -9776,6 +9794,10 @@ class RecoveryProtectionManager:
             # Brief pause between batches to let event loop process other tasks
             if batch_end < total_files:
                 await asyncio.sleep(0.1)
+        
+        # Final cleanup: give event loop a chance to clean up any remaining pending tasks
+        # This helps prevent "Task was destroyed but it is pending" warnings
+        await asyncio.sleep(0.5)
         
         print(f"[run_batch] Batch processing completed: success {counters['success']}, failed {counters['failed']}, "
               f"abnormal {counters['abnormal']}, timeout {counters['code_timeout']}, partial {counters['partial']}")
