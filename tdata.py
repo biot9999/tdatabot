@@ -9693,10 +9693,7 @@ class RecoveryProtectionManager:
                         context.failure_reason = "Task cancelled"
                         contexts.append(context)
                     else:
-                        try:
-                            exc = task.exception()
-                        except asyncio.CancelledError:
-                            exc = asyncio.CancelledError()
+                        exc = task.exception()
                         
                         if exc is not None:
                             # Task threw an exception
@@ -9753,8 +9750,15 @@ class RecoveryProtectionManager:
                         task.cancel()
                         try:
                             await task
-                        except (asyncio.CancelledError, Exception):
+                        except asyncio.CancelledError:
+                            # Expected when task is cancelled
                             pass
+                        except asyncio.TimeoutError:
+                            # Task timed out during cancellation
+                            pass
+                        except Exception as e:
+                            # Log unexpected exceptions during cleanup
+                            print(f"[run_batch] Cleanup exception for {context.original_path}: {type(e).__name__}: {str(e)[:50]}")
                     
                     counters['failed'] += 1
                     context.status = "failed"
