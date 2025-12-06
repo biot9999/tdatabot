@@ -6928,13 +6928,17 @@ class RecoveryProtectionManager:
         if client is None:
             return
         try:
-            await asyncio.wait_for(client.disconnect(), timeout=self.DISCONNECT_TIMEOUT)
+            # 验证disconnect方法存在且是可等待的
+            disconnect_method = getattr(client, 'disconnect', None)
+            if disconnect_method is None or not callable(disconnect_method):
+                return
+            await asyncio.wait_for(disconnect_method(), timeout=self.DISCONNECT_TIMEOUT)
         except asyncio.TimeoutError:
             if config.DEBUG_RECOVERY:
                 print(f"🔌 [{client_name}] 断开连接超时 (>{self.DISCONNECT_TIMEOUT}s)")
-        except (OSError, ConnectionError, RuntimeError) as e:
+        except (OSError, ConnectionError, RuntimeError, TypeError) as e:
             if config.DEBUG_RECOVERY:
-                print(f"🔌 [{client_name}] 断开连接异常: {type(e).__name__}: {str(e)[:50]}")
+                print(f"🔌 [{client_name}] 断开连接异常: {type(e).__name__}: {str(e)[:self.MAX_ERROR_MSG_LENGTH]}")
     
     def _get_random_device_info(self) -> Tuple[str, str, str]:
         """生成随机设备信息以防风控
@@ -9597,7 +9601,7 @@ class RecoveryProtectionManager:
             return context
     
     def _handle_task_state_error(self, state_err: Exception, context: RecoveryAccountContext, 
-                                  error_prefix: str, counters: Dict) -> Tuple[str, str]:
+                                  error_prefix: str, counters: Dict) -> str:
         """处理任务状态异常的辅助函数
         
         Args:
@@ -9607,14 +9611,21 @@ class RecoveryProtectionManager:
             counters: 计数器字典
             
         Returns:
-            (错误消息, 更新后的上下文状态)
+            错误消息字符串（上下文状态始终设置为"failed"）
         """
-        error_msg = f"{error_prefix}: {type(state_err).__name__}: {str(state_err)[:self.MAX_ERROR_MSG_LENGTH]}"
+        # 构造完整错误消息，确保总长度不超过限制
+        type_name = type(state_err).__name__
+        err_str = str(state_err)
+        # 计算可用于异常字符串的最大长度
+        prefix_len = len(error_prefix) + len(type_name) + 4  # 4 for ": " and ": "
+        max_err_len = max(20, self.MAX_ERROR_MSG_LENGTH - prefix_len)
+        error_msg = f"{error_prefix}: {type_name}: {err_str[:max_err_len]}"
+        
         print(f"[run_batch] {error_msg}: {context.original_path}")
         counters['failed'] += 1
         context.status = "failed"
         context.failure_reason = error_msg
-        return error_msg, "failed"
+        return error_msg
     
     async def run_batch(self, files: List[Tuple[str, str]], progress_callback=None, 
                         user_password: str = "", user_old_password: str = "") -> Dict:
