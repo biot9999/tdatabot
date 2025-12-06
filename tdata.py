@@ -9074,7 +9074,7 @@ class RecoveryProtectionManager:
         按照issue要求的流程，使用UpdatePasswordSettingsRequest来修改密码
         """
         from telethon.tl.functions.account import GetPasswordRequest, UpdatePasswordSettingsRequest
-        from telethon.tl.types import PasswordInputSettings
+        from telethon.tl.types import account as account_types
         from telethon.crypto import pwd as pwd_mod
         
         account_name = os.path.basename(context.original_path)
@@ -9102,7 +9102,7 @@ class RecoveryProtectionManager:
             # 修改密码
             await old_client(UpdatePasswordSettingsRequest(
                 password=old_password_hash,
-                new_settings=PasswordInputSettings(
+                new_settings=account_types.PasswordInputSettings(
                     new_algo=password.new_algo,
                     new_password_hash=new_password_hash,
                     hint=context.new_password_hint or ""
