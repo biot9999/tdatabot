@@ -9586,6 +9586,24 @@ class RecoveryProtectionManager:
                     context.status = "success"
                     context.failure_reason = ""
                 
+            except asyncio.CancelledError:
+                # 任务被取消（通常是超时导致）
+                context.status = "failed"
+                context.failure_reason = "任务被取消(超时)"
+                print(f"⏰ 账号 {account_name} 任务被取消")
+            except RuntimeError as e:
+                # 特别处理RuntimeError（常见于连接问题）
+                error_str = str(e)
+                if "Task" in error_str:
+                    context.status = "failed"
+                    context.failure_reason = f"连接异常: {error_str[:80]}"
+                    print(f"🔌 账号 {account_name} 连接异常: {error_str[:100]}")
+                else:
+                    context.status = "failed"
+                    context.failure_reason = f"运行时错误: {error_str[:80]}"
+                    print(f"❌ 账号 {account_name} 运行时错误: {error_str[:100]}")
+                if config.DEBUG_RECOVERY:
+                    print(f"🔍 [{account_name}] 完整堆栈跟踪:\n{traceback.format_exc()}")
             except Exception as e:
                 context.status = "failed"
                 context.failure_reason = f"处理异常: {str(e)[:100]}"
@@ -9722,9 +9740,17 @@ class RecoveryProtectionManager:
                     continue
                 
                 # 使用try-except包装task.exception()和task.result()调用
-                # 防止在任务状态异常时抛出InvalidStateError或RuntimeError
+                # 防止在任务状态异常时抛出InvalidStateError、RuntimeError或CancelledError
                 try:
                     exc = task.exception()
+                except asyncio.CancelledError:
+                    # 任务被取消时，task.exception()会抛出CancelledError
+                    counters['failed'] += 1
+                    print(f"[run_batch] 任务被取消(CancelledError): {context.original_path}")
+                    context.status = "failed"
+                    context.failure_reason = "任务被取消"
+                    contexts.append(context)
+                    continue
                 except (asyncio.InvalidStateError, RuntimeError) as state_err:
                     # 任务可能处于意外状态，使用辅助函数处理
                     self._handle_task_state_error(state_err, context, "任务状态异常", counters)
@@ -9741,6 +9767,12 @@ class RecoveryProtectionManager:
                         print(f"[run_batch] 任务超时: {context.original_path}")
                         context.status = "timeout"
                         context.failure_reason = "任务执行超时"
+                    elif isinstance(exc, RuntimeError) and "Task" in str(exc):
+                        # 连接相关的RuntimeError（如Task was destroyed）
+                        counters['failed'] += 1
+                        print(f"[run_batch] 连接异常 (RuntimeError): {error_msg[:100]}")
+                        context.status = "failed"
+                        context.failure_reason = f"连接异常: {error_msg[:80]}"
                     else:
                         counters['failed'] += 1
                         print(f"[run_batch] 任务异常 ({error_type}): {error_msg[:100]}")
@@ -9753,6 +9785,14 @@ class RecoveryProtectionManager:
                 # 任务正常完成，获取结果
                 try:
                     result = task.result()
+                except asyncio.CancelledError:
+                    # 任务被取消时，task.result()会抛出CancelledError
+                    counters['failed'] += 1
+                    print(f"[run_batch] 获取结果时任务已取消: {context.original_path}")
+                    context.status = "failed"
+                    context.failure_reason = "任务被取消"
+                    contexts.append(context)
+                    continue
                 except (asyncio.InvalidStateError, RuntimeError) as state_err:
                     # 任务结果获取失败，使用辅助函数处理
                     self._handle_task_state_error(state_err, context, "获取结果失败", counters)
