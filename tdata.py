@@ -5401,27 +5401,27 @@ def _afc_run_server(self):
     if config.ALLOW_PORT_SHIFT:
         available_port = _find_available_port(preferred_port)
         if available_port and available_port != preferred_port:
-            print(f"⚠️ [RECOVERY] 端口 {preferred_port} 被占用，切换到端口 {available_port}")
+            print(f"⚠️ [CODE_SERVER] 端口 {preferred_port} 被占用，切换到端口 {available_port}")
             port = available_port
             # 更新 base_url
             if hasattr(self, 'base_url'):
                 self.base_url = self.base_url.replace(f':{preferred_port}', f':{port}')
         elif not available_port:
-            print(f"❌ [RECOVERY] 无法找到可用端口（尝试范围：{preferred_port}-{preferred_port + 20}）")
-            print(f"💡 [RECOVERY] 验证码服务器将不会启动，请手动释放端口或关闭 ALLOW_PORT_SHIFT")
+            print(f"❌ [CODE_SERVER] 无法找到可用端口（尝试范围：{preferred_port}-{preferred_port + 20}）")
+            print(f"💡 [CODE_SERVER] 验证码服务器将不会启动，请手动释放端口或关闭 ALLOW_PORT_SHIFT")
             return
     
-    print(f"🌐 [RECOVERY] 验证码接收服务器启动: http://{host}:{port} (BASE_URL={self.base_url if hasattr(self, 'base_url') else 'N/A'})")
+    print(f"🌐 [CODE_SERVER] 验证码接收服务器启动: http://{host}:{port} (BASE_URL={self.base_url if hasattr(self, 'base_url') else 'N/A'})")
     try:
         self.flask_app.run(host=host, port=port, debug=False)
     except OSError as e:
         if "Address already in use" in str(e):
-            print(f"❌ [RECOVERY] 端口 {port} 仍被占用: {e}")
-            print(f"💡 [RECOVERY] 请检查是否有其他进程占用该端口")
+            print(f"❌ [CODE_SERVER] 端口 {port} 仍被占用: {e}")
+            print(f"💡 [CODE_SERVER] 请检查是否有其他进程占用该端口")
         else:
-            print(f"❌ [RECOVERY] Flask 服务器启动失败: {e}")
+            print(f"❌ [CODE_SERVER] Flask 服务器启动失败: {e}")
     except Exception as e:
-        print(f"❌ [RECOVERY] Flask 服务器运行错误: {e}")
+        print(f"❌ [CODE_SERVER] Flask 服务器运行错误: {e}")
 
 # 把方法安全挂到类上（先定义，后挂载；用 hasattr 避免引用未定义名字）
 if not hasattr(APIFormatConverter, "_env"):
@@ -5452,7 +5452,7 @@ def normalize_phone(phone: Any, default_country_prefix: str = None) -> str:
     """
     # 获取默认前缀
     if default_country_prefix is None:
-        default_country_prefix = config.RECOVERY_DEFAULT_COUNTRY_PREFIX
+        default_country_prefix = "+62"  # Default country prefix
     
     # 处理 None 和空值
     if phone is None or phone == "":
