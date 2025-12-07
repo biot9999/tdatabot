@@ -9146,6 +9146,36 @@ class RecoveryProtectionManager:
             context.stage_results.append(stage_result)
             self.db.insert_recovery_log(stage_result)
             return False, f"操作过快，需等待{wait_time}秒"
+        except RPCError as e:
+            elapsed = time.time() - stage_start
+            error_msg = str(e)
+            # 检查是否是FROZEN_METHOD_INVALID错误
+            if 'FROZEN_METHOD_INVALID' in error_msg or 'frozen' in error_msg.lower():
+                print(f"❌ [{account_name}] 账号功能被冻结，无法修改密码")
+                stage_result = RecoveryStageResult(
+                    account_name=account_name,
+                    phone=context.phone,
+                    stage="change_pwd_old",
+                    success=False,
+                    error="账号功能被冻结 (FROZEN_METHOD_INVALID)",
+                    elapsed=elapsed
+                )
+                context.stage_results.append(stage_result)
+                self.db.insert_recovery_log(stage_result)
+                return False, "账号功能被冻结，无法修改密码"
+            else:
+                print(f"❌ [{account_name}] RPC错误: {error_msg[:100]}")
+                stage_result = RecoveryStageResult(
+                    account_name=account_name,
+                    phone=context.phone,
+                    stage="change_pwd_old",
+                    success=False,
+                    error=f"RPC错误: {error_msg[:100]}",
+                    elapsed=elapsed
+                )
+                context.stage_results.append(stage_result)
+                self.db.insert_recovery_log(stage_result)
+                return False, f"RPC错误: {error_msg[:100]}"
         except Exception as e:
             elapsed = time.time() - stage_start
             error_msg = str(e)[:50]
