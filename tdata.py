@@ -727,6 +727,10 @@ class Config:
         self.FORGET2FA_PROXY_TIMEOUT = int(os.getenv("FORGET2FA_PROXY_TIMEOUT", "15"))  # 代理超时时间（秒）
         self.FORGET2FA_DEFAULT_COUNTRY_PREFIX = os.getenv("FORGET2FA_DEFAULT_COUNTRY_PREFIX", "+62")  # 默认国家前缀
         
+        # API格式转换器和验证码服务器配置
+        self.WEB_SERVER_PORT = int(os.getenv("WEB_SERVER_PORT", "8080"))
+        self.ALLOW_PORT_SHIFT = os.getenv("ALLOW_PORT_SHIFT", "true").lower() == "true"
+        
         # 获取当前脚本目录
         self.SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
         
@@ -794,6 +798,9 @@ FORGET2FA_NOTIFY_WAIT=0.5
 FORGET2FA_MAX_PROXY_RETRIES=2
 FORGET2FA_PROXY_TIMEOUT=15
 FORGET2FA_DEFAULT_COUNTRY_PREFIX=+62
+# API格式转换器和验证码服务器配置
+WEB_SERVER_PORT=8080
+ALLOW_PORT_SHIFT=true
 """
             with open(".env", "w", encoding="utf-8") as f:
                 f.write(env_content)
